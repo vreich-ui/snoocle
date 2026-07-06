@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field
 from ..schema.song import Line
 
 
+class SectionStart(BaseModel):
+    name: str  # e.g. "Verse 1"
+    startLineIndex: int
+
+
 class CandidateSource(BaseModel):
     sourceId: str  # e.g. "web-1"
     url: Optional[str] = None
@@ -23,6 +28,7 @@ class CandidateSource(BaseModel):
     declaredKey: Optional[str] = None
     confidence: float = Field(default=0.5, ge=0, le=1)
     sectionsHint: list[str] = Field(default_factory=list)  # e.g. ["Verse 1", "Chorus"]
+    sectionStarts: list[SectionStart] = Field(default_factory=list)  # header positions
     lines: list[Line] = Field(default_factory=list)
     notes: Optional[str] = None
 

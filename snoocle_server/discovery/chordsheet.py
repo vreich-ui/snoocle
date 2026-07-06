@@ -44,6 +44,7 @@ _REPEAT_RE = re.compile(r"^[x(]?\s*x?\d+[x)]?$", re.IGNORECASE)
 class ParsedSheet:
     lines: list[Line] = field(default_factory=list)
     sections_hint: list[str] = field(default_factory=list)
+    section_starts: list[tuple[str, int]] = field(default_factory=list)  # (name, lineIndex)
     declared_capo: int = 0
     declared_key: str | None = None
     chord_line_count: int = 0
@@ -186,6 +187,10 @@ def parse_chord_sheet(text: str) -> ParsedSheet:
         header = _section_header(stripped)
         if header is not None:
             sheet.sections_hint.append(header)
+            if sheet.section_starts and sheet.section_starts[-1][1] == len(sheet.lines):
+                sheet.section_starts[-1] = (header, len(sheet.lines))  # empty section: keep last
+            else:
+                sheet.section_starts.append((header, len(sheet.lines)))
             seen_musical = True
             i += 1
             continue

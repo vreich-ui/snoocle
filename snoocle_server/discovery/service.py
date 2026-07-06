@@ -19,7 +19,7 @@ from typing import Callable
 
 from .chordsheet import parse_chord_sheet
 from .fetch import extract_sheet_text, fetch_page
-from .models import CandidateSource
+from .models import CandidateSource, SectionStart
 from .search import SearchHit, web_search
 from ..config import settings
 
@@ -60,6 +60,11 @@ def candidate_from_text(text: str, source_id: str, url: str | None = None, title
         declaredKey=sheet.declared_key,
         confidence=_confidence(sheet),
         sectionsHint=sheet.sections_hint,
+        sectionStarts=[
+            SectionStart(name=n, startLineIndex=i)
+            for n, i in sheet.section_starts
+            if i < len(sheet.lines)
+        ],
         lines=sheet.lines,
         notes=notes,
     )

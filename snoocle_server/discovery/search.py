@@ -103,10 +103,24 @@ def _search_duckduckgo(query: str, max_results: int) -> list[SearchHit]:
     return hits
 
 
+def _search_static(query: str, max_results: int) -> list[SearchHit]:
+    """Fixture backend for offline development/e2e testing: hits come from the
+    SNOOCLE_STATIC_SEARCH_HITS env var (JSON list of {url, title})."""
+    import json
+    import os
+
+    raw = os.environ.get("SNOOCLE_STATIC_SEARCH_HITS", "")
+    if not raw:
+        raise SearchError("static: SNOOCLE_STATIC_SEARCH_HITS not set")
+    hits = [SearchHit(url=h["url"], title=h.get("title", "")) for h in json.loads(raw)]
+    return hits[:max_results]
+
+
 _BACKENDS = {
     "brave": _search_brave,
     "serpapi": _search_serpapi,
     "duckduckgo": _search_duckduckgo,
+    "static": _search_static,
 }
 
 

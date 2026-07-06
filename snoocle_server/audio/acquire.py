@@ -61,8 +61,11 @@ def search_video(title: str, artist: str, max_results: int = 5) -> list[dict]:
 
     query = f"{artist} {title}"
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "noplaylist": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+    except Exception as e:  # yt_dlp raises many exception types
+        raise AcquisitionError(f"YouTube search failed for {query!r}: {e}") from e
     entries = [e for e in (info.get("entries") or []) if e]
     if not entries:
         raise AcquisitionError(f"no YouTube results for {query!r}")

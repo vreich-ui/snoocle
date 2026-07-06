@@ -26,6 +26,7 @@ from .mir import MirAnalysis, analyze_audio
 from .pipeline import get_store, run_pipeline
 from .reconcile import ReconcileResult, provider_capabilities, reconcile
 from .reconcile.engine import ReconcileError
+from .reconcile.providers import ProviderError
 from .schema import Song, song_json_schema
 from .store import StoreError, VersionConflictError
 
@@ -182,7 +183,7 @@ def post_reconcile(req: ReconcileRequest) -> dict:
             attach_audio=req.attachAudio,
             youtube_video_id=req.youtubeVideoId,
         )
-    except ReconcileError as e:
+    except (ReconcileError, ProviderError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _reconcile_response(result)
 
@@ -218,7 +219,7 @@ def post_songs_analyze(req: PipelineRequest) -> dict:
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    except ReconcileError as e:
+    except (ReconcileError, ProviderError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     assert report.reconcile is not None
     return {

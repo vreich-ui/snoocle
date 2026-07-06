@@ -79,10 +79,13 @@ class AnthropicProvider(LLMProvider):
 
         if audio is not None:
             log.info("anthropic provider ignores audio attachment (unsupported)")
-        client = anthropic.Anthropic(
-            api_key=settings.anthropic_api_key or None,
-            base_url=settings.anthropic_base_url,
-        )
+        try:
+            client = anthropic.Anthropic(
+                api_key=settings.anthropic_api_key or None,
+                base_url=settings.anthropic_base_url,
+            )
+        except (anthropic.AnthropicError, TypeError) as e:  # TypeError: SDK's no-credentials error
+            raise ProviderError(f"anthropic: {e}") from e
         model = self._model(model)
         try:
             response = client.messages.create(
@@ -98,6 +101,9 @@ class AnthropicProvider(LLMProvider):
             raise ProviderError(f"anthropic: {e.status_code} {e.message}") from e
         except anthropic.APIConnectionError as e:
             raise ProviderError(f"anthropic: connection failed: {e}") from e
+        except (anthropic.AnthropicError, TypeError) as e:
+            # TypeError is the SDK's "could not resolve authentication" error
+            raise ProviderError(f"anthropic: {e}") from e
         if response.stop_reason == "refusal":
             raise ProviderError("anthropic: request refused by safety classifiers")
         text = "".join(b.text for b in response.content if b.type == "text")
@@ -130,17 +136,20 @@ class OpenAIProvider(LLMProvider):
                     },
                 ]
             messages.append({"role": t["role"], "content": content})
-        r = httpx.post(
-            f"{settings.openai_base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-            json={
-                "model": model,
-                "max_completion_tokens": max_tokens or settings.llm_max_tokens,
-                "temperature": settings.llm_temperature,
-                "messages": messages,
-            },
-            timeout=300.0,
-        )
+        try:
+            r = httpx.post(
+                f"{settings.openai_base_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+                json={
+                    "model": model,
+                    "max_completion_tokens": max_tokens or settings.llm_max_tokens,
+                    "temperature": settings.llm_temperature,
+                    "messages": messages,
+                },
+                timeout=300.0,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"openai: connection failed: {e}") from e
         if r.status_code != 200:
             raise ProviderError(f"openai: {r.status_code} {r.text[:300]}")
         data = r.json()
@@ -173,20 +182,23 @@ class GeminiProvider(LLMProvider):
                     }
                 )
             contents.append({"role": role, "parts": parts})
-        r = httpx.post(
-            f"{settings.gemini_base_url}/v1beta/models/{model}:generateContent",
-            params={"key": settings.gemini_api_key},
-            json={
-                "systemInstruction": {"parts": [{"text": system}]},
-                "contents": contents,
-                "generationConfig": {
-                    "maxOutputTokens": max_tokens or settings.llm_max_tokens,
-                    "temperature": settings.llm_temperature,
-                    "responseMimeType": "application/json",
+        try:
+            r = httpx.post(
+                f"{settings.gemini_base_url}/v1beta/models/{model}:generateContent",
+                params={"key": settings.gemini_api_key},
+                json={
+                    "systemInstruction": {"parts": [{"text": system}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens or settings.llm_max_tokens,
+                        "temperature": settings.llm_temperature,
+                        "responseMimeType": "application/json",
+                    },
                 },
-            },
-            timeout=300.0,
-        )
+                timeout=300.0,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"gemini: connection failed: {e}") from e
         if r.status_code != 200:
             raise ProviderError(f"gemini: {r.status_code} {r.text[:300]}")
         data = r.json()

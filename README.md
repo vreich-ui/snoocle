@@ -59,6 +59,23 @@ Output must conform to the `Song` schema used by the Snoocle iOS app — `metada
 - Git LFS for model checkpoints
 - `.env` for API keys: Anthropic, OpenAI, Google (Gemini), and a YouTube-related key/tooling as needed — never commit this file
 
+## Quickstart
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e '.[mir,dev]' anthropic python-multipart
+cp .env.example .env                     # fill in API keys
+
+.venv/bin/snoocle-server                 # HTTP API on 127.0.0.1:8765
+.venv/bin/snoocle-mcp                    # MCP tool server (stdio)
+.venv/bin/python -m pytest               # test suite
+.venv/bin/python scripts/acceptance.py --offline   # acceptance report -> docs/ACCEPTANCE.md
+```
+
+`ffmpeg` must be on PATH. See `docs/ARCHITECTURE.md` for the module map and
+the overnight-build assumptions, and `docs/ACCEPTANCE.md` for the latest
+per-step acceptance results.
+
 ## Versioned artifacts
 
 Every analysis run commits its output JSON to a dedicated git-backed store rather than overwriting the previous result — full history, diffing, and rollback via ordinary git tooling. This store is separate from the code in this repo.

@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.env
+data/
+temp/
+models/checkpoints/
+*.wav
+*.mp3
+*.m4a
+*.flac

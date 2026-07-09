@@ -36,8 +36,11 @@ gcloud config set project "$PROJECT_ID"
 ## 1. One-time project setup
 
 ```sh
+# Includes iam (service-account creation, step 1) and cloudbuild (image build,
+# step 3) — on a fresh project those commands fail without their APIs enabled.
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
-    secretmanager.googleapis.com storage.googleapis.com
+    secretmanager.googleapis.com storage.googleapis.com \
+    iam.googleapis.com cloudbuild.googleapis.com
 
 gcloud artifacts repositories create "$REPO" \
     --repository-format=docker --location="$REGION"
@@ -156,14 +159,15 @@ gcloud run deploy snoocle-mcp \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
 ```
 
-`SNOOCLE_MCP_TRUST_PROXY=true` explicitly disables the MCP SDK's
-DNS-rebinding host check — correct **only** because Cloud Run IAM
-(`--no-allow-unauthenticated`) authenticates every request before it reaches
-the container. The server keeps that protection ON by default, so a local or
-directly-exposed HTTP run is not silently open; set this flag only when an
-authenticating proxy sits in front. (Alternatively, once you know the
-assigned hostname, set `SNOOCLE_MCP_ALLOWED_HOSTS=snoocle-mcp-….run.app` to
-keep the check on but scoped to that host.)
+`SNOOCLE_MCP_TRUST_PROXY=true` binds `0.0.0.0` (required so Cloud Run can
+route traffic to the container) and disables the MCP SDK's DNS-rebinding host
+check — correct **only** because Cloud Run IAM (`--no-allow-unauthenticated`)
+authenticates every request before it reaches the container. Without a
+remote-serving flag the server binds loopback (`127.0.0.1`) with the host
+check ON, so a local HTTP run is never exposed on the LAN; set this flag only
+when an authenticating proxy sits in front. (Alternatively, once you know the
+assigned hostname, set `SNOOCLE_MCP_ALLOWED_HOSTS=snoocle-mcp-….run.app` — it
+also binds `0.0.0.0` but keeps the host check on, scoped to that host.)
 
 Both services point at the **same bucket/mount** — they see the same song
 store, so a song analyzed via the API is immediately visible to the MCP

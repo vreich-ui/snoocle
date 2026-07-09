@@ -188,6 +188,42 @@ def test_http_host_protection_default_and_opt_out(tmp_path):
         assert r.status_code != 421, f"TRUST_PROXY should bypass host check, got {r.status_code}"
 
 
+@pytest.mark.parametrize(
+    "env,expected_host,expected_protection",
+    [
+        # default: loopback bind, protection ON (localhost-only)
+        ({}, "127.0.0.1", True),
+        # trust-proxy (Cloud Run behind IAM): 0.0.0.0 bind, protection OFF
+        ({"SNOOCLE_MCP_TRUST_PROXY": "true"}, "0.0.0.0", False),
+        # explicit allowed hosts: 0.0.0.0 bind, protection ON
+        ({"SNOOCLE_MCP_ALLOWED_HOSTS": "snoocle.run.app"}, "0.0.0.0", True),
+        # explicit host override always wins
+        ({"SNOOCLE_MCP_HOST": "10.0.0.5"}, "10.0.0.5", True),
+    ],
+)
+def test_resolve_http_transport_bind_and_protection(env, expected_host, expected_protection):
+    from snoocle_server.mcp_server import resolve_http_transport
+
+    host, port, security = resolve_http_transport(env)
+    assert host == expected_host
+    assert security.enable_dns_rebinding_protection is expected_protection
+    if env.get("SNOOCLE_MCP_ALLOWED_HOSTS"):
+        assert "snoocle.run.app" in security.allowed_hosts
+        assert "127.0.0.1:*" in security.allowed_hosts  # localhost still allowed
+
+
+def test_resolve_http_transport_port_precedence():
+    from snoocle_server.mcp_server import resolve_http_transport
+
+    # $PORT (Cloud Run) wins over SNOOCLE_MCP_PORT
+    _, port, _ = resolve_http_transport({"PORT": "9090", "SNOOCLE_MCP_PORT": "1234"})
+    assert port == 9090
+    _, port, _ = resolve_http_transport({"SNOOCLE_MCP_PORT": "1234"})
+    assert port == 1234
+    _, port, _ = resolve_http_transport({})
+    assert port == 8080
+
+
 @pytest.fixture()
 def anyio_backend():
     return "asyncio"

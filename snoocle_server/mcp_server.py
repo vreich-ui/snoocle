@@ -341,6 +341,71 @@ def get_song_schema() -> dict:
     return song_json_schema()
 
 
+_LOCALHOST_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+_LOCALHOST_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+
+
+def _truthy(v: str | None) -> bool:
+    return (v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_http_transport(env: dict):
+    """Pure resolver for the HTTP transport's bind host + security settings.
+
+    Extracted from main() so the security posture is unit-testable without
+    spawning a server. Returns (host: str, port: int, security_settings).
+
+    Bind loopback-only unless a remote-serving mode is explicitly configured.
+    The DNS-rebinding Host check alone can't protect a 0.0.0.0 bind — the Host
+    header is client-controlled, so a LAN client can send `Host: localhost:
+    <port>` to satisfy the localhost allowlist. Binding 127.0.0.1 for a local
+    smoke test keeps the port off the LAN entirely; remote serving (Cloud Run
+    sets SNOOCLE_MCP_TRUST_PROXY=true and needs 0.0.0.0 for routed traffic)
+    opts into the wider bind. An explicit SNOOCLE_MCP_HOST always wins.
+
+    Security settings are constructed explicitly in every branch rather than
+    mutating FastMCP's default: on mcp 1.10.x that default is None (mutating
+    would AttributeError) and its middleware treats None as protection-OFF
+    "for backwards compatibility", so relying on it would silently leave a
+    local run open. Explicit construction is safe-by-default on every version.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    allowed = [h.strip() for h in env.get("SNOOCLE_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    trust_proxy = _truthy(env.get("SNOOCLE_MCP_TRUST_PROXY"))
+    remote_mode = bool(allowed) or trust_proxy
+
+    host = env.get("SNOOCLE_MCP_HOST") or ("0.0.0.0" if remote_mode else "127.0.0.1")
+    port = int(env.get("PORT", env.get("SNOOCLE_MCP_PORT", "8080")))
+
+    if allowed:
+        # Protection ON, scoped to the operator's hosts (+ localhost, so local
+        # health checks against the same process still work).
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[*allowed, *_LOCALHOST_HOSTS],
+            allowed_origins=[
+                *(f"https://{h}" for h in allowed),
+                *(f"http://{h}" for h in allowed),
+                *_LOCALHOST_ORIGINS,
+            ],
+        )
+    elif trust_proxy:
+        # Explicit opt-out: only safe behind an authenticating proxy (Cloud Run
+        # IAM). The deployed *.run.app hostname is assigned at deploy time so it
+        # can't be hardcoded into an allowlist; this is the escape hatch.
+        security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    else:
+        # Neither configured: loopback bind (above) + protection ON,
+        # localhost-only. Defense in depth for a local smoke test.
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=_LOCALHOST_HOSTS,
+            allowed_origins=_LOCALHOST_ORIGINS,
+        )
+    return host, port, security
+
+
 def main() -> None:
     """Entrypoint for the `snoocle-mcp` console script.
 
@@ -350,19 +415,16 @@ def main() -> None:
     HTTP process (e.g. deployed to Cloud Run as its own service, behind
     Cloud Run IAM auth rather than any app-level auth).
 
-    HTTP host-header (DNS-rebinding) protection is KEPT ON by default so a
-    local/non-Cloud-Run HTTP run is not silently exposed. Configure one of:
+    In HTTP mode the port binds to loopback (127.0.0.1) with the SDK's Host
+    (DNS-rebinding) check ON, so a local run is not exposed on the LAN.
+    Opt into remote serving with one of:
       * SNOOCLE_MCP_ALLOWED_HOSTS  comma-separated Host values to allow
-        (e.g. "snoocle-mcp-xxxx.run.app") — protection stays on, scoped to
-        those hosts. Preferred once the deployed hostname is known.
-      * SNOOCLE_MCP_TRUST_PROXY=true  explicitly disable the host check —
-        ONLY correct when an authenticating proxy (Cloud Run IAM) sits in
-        front of this process. Never set this for a directly-exposed HTTP run.
+        (e.g. "snoocle-mcp-xxxx.run.app"); binds 0.0.0.0, check stays on,
+        scoped to those hosts. Preferred once the deployed hostname is known.
+      * SNOOCLE_MCP_TRUST_PROXY=true  binds 0.0.0.0 and disables the Host
+        check — ONLY correct behind an authenticating proxy (Cloud Run IAM).
     """
     import os
-
-    def _truthy(v: str | None) -> bool:
-        return (v or "").strip().lower() in ("1", "true", "yes", "on")
 
     transport = os.environ.get("SNOOCLE_MCP_TRANSPORT", "stdio")
     if transport == "stdio":
@@ -373,51 +435,10 @@ def main() -> None:
             f"unsupported SNOOCLE_MCP_TRANSPORT {transport!r} "
             "(expected stdio | streamable-http | sse)"
         )
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    mcp.settings.host = os.environ.get("SNOOCLE_MCP_HOST", "0.0.0.0")
-    mcp.settings.port = int(os.environ.get("PORT", os.environ.get("SNOOCLE_MCP_PORT", "8080")))
-
-    # Build transport security explicitly in every branch rather than mutating
-    # mcp.settings.transport_security in place: on mcp 1.10.x FastMCP defaults
-    # that attribute to None (mutating it would AttributeError), AND the
-    # middleware treats None as protection-OFF "for backwards compatibility" —
-    # so relying on the default would silently leave a local HTTP run open.
-    # Constructing the settings makes behavior identical and safe-by-default
-    # across every supported SDK version.
-    _LOCALHOST_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-    _LOCALHOST_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
-
-    allowed = [h.strip() for h in os.environ.get("SNOOCLE_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
-    if allowed:
-        # Protection ON, scoped to the operator's hosts (+ localhost, so local
-        # health checks against the same process still work).
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=[*allowed, *_LOCALHOST_HOSTS],
-            allowed_origins=[
-                *(f"https://{h}" for h in allowed),
-                *(f"http://{h}" for h in allowed),
-                *_LOCALHOST_ORIGINS,
-            ],
-        )
-    elif _truthy(os.environ.get("SNOOCLE_MCP_TRUST_PROXY")):
-        # Explicit opt-out: only safe when Cloud Run IAM (or another
-        # authenticating proxy) has already gated the request. The deployed
-        # *.run.app hostname is assigned at deploy time so it can't be
-        # hardcoded into an allowlist; this is the escape hatch for that case.
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False
-        )
-    else:
-        # Neither configured: protection ON, localhost-only. Fine for a local
-        # HTTP smoke test; a remote client will 421 until the operator sets
-        # one of the two vars above — a loud, safe default, not a silent bind.
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=_LOCALHOST_HOSTS,
-            allowed_origins=_LOCALHOST_ORIGINS,
-        )
+    host, port, security = resolve_http_transport(dict(os.environ))
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.transport_security = security
     mcp.run(transport=transport)
 
 

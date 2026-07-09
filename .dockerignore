@@ -1,0 +1,52 @@
+# Keep the build context small and the image clean.
+# The Dockerfile only COPYs pyproject.toml + snoocle_server/, but a tight
+# .dockerignore speeds context upload (e.g. to Cloud Build) and avoids leaking
+# secrets/local state.
+
+# --- version control / CI ---
+.git
+.gitignore
+.github
+
+# --- secrets & local env (NEVER bake into an image) ---
+.env
+.env.*
+!.env.example
+
+# --- Python caches / build artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- runtime data / large binaries (regenerated, not shipped) ---
+data/
+temp/
+models/
+models/checkpoints/
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# --- not needed to run the service ---
+tests/
+scripts/
+docs/
+README.md
+*.md
+Dockerfile
+.dockerignore
+
+# --- editor / OS cruft ---
+.idea/
+.vscode/
+*.swp
+.DS_Store

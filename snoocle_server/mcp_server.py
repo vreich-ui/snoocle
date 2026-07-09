@@ -398,15 +398,20 @@ def resolve_http_transport(env: dict):
     port = int(env.get("PORT", env.get("SNOOCLE_MCP_PORT", "8080")))
 
     if allowed:
-        # Protection ON, scoped to the operator's hosts (+ localhost, so local
-        # health checks against the same process still work).
+        # Protection ON, scoped STRICTLY to the operator's hosts. This branch
+        # binds 0.0.0.0 (remote-reachable), so localhost must NOT be appended:
+        # allowing `localhost:*` here would let a LAN client spoof
+        # `Host: localhost:<port>` to bypass the allowlist the operator set to
+        # narrow access. If a local Host value is genuinely needed, the
+        # operator adds it to SNOOCLE_MCP_ALLOWED_HOSTS explicitly. (Cloud
+        # Run's startup probe is a TCP socket check — it sends no HTTP Host
+        # header, so nothing here depends on the localhost entries.)
         security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[*allowed, *_LOCALHOST_HOSTS],
+            allowed_hosts=list(allowed),
             allowed_origins=[
                 *(f"https://{h}" for h in allowed),
                 *(f"http://{h}" for h in allowed),
-                *_LOCALHOST_ORIGINS,
             ],
         )
     elif trust_proxy:

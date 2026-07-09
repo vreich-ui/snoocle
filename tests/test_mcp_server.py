@@ -210,8 +210,10 @@ def test_resolve_http_transport_bind_and_protection(env, expected_host, expected
     assert host == expected_host
     assert security.enable_dns_rebinding_protection is expected_protection
     if env.get("SNOOCLE_MCP_ALLOWED_HOSTS"):
-        assert "snoocle.run.app" in security.allowed_hosts
-        assert "127.0.0.1:*" in security.allowed_hosts  # localhost still allowed
+        # STRICTLY the operator's hosts — no localhost appended, or a LAN client
+        # could spoof `Host: localhost:<port>` past this 0.0.0.0-bound allowlist.
+        assert security.allowed_hosts == ["snoocle.run.app"]
+        assert not any("localhost" in h or "127.0.0.1" in h for h in security.allowed_hosts)
 
 
 def test_resolve_http_transport_rejects_unguarded_nonloopback_host():

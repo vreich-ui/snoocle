@@ -361,7 +361,14 @@ def resolve_http_transport(env: dict):
     <port>` to satisfy the localhost allowlist. Binding 127.0.0.1 for a local
     smoke test keeps the port off the LAN entirely; remote serving (Cloud Run
     sets SNOOCLE_MCP_TRUST_PROXY=true and needs 0.0.0.0 for routed traffic)
-    opts into the wider bind. An explicit SNOOCLE_MCP_HOST always wins.
+    opts into the wider bind.
+
+    A non-loopback SNOOCLE_MCP_HOST is a remote-serving intent, so it REQUIRES
+    a security mode too (ALLOWED_HOSTS or TRUST_PROXY). Without one it would
+    widen the bind while leaving the localhost-only fallback policy in place —
+    rejecting real remote clients AND letting any reachable client spoof
+    `Host: localhost:<port>` — so it's rejected with a clear error rather than
+    silently creating that insecure state.
 
     Security settings are constructed explicitly in every branch rather than
     mutating FastMCP's default: on mcp 1.10.x that default is None (mutating
@@ -371,11 +378,23 @@ def resolve_http_transport(env: dict):
     """
     from mcp.server.transport_security import TransportSecuritySettings
 
+    _LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
     allowed = [h.strip() for h in env.get("SNOOCLE_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
     trust_proxy = _truthy(env.get("SNOOCLE_MCP_TRUST_PROXY"))
     remote_mode = bool(allowed) or trust_proxy
 
-    host = env.get("SNOOCLE_MCP_HOST") or ("0.0.0.0" if remote_mode else "127.0.0.1")
+    explicit_host = env.get("SNOOCLE_MCP_HOST")
+    if explicit_host and explicit_host not in _LOOPBACK and not remote_mode:
+        raise ValueError(
+            f"SNOOCLE_MCP_HOST={explicit_host!r} exposes the MCP server beyond "
+            "loopback but no host-security mode is set. Also set "
+            "SNOOCLE_MCP_ALLOWED_HOSTS=<host[,host...]> (keeps the DNS-rebinding "
+            "check on) or SNOOCLE_MCP_TRUST_PROXY=true (only behind an "
+            "authenticating proxy such as Cloud Run IAM)."
+        )
+
+    host = explicit_host or ("0.0.0.0" if remote_mode else "127.0.0.1")
     port = int(env.get("PORT", env.get("SNOOCLE_MCP_PORT", "8080")))
 
     if allowed:

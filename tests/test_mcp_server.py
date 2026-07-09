@@ -197,8 +197,10 @@ def test_http_host_protection_default_and_opt_out(tmp_path):
         ({"SNOOCLE_MCP_TRUST_PROXY": "true"}, "0.0.0.0", False),
         # explicit allowed hosts: 0.0.0.0 bind, protection ON
         ({"SNOOCLE_MCP_ALLOWED_HOSTS": "snoocle.run.app"}, "0.0.0.0", True),
-        # explicit host override always wins
-        ({"SNOOCLE_MCP_HOST": "10.0.0.5"}, "10.0.0.5", True),
+        # explicit LOOPBACK host without a security mode is fine (still local)
+        ({"SNOOCLE_MCP_HOST": "127.0.0.1"}, "127.0.0.1", True),
+        # explicit non-loopback host WITH a security mode is honored
+        ({"SNOOCLE_MCP_HOST": "10.0.0.5", "SNOOCLE_MCP_TRUST_PROXY": "true"}, "10.0.0.5", False),
     ],
 )
 def test_resolve_http_transport_bind_and_protection(env, expected_host, expected_protection):
@@ -210,6 +212,20 @@ def test_resolve_http_transport_bind_and_protection(env, expected_host, expected
     if env.get("SNOOCLE_MCP_ALLOWED_HOSTS"):
         assert "snoocle.run.app" in security.allowed_hosts
         assert "127.0.0.1:*" in security.allowed_hosts  # localhost still allowed
+
+
+def test_resolve_http_transport_rejects_unguarded_nonloopback_host():
+    """A non-loopback SNOOCLE_MCP_HOST without ALLOWED_HOSTS/TRUST_PROXY is a
+    misconfiguration (wide bind + localhost-only policy) and must be rejected,
+    not silently served."""
+    from snoocle_server.mcp_server import resolve_http_transport
+
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="no host-security mode"):
+        resolve_http_transport({"SNOOCLE_MCP_HOST": "0.0.0.0"})
+    with _pytest.raises(ValueError, match="no host-security mode"):
+        resolve_http_transport({"SNOOCLE_MCP_HOST": "10.0.0.5"})
 
 
 def test_resolve_http_transport_port_precedence():

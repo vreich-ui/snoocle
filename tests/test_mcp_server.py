@@ -6,6 +6,7 @@ MCP-compatible client (acceptance step 6).
 """
 
 import base64
+import contextlib
 import json
 import os
 import shutil
@@ -107,21 +108,16 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.mark.anyio
-async def test_mcp_tools_over_streamable_http(tmp_path):
-    """Same tool surface, served over HTTP instead of stdio — the transport
-    Cloud Run (and any remote MCP client) actually needs, gated in
-    deployment by Cloud Run IAM rather than app-level auth."""
+@contextlib.contextmanager
+def _http_mcp_server(tmp_path, **extra_env):
+    """Spawn the MCP server in streamable-http mode; yield (base_url, port)."""
     port = _free_port()
     env = {
         **os.environ,
         "SNOOCLE_MCP_TRANSPORT": "streamable-http",
         "SNOOCLE_MCP_PORT": str(port),
         "SNOOCLE_STORE_DIR": str(tmp_path / "store"),
-        # Exercise the explicit host-check opt-out (as a Cloud-Run-behind-IAM
-        # deploy would set); without it the server keeps localhost-only host
-        # protection and a non-localhost Host header would 421.
-        "SNOOCLE_MCP_TRUST_PROXY": "true",
+        **extra_env,
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "snoocle_server.mcp_server"],
@@ -139,7 +135,22 @@ async def test_mcp_tools_over_streamable_http(tmp_path):
                 time.sleep(0.2)
         else:
             raise RuntimeError("server never started listening")
+        yield url, port
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
+
+@pytest.mark.anyio
+async def test_mcp_tools_over_streamable_http(tmp_path):
+    """Same tool surface, served over HTTP instead of stdio — the transport
+    Cloud Run (and any remote MCP client) actually needs, gated in
+    deployment by Cloud Run IAM rather than app-level auth. TRUST_PROXY set
+    to exercise the explicit host-check opt-out a behind-IAM deploy uses."""
+    with _http_mcp_server(tmp_path, SNOOCLE_MCP_TRUST_PROXY="true") as (url, _):
         async with streamablehttp_client(url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -153,12 +164,28 @@ async def test_mcp_tools_over_streamable_http(tmp_path):
 
                 schema = await session.call_tool("get_song_schema", {})
                 assert "chordPlacements" in schema.content[0].text
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+
+
+def test_http_host_protection_default_and_opt_out(tmp_path):
+    """The DNS-rebinding host check must be ON by default (spoofed Host -> 421)
+    and only bypassed by the explicit SNOOCLE_MCP_TRUST_PROXY opt-out. This is
+    the safe-by-default posture on every supported mcp version — on mcp 1.10.x
+    the SDK's own default leaves it OFF, which this explicit config overrides."""
+    spoof = {"Host": "attacker.example", "Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "0"}}}
+
+    # Default: no TRUST_PROXY / ALLOWED_HOSTS -> foreign Host rejected with 421.
+    with _http_mcp_server(tmp_path) as (url, _):
+        r = httpx.post(url, headers=spoof, json=init, timeout=5.0)
+        assert r.status_code == 421, f"expected 421 for spoofed Host, got {r.status_code}"
+
+    # Opt-out: TRUST_PROXY disables the check -> foreign Host is NOT 421.
+    with _http_mcp_server(tmp_path, SNOOCLE_MCP_TRUST_PROXY="true") as (url, _):
+        r = httpx.post(url, headers=spoof, json=init, timeout=5.0)
+        assert r.status_code != 421, f"TRUST_PROXY should bypass host check, got {r.status_code}"
 
 
 @pytest.fixture()

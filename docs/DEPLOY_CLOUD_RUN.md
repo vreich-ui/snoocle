@@ -91,11 +91,20 @@ gcloud run deploy snoocle-api \
     --execution-environment=gen2 \
     --cpu=1 --memory=2Gi --timeout=900 --concurrency=1 \
     --min-instances=0 --max-instances=1 \
-    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data" \
+    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750" \
     --add-volume-mount=volume=data,mount-path=/data \
     --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
 ```
+
+**The `mount-options` uid/gid are required, not optional.** Cloud Run mounts a
+GCS FUSE volume **root-owned** by default, but the image runs as non-root
+`appuser` (UID/GID 10001, pinned in the Dockerfile). Without
+`uid=10001;gid=10001`, the very first write — `GitSongStore._ensure_repo()`
+initializing the store, or the first audio-cache write — fails with permission
+denied, so the service starts but can't analyze or store anything. (`file-mode`/
+`dir-mode` are needed too because GCS FUSE ignores `chmod`, so the app can't fix
+perms at runtime.)
 
 **Store-write concurrency — read this before serving real traffic.**
 `GitSongStore`'s write lock (`fcntl.flock` in
@@ -141,7 +150,7 @@ gcloud run deploy snoocle-mcp \
     --execution-environment=gen2 \
     --cpu=1 --memory=2Gi --timeout=900 --concurrency=1 \
     --min-instances=0 --max-instances=1 \
-    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data" \
+    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750" \
     --add-volume-mount=volume=data,mount-path=/data \
     --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRANSPORT=streamable-http,SNOOCLE_MCP_TRUST_PROXY=true" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"

@@ -13,7 +13,11 @@ Design notes (patterns reused per the brief):
 - save_song exposes expected_version optimistic locking —
   saveRecordIfVersionUnchanged, as in CMS-Agent.
 
-Run: `snoocle-mcp` (stdio transport).
+Run: `snoocle-mcp` — stdio transport by default (for a local MCP client /
+agent runtime to spawn as a subprocess). Set SNOOCLE_MCP_TRANSPORT=
+streamable-http to instead serve MCP over HTTP on $PORT/SNOOCLE_MCP_PORT
+(e.g. as a second Cloud Run service, gated by Cloud Run IAM auth — see
+docs/DEPLOY_CLOUD_RUN.md). SSE is also available for older clients.
 """
 
 from __future__ import annotations
@@ -338,7 +342,36 @@ def get_song_schema() -> dict:
 
 
 def main() -> None:
-    mcp.run()
+    """Entrypoint for the `snoocle-mcp` console script.
+
+    Defaults to stdio — the standard way an MCP client (Claude Desktop, an
+    agent runtime) spawns this as a local subprocess. Set
+    SNOOCLE_MCP_TRANSPORT=streamable-http to instead serve as a long-running
+    HTTP process (e.g. deployed to Cloud Run as its own service, behind
+    Cloud Run IAM auth rather than any app-level auth).
+    """
+    import os
+
+    transport = os.environ.get("SNOOCLE_MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+        return
+    if transport not in ("streamable-http", "sse"):
+        raise ValueError(
+            f"unsupported SNOOCLE_MCP_TRANSPORT {transport!r} "
+            "(expected stdio | streamable-http | sse)"
+        )
+    mcp.settings.host = os.environ.get("SNOOCLE_MCP_HOST", "0.0.0.0")
+    mcp.settings.port = int(os.environ.get("PORT", os.environ.get("SNOOCLE_MCP_PORT", "8080")))
+    # The deployed hostname is assigned by Cloud Run at deploy time, so it
+    # can't be hardcoded into an allowlist here. Access control for this
+    # transport is Cloud Run IAM in front of the process (see the deploy
+    # doc) — traffic reaching this process is already authenticated, so the
+    # SDK's browser-oriented DNS-rebinding host check (which would otherwise
+    # 421 every request against an unknown *.run.app Host header) is
+    # redundant here and disabled rather than guessed at.
+    mcp.settings.transport_security.enable_dns_rebinding_protection = False
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 # Snoocle server — architecture
 
-One Python service (FastAPI + an MCP stdio server sharing the same service
-layer). State lives only in the git-backed song store and the audio cache;
-everything else is stateless and env-configured (`.env.example`).
+One Python service (FastAPI + an MCP server sharing the same service layer).
+State lives only in the git-backed song store and the audio cache; everything
+else is stateless and env-configured (`.env.example`). Deployable to Cloud
+Run as two services from one image — see `docs/DEPLOY_CLOUD_RUN.md`.
 
 ```
 snoocle_server/
@@ -40,7 +41,10 @@ snoocle_server/
 ├── pipeline.py      orchestration, tolerant of partial failure
 ├── api.py           HTTP surface (one endpoint per step + full pipeline)
 └── mcp_server.py    MCP surface (16 step-scoped tools; base64 fallback for
-                     binary; save-if-version-unchanged exposed)
+                     binary; save-if-version-unchanged exposed). Defaults to
+                     stdio (local subprocess use); SNOOCLE_MCP_TRANSPORT=
+                     streamable-http serves it as a long-running HTTP
+                     process instead (e.g. its own Cloud Run service).
 ```
 
 ## Key decisions & assumptions (made overnight, flag anything wrong)

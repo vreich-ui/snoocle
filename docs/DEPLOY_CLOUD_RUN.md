@@ -22,7 +22,12 @@ its own credentials) to execute, not something I ran. Commands assume
 `gcloud` is authenticated (`gcloud auth login`) and pointed at your project:
 
 ```sh
-export PROJECT_ID=<your-project-id>          # from the YAML: numeric id 99287560712
+# PROJECT_ID is the ALPHANUMERIC project id (e.g. "kugelbrands-snoocle"), NOT
+# the number. The `99287560712` in your Cloud Run YAML is the project NUMBER;
+# it appears in some resource paths but is the wrong value for the
+# service-account emails below (`snoocle-run@${PROJECT_ID}.iam...`), which
+# require the alphanumeric id. Find it with: `gcloud projects list`.
+export PROJECT_ID=<your-alphanumeric-project-id>
 export REGION=europe-west1                    # matches your existing service
 export REPO=snoocle
 gcloud config set project "$PROJECT_ID"
@@ -92,18 +97,33 @@ gcloud run deploy snoocle-api \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
 ```
 
-**`--concurrency=1` is not a typo.** `GitSongStore`'s write lock
-(`fcntl.flock` in `snoocle_server/store/gitstore.py`) protects concurrent
-writers on a normal filesystem, but **`flock()` is not reliably supported
-over a `gcsfuse` mount** — GCS FUSE implements only a subset of POSIX and
-advisory locking is not part of it. With `--concurrency=1`, Cloud Run only
-ever hands one request at a time to the container, which sidesteps the
-problem entirely rather than depending on a lock that may silently no-op.
-If you need to serve concurrent requests, either (a) raise concurrency but
-accept that overlapping `analyze_and_store_song` calls could race on the
-store, or (b) swap `GitSongStore`'s lock for a GCS-native one (conditional
-writes via object generation preconditions) — not implemented, flagged here
-rather than shipped untested.
+**Store-write concurrency — read this before serving real traffic.**
+`GitSongStore`'s write lock (`fcntl.flock` in
+`snoocle_server/store/gitstore.py`) protects concurrent writers on a normal
+filesystem, but **`flock()` is not reliably honored over a `gcsfuse` mount**
+— GCS FUSE implements only a POSIX subset and advisory locking is not part
+of it. `--concurrency=1 --max-instances=1` serializes writes **within a
+single service**, but this runbook deploys **two** services (`snoocle-api`
+and `snoocle-mcp`) that mount the **same** store, and both expose write
+operations (`/v1/songs/analyze` / `POST /v1/songs/{id}` on the API;
+`analyze_and_store_song` / `save_song` on MCP). So one API write and one MCP
+write can still land in two different containers at the same instant — the
+per-service concurrency cap does **not** serialize across services. Pick one:
+
+- **(recommended) Single writer.** Deploy only ONE of the two services, or
+  serve both surfaces from one Cloud Run service (the FastMCP app can be
+  mounted into the FastAPI app so a single container/port answers both REST
+  and MCP — then `--concurrency=1` genuinely serializes every write). This is
+  a small code change, not yet implemented — see the follow-up note at the
+  end of this doc.
+- **Accept the race for personal single-user use.** In practice you are
+  unlikely to fire an API write and an MCP write within the same moment; two
+  simultaneous writes to the *same* song id are what corrupt history, and a
+  personal workflow rarely does that. Fine to start here; don't rely on it
+  for anything shared.
+- **Implement a GCS-native lock.** Replace `flock` with conditional writes
+  via object-generation preconditions (the store already has an
+  `expected_version` CAS path to build on). The durable fix; not built yet.
 
 ## 5. Deploy — `snoocle-mcp`
 
@@ -123,9 +143,18 @@ gcloud run deploy snoocle-mcp \
     --min-instances=0 --max-instances=1 \
     --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data" \
     --add-volume-mount=volume=data,mount-path=/data \
-    --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRANSPORT=streamable-http" \
+    --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRANSPORT=streamable-http,SNOOCLE_MCP_TRUST_PROXY=true" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
 ```
+
+`SNOOCLE_MCP_TRUST_PROXY=true` explicitly disables the MCP SDK's
+DNS-rebinding host check — correct **only** because Cloud Run IAM
+(`--no-allow-unauthenticated`) authenticates every request before it reaches
+the container. The server keeps that protection ON by default, so a local or
+directly-exposed HTTP run is not silently open; set this flag only when an
+authenticating proxy sits in front. (Alternatively, once you know the
+assigned hostname, set `SNOOCLE_MCP_ALLOWED_HOSTS=snoocle-mcp-….run.app` to
+keep the check on but scoped to that host.)
 
 Both services point at the **same bucket/mount** — they see the same song
 store, so a song analyzed via the API is immediately visible to the MCP
@@ -193,8 +222,14 @@ needs any of this.
 
 ## Known gaps / follow-ups
 
-- **GCS FUSE + `flock` concurrency risk** (see step 4) — mitigated with
-  `--concurrency=1` for now, not fixed at the code level.
+- **Cross-service store-write race** (see step 4). Per-service
+  `--concurrency=1` does NOT serialize writes across the two separate
+  `snoocle-api` / `snoocle-mcp` services sharing the GCS-FUSE store, and
+  `flock` doesn't work over GCS FUSE. Real fixes: serve both surfaces from a
+  single Cloud Run service (mount the FastMCP ASGI app into the FastAPI app
+  — small code change, not yet done), or a GCS-native conditional-write lock
+  in `GitSongStore`. For personal single-user use the practical race window
+  is small; don't rely on the two-service topology for shared use.
 - **madmom is not in the runtime image** (the Dockerfile excludes it — heavy
   native build). The deployed beat engine is the librosa fallback, not the
   one used in this session's local acceptance run.

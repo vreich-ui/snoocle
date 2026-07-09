@@ -118,6 +118,10 @@ async def test_mcp_tools_over_streamable_http(tmp_path):
         "SNOOCLE_MCP_TRANSPORT": "streamable-http",
         "SNOOCLE_MCP_PORT": str(port),
         "SNOOCLE_STORE_DIR": str(tmp_path / "store"),
+        # Exercise the explicit host-check opt-out (as a Cloud-Run-behind-IAM
+        # deploy would set); without it the server keeps localhost-only host
+        # protection and a non-localhost Host header would 421.
+        "SNOOCLE_MCP_TRUST_PROXY": "true",
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "snoocle_server.mcp_server"],

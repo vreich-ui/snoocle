@@ -349,8 +349,20 @@ def main() -> None:
     SNOOCLE_MCP_TRANSPORT=streamable-http to instead serve as a long-running
     HTTP process (e.g. deployed to Cloud Run as its own service, behind
     Cloud Run IAM auth rather than any app-level auth).
+
+    HTTP host-header (DNS-rebinding) protection is KEPT ON by default so a
+    local/non-Cloud-Run HTTP run is not silently exposed. Configure one of:
+      * SNOOCLE_MCP_ALLOWED_HOSTS  comma-separated Host values to allow
+        (e.g. "snoocle-mcp-xxxx.run.app") — protection stays on, scoped to
+        those hosts. Preferred once the deployed hostname is known.
+      * SNOOCLE_MCP_TRUST_PROXY=true  explicitly disable the host check —
+        ONLY correct when an authenticating proxy (Cloud Run IAM) sits in
+        front of this process. Never set this for a directly-exposed HTTP run.
     """
     import os
+
+    def _truthy(v: str | None) -> bool:
+        return (v or "").strip().lower() in ("1", "true", "yes", "on")
 
     transport = os.environ.get("SNOOCLE_MCP_TRANSPORT", "stdio")
     if transport == "stdio":
@@ -363,14 +375,27 @@ def main() -> None:
         )
     mcp.settings.host = os.environ.get("SNOOCLE_MCP_HOST", "0.0.0.0")
     mcp.settings.port = int(os.environ.get("PORT", os.environ.get("SNOOCLE_MCP_PORT", "8080")))
-    # The deployed hostname is assigned by Cloud Run at deploy time, so it
-    # can't be hardcoded into an allowlist here. Access control for this
-    # transport is Cloud Run IAM in front of the process (see the deploy
-    # doc) — traffic reaching this process is already authenticated, so the
-    # SDK's browser-oriented DNS-rebinding host check (which would otherwise
-    # 421 every request against an unknown *.run.app Host header) is
-    # redundant here and disabled rather than guessed at.
-    mcp.settings.transport_security.enable_dns_rebinding_protection = False
+
+    allowed = [h.strip() for h in os.environ.get("SNOOCLE_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    if allowed:
+        # Keep DNS-rebinding protection ON, scoped to the operator's hosts.
+        mcp.settings.transport_security.allowed_hosts = allowed
+        mcp.settings.transport_security.allowed_origins = [
+            *(f"https://{h}" for h in allowed),
+            *(f"http://{h}" for h in allowed),
+        ]
+    elif _truthy(os.environ.get("SNOOCLE_MCP_TRUST_PROXY")):
+        # Explicit opt-out: only safe when Cloud Run IAM (or another
+        # authenticating proxy) has already gated the request. The deployed
+        # *.run.app hostname is assigned at deploy time so it can't be
+        # hardcoded into an allowlist; this is the escape hatch for that case.
+        mcp.settings.transport_security.enable_dns_rebinding_protection = False
+    else:
+        # Neither configured: leave the SDK's default host protection intact
+        # (localhost-only). Fine for a local HTTP smoke test; a remote client
+        # will 421 until the operator sets one of the two vars above — a loud,
+        # safe default rather than a silent bypass.
+        pass
     mcp.run(transport=transport)
 
 

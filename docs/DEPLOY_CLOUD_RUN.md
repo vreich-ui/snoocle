@@ -94,7 +94,7 @@ gcloud run deploy snoocle-api \
     --execution-environment=gen2 \
     --cpu=1 --memory=2Gi --timeout=900 --concurrency=1 \
     --min-instances=0 --max-instances=1 \
-    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750" \
+    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750;metadata-cache-ttl-secs=0" \
     --add-volume-mount=volume=data,mount-path=/data \
     --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
@@ -109,30 +109,41 @@ denied, so the service starts but can't analyze or store anything. (`file-mode`/
 `dir-mode` are needed too because GCS FUSE ignores `chmod`, so the app can't fix
 perms at runtime.)
 
-**Store-write concurrency — read this before serving real traffic.**
-`GitSongStore`'s write lock (`fcntl.flock` in
-`snoocle_server/store/gitstore.py`) protects concurrent writers on a normal
-filesystem, but **`flock()` is not reliably honored over a `gcsfuse` mount**
-— GCS FUSE implements only a POSIX subset and advisory locking is not part
-of it. `--concurrency=1 --max-instances=1` serializes writes **within a
-single service**, but this runbook deploys **two** services (`snoocle-api`
-and `snoocle-mcp`) that mount the **same** store, and both expose write
-operations (`/v1/songs/analyze` / `POST /v1/songs/{id}` on the API;
-`analyze_and_store_song` / `save_song` on MCP). So one API write and one MCP
-write can still land in two different containers at the same instant — the
-per-service concurrency cap does **not** serialize across services. Pick one:
+**Sharing one GCS-FUSE git store across two services is fragile — read this
+before serving real traffic.** Two independent problems, both rooted in the
+two-service topology:
+
+1. **Read staleness.** GCS FUSE caches file metadata; Cloud Run's default
+   stat-cache TTL is **60s**. `GitSongStore.current_version()`, `get()`, and
+   `list_songs()` all read refs/song files through the mount, so *even with
+   sequential (non-concurrent) requests*, the MCP service can read seconds
+   after an API write and still see stale state — missing the just-committed
+   version. The `metadata-cache-ttl-secs=0` in the mount-options above
+   disables that cache (each read re-checks object generation), which
+   mitigates this. It costs a metadata round-trip per read — acceptable for a
+   low-volume personal store.
+2. **Write races.** `GitSongStore`'s `fcntl.flock` (`store/gitstore.py`) is
+   **not reliably honored over gcsfuse** (POSIX subset, no advisory locking),
+   and `metadata-cache-ttl-secs=0` does **not** help here. `--concurrency=1
+   --max-instances=1` serializes writes within *one* service, but the two
+   services (`snoocle-api` and `snoocle-mcp`) both write the same store
+   (`/v1/songs/analyze`, `POST /v1/songs/{id}`; `analyze_and_store_song`,
+   `save_song`), so a write in each container can interleave and corrupt the
+   git index/refs — the per-service cap does not serialize across services,
+   and no mount-option fixes this.
+
+The mount-option above closes (1). For (2), pick one:
 
 - **(recommended) Single writer.** Deploy only ONE of the two services, or
-  serve both surfaces from one Cloud Run service (the FastMCP app can be
-  mounted into the FastAPI app so a single container/port answers both REST
-  and MCP — then `--concurrency=1` genuinely serializes every write). This is
-  a small code change, not yet implemented — see the follow-up note at the
-  end of this doc.
-- **Accept the race for personal single-user use.** In practice you are
-  unlikely to fire an API write and an MCP write within the same moment; two
-  simultaneous writes to the *same* song id are what corrupt history, and a
-  personal workflow rarely does that. Fine to start here; don't rely on it
-  for anything shared.
+  serve both surfaces from one Cloud Run service (the FastMCP app mounted
+  into the FastAPI app so a single container/port answers both REST and MCP —
+  then `--concurrency=1` genuinely serializes every write *and* removes the
+  cross-service read-staleness entirely, since there's one mount). Small code
+  change, not yet implemented — see the follow-up note at the end.
+- **Accept the write-race for personal single-user use.** Two simultaneous
+  writes to the *same* song id are what corrupt history; a single-user
+  workflow rarely fires an API write and an MCP write concurrently. Fine to
+  start here; don't rely on it for anything shared.
 - **Implement a GCS-native lock.** Replace `flock` with conditional writes
   via object-generation preconditions (the store already has an
   `expected_version` CAS path to build on). The durable fix; not built yet.
@@ -153,7 +164,7 @@ gcloud run deploy snoocle-mcp \
     --execution-environment=gen2 \
     --cpu=1 --memory=2Gi --timeout=900 --concurrency=1 \
     --min-instances=0 --max-instances=1 \
-    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750" \
+    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750;metadata-cache-ttl-secs=0" \
     --add-volume-mount=volume=data,mount-path=/data \
     --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRANSPORT=streamable-http,SNOOCLE_MCP_TRUST_PROXY=true" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
@@ -235,14 +246,15 @@ needs any of this.
 
 ## Known gaps / follow-ups
 
-- **Cross-service store-write race** (see step 4). Per-service
-  `--concurrency=1` does NOT serialize writes across the two separate
-  `snoocle-api` / `snoocle-mcp` services sharing the GCS-FUSE store, and
-  `flock` doesn't work over GCS FUSE. Real fixes: serve both surfaces from a
-  single Cloud Run service (mount the FastMCP ASGI app into the FastAPI app
-  — small code change, not yet done), or a GCS-native conditional-write lock
-  in `GitSongStore`. For personal single-user use the practical race window
-  is small; don't rely on the two-service topology for shared use.
+- **Two services sharing one GCS-FUSE git store** (see step 4). Read
+  staleness (60s stat-cache TTL) is mitigated by `metadata-cache-ttl-secs=0`
+  in the mount-options. The write race is NOT: per-service `--concurrency=1`
+  doesn't serialize across the two services, and `flock` doesn't work over
+  GCS FUSE. Real fixes: serve both surfaces from a single Cloud Run service
+  (mount the FastMCP ASGI app into the FastAPI app — small code change, not
+  yet done), or a GCS-native conditional-write lock in `GitSongStore`. For
+  personal single-user use the practical write-race window is small; don't
+  rely on the two-service topology for shared use.
 - **madmom is not in the runtime image** (the Dockerfile excludes it — heavy
   native build). The deployed beat engine is the librosa fallback, not the
   one used in this session's local acceptance run.

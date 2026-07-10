@@ -8,7 +8,9 @@ lives only in the git-backed store and the audio cache.
 from __future__ import annotations
 
 import dataclasses
+import os
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,6 +24,8 @@ from .audio.acquire import AcquisitionError, acquire
 from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .discovery.search import SearchError
+from .mcp_server import mcp as _mcp
+from .mcp_server import resolve_http_transport as _resolve_mcp_security
 from .mir import MirAnalysis, analyze_audio
 from .pipeline import get_store, run_pipeline
 from .reconcile import ReconcileResult, provider_capabilities, reconcile
@@ -30,11 +34,49 @@ from .reconcile.providers import ProviderError
 from .schema import Song, song_json_schema
 from .store import StoreError, VersionConflictError
 
+# --- Single-service topology: embed the MCP endpoint in this FastAPI app -----
+# One Cloud Run service / container / process serves BOTH the REST API and the
+# MCP streamable-HTTP transport (at /mcp), so it is the SOLE writer to the git
+# store. That fully serializes writes (no cross-service race) and removes the
+# cross-mount read-staleness that a two-service split had. The MCP session
+# manager is created here and its lifespan is run by this app's lifespan below
+# (Starlette does not run a mounted sub-app's lifespan on its own).
+_mcp.settings.stateless_http = True  # no persistent SSE stream (see mcp_server docs)
+_mcp.settings.json_response = True
+# The /mcp route's DNS-rebinding host check is driven by the same env vars as
+# the standalone server (SNOOCLE_MCP_TRUST_PROXY / SNOOCLE_MCP_ALLOWED_HOSTS);
+# only the security settings are used here — host/port binding is uvicorn's job
+# for the combined app. Defaults to protection-on/localhost.
+try:
+    _, _, _mcp.settings.transport_security = _resolve_mcp_security(dict(os.environ))
+except ValueError:
+    # A non-loopback SNOOCLE_MCP_HOST without a security mode is only a
+    # standalone-server misconfig; it doesn't bind the combined app (uvicorn
+    # does). Fall back to protection-on/localhost rather than failing import.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    _mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+    )
+_mcp_asgi_app = _mcp.streamable_http_app()  # creates the session manager
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Run the MCP StreamableHTTP session manager for the app's lifetime.
+    async with _mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title="Snoocle server",
     version=__version__,
     description="Audio-to-song-data foundry: web-sourced chord/lyric text + MIR analysis, "
-    "reconciled by a configurable LLM into Snoocle Song JSON. Personal-use tool.",
+    "reconciled by a configurable LLM into Snoocle Song JSON. MCP tools at /mcp. "
+    "Personal-use tool.",
+    lifespan=_lifespan,
 )
 
 
@@ -69,6 +111,7 @@ def healthz() -> dict:
         },
         "llmProviders": provider_capabilities(),
         "store": str(settings.store_dir),
+        "mcpEndpoint": _mcp.settings.streamable_http_path,  # embedded MCP transport
     }
 
 
@@ -338,6 +381,16 @@ async def post_probe(file: UploadFile = File(...)) -> dict:
         return dataclasses.asdict(audio_utils.probe(src))
     except audio_utils.AudioToolError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+# --- embedded MCP route ------------------------------------------------------
+# Register the MCP streamable-HTTP route (default path /mcp) onto this app,
+# after all REST routes are defined. Copying the route rather than mounting the
+# whole sub-app avoids a path prefix and trailing-slash mismatch, and keeps a
+# single ASGI app with one lifespan. The session manager it dispatches to is
+# started by _lifespan above.
+for _route in _mcp_asgi_app.routes:
+    app.router.routes.append(_route)
 
 
 def main() -> None:

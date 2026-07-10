@@ -2,8 +2,11 @@
 
 One Python service (FastAPI + an MCP server sharing the same service layer).
 State lives only in the git-backed song store and the audio cache; everything
-else is stateless and env-configured (`.env.example`). Deployable to Cloud
-Run as two services from one image — see `docs/DEPLOY_CLOUD_RUN.md`.
+else is stateless and env-configured (`.env.example`). Deployed to Cloud Run
+as a **single** service: the MCP streamable-HTTP transport is embedded into
+the FastAPI app at `/mcp` (one ASGI app, one lifespan), so one container is
+the sole writer to the store — `--concurrency=1` then fully serializes writes
+with no cross-service race. See `docs/DEPLOY_CLOUD_RUN.md`.
 
 ```
 snoocle_server/
@@ -39,12 +42,17 @@ snoocle_server/
 │                    (saveRecordIfVersionUnchanged), OS write lock,
 │                    append-only provenance enforcement
 ├── pipeline.py      orchestration, tolerant of partial failure
-├── api.py           HTTP surface (one endpoint per step + full pipeline)
+├── api.py           HTTP surface (one endpoint per step + full pipeline);
+│                    ALSO embeds the MCP transport at /mcp (single-service
+│                    topology) — imports the FastMCP instance, runs its
+│                    session manager in the app lifespan, registers the route
 └── mcp_server.py    MCP surface (16 step-scoped tools; base64 fallback for
                      binary; save-if-version-unchanged exposed). Defaults to
                      stdio (local subprocess use); SNOOCLE_MCP_TRANSPORT=
-                     streamable-http serves it as a long-running HTTP
-                     process instead (e.g. its own Cloud Run service).
+                     streamable-http serves it as a standalone HTTP process.
+                     resolve_http_transport() is the shared, unit-tested
+                     bind-host + DNS-rebinding-security resolver used by both
+                     the standalone server and the embedded /mcp route.
 ```
 
 ## Key decisions & assumptions (made overnight, flag anything wrong)

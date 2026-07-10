@@ -1,18 +1,21 @@
 # Deploying Snoocle server to Cloud Run
 
-Two Cloud Run services share one container image, deployed with different
-startup commands:
+**One** Cloud Run service runs the combined app: the FastAPI REST API plus the
+MCP streamable-HTTP transport, served at `/mcp` on the same service. A single
+container/process is therefore the **sole writer** to the git store — which
+fully serializes writes (no cross-service race) and removes any cross-mount
+read-staleness.
 
-| Service | Runs | Transport | Auth |
-|---|---|---|---|
-| `snoocle-api`  | `uvicorn snoocle_server.api:app` (image default `CMD`) | HTTP (FastAPI) | Cloud Run IAM |
-| `snoocle-mcp`  | `snoocle-mcp` with `SNOOCLE_MCP_TRANSPORT=streamable-http` | MCP streamable-HTTP | Cloud Run IAM |
+| Path | Surface | Auth |
+|---|---|---|
+| `/healthz`, `/v1/...` | REST API (FastAPI) | Cloud Run IAM |
+| `/mcp` | MCP streamable-HTTP (stateless) | Cloud Run IAM |
 
-Both are **private** (`--no-allow-unauthenticated`) — every request must carry
-a Google-signed identity token for a principal you've explicitly granted
+The service is **private** (`--no-allow-unauthenticated`) — every request must
+carry a Google-signed identity token for a principal you've explicitly granted
 `roles/run.invoker`. This is deliberate: the service can trigger YouTube
-downloads and spend your LLM API budget on request, and the original brief
-is explicit that server-side YouTube acquisition is personal-use-only until
+downloads and spend your LLM API budget on request, and the original brief is
+explicit that server-side YouTube acquisition is personal-use-only until
 reconsidered for wider exposure. IAM auth keeps that posture without any
 app-level auth code.
 
@@ -36,8 +39,9 @@ gcloud config set project "$PROJECT_ID"
 ## 1. One-time project setup
 
 ```sh
-# Includes iam (service-account creation, step 1) and cloudbuild (image build,
-# step 3) — on a fresh project those commands fail without their APIs enabled.
+# Includes iam (service-account creation, this step) and cloudbuild (image
+# build, step 3) — on a fresh project those commands fail without their APIs
+# enabled.
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
     secretmanager.googleapis.com storage.googleapis.com \
     iam.googleapis.com cloudbuild.googleapis.com
@@ -76,17 +80,17 @@ done
 
 ## 3. Build and push the image
 
-Reuses the `Dockerfile` already on `main` — no changes needed for either
-service; they differ only by the Cloud Run `--command`/env override in step 4.
+Reuses the `Dockerfile` already on `main` — its default `CMD`
+(`uvicorn snoocle_server.api:app`) is exactly the combined app.
 
 ```sh
 gcloud builds submit --tag "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/snoocle:latest" .
 ```
 
-## 4. Deploy — `snoocle-api`
+## 4. Deploy the (single) `snoocle` service
 
 ```sh
-gcloud run deploy snoocle-api \
+gcloud run deploy snoocle \
     --project="$PROJECT_ID" --region="$REGION" \
     --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/snoocle:latest" \
     --service-account="snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -96,9 +100,31 @@ gcloud run deploy snoocle-api \
     --min-instances=0 --max-instances=1 \
     --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750;metadata-cache-ttl-secs=0" \
     --add-volume-mount=volume=data,mount-path=/data \
-    --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache" \
+    --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRUST_PROXY=true" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
 ```
+
+The default container `CMD` runs `uvicorn snoocle_server.api:app`, which serves
+the REST API and mounts the MCP transport at `/mcp` (embedded in the same ASGI
+app, one lifespan). `--command`/`--args` are **not** overridden — there is only
+one service.
+
+**`--concurrency=1` is genuinely safe here.** Because this one service is the
+only writer to the store, the concurrency cap serializes *every* write — API
+and MCP alike — with no cross-service interleaving. Combined with the MCP
+transport running **stateless** (no persistent GET SSE stream that would
+otherwise occupy the single request slot and deadlock tool-call POSTs;
+`SNOOCLE_MCP_STATELESS` defaults true), `--concurrency=1` is both correct and
+non-deadlocking. `GitSongStore`'s `fcntl.flock` — unreliable over gcsfuse — is
+no longer load-bearing, since the concurrency cap does the serialization.
+
+**`SNOOCLE_MCP_TRUST_PROXY=true`** disables the MCP DNS-rebinding host check on
+the `/mcp` route — correct **only** because Cloud Run IAM
+(`--no-allow-unauthenticated`) authenticates every request before it reaches
+the container, and because the co-located REST routes have no such check
+either: the whole service's exposure is governed uniformly at the IAM/bind
+edge, not per-route. Locally (no flag), the `/mcp` host check stays on with a
+localhost allowlist; bind uvicorn to `127.0.0.1` for local runs.
 
 **The `mount-options` uid/gid are required, not optional.** Cloud Run mounts a
 GCS FUSE volume **root-owned** by default, but the image runs as non-root
@@ -107,137 +133,52 @@ GCS FUSE volume **root-owned** by default, but the image runs as non-root
 initializing the store, or the first audio-cache write — fails with permission
 denied, so the service starts but can't analyze or store anything. (`file-mode`/
 `dir-mode` are needed too because GCS FUSE ignores `chmod`, so the app can't fix
-perms at runtime.)
+perms at runtime.) `metadata-cache-ttl-secs=0` is belt-and-suspenders now that
+one process owns the mount (it forces a generation re-check per read); harmless
+to keep.
 
-**Sharing one GCS-FUSE git store across two services is fragile — read this
-before serving real traffic.** Two independent problems, both rooted in the
-two-service topology:
-
-1. **Read staleness.** GCS FUSE caches file metadata; Cloud Run's default
-   stat-cache TTL is **60s**. `GitSongStore.current_version()`, `get()`, and
-   `list_songs()` all read refs/song files through the mount, so *even with
-   sequential (non-concurrent) requests*, the MCP service can read seconds
-   after an API write and still see stale state — missing the just-committed
-   version. The `metadata-cache-ttl-secs=0` in the mount-options above
-   disables that cache (each read re-checks object generation), which
-   mitigates this. It costs a metadata round-trip per read — acceptable for a
-   low-volume personal store.
-2. **Write races.** `GitSongStore`'s `fcntl.flock` (`store/gitstore.py`) is
-   **not reliably honored over gcsfuse** (POSIX subset, no advisory locking),
-   and `metadata-cache-ttl-secs=0` does **not** help here. `--concurrency=1
-   --max-instances=1` serializes writes within *one* service, but the two
-   services (`snoocle-api` and `snoocle-mcp`) both write the same store
-   (`/v1/songs/analyze`, `POST /v1/songs/{id}`; `analyze_and_store_song`,
-   `save_song`), so a write in each container can interleave and corrupt the
-   git index/refs — the per-service cap does not serialize across services,
-   and no mount-option fixes this.
-
-The mount-option above closes (1). For (2), pick one:
-
-- **(recommended) Single writer.** Deploy only ONE of the two services, or
-  serve both surfaces from one Cloud Run service (the FastMCP app mounted
-  into the FastAPI app so a single container/port answers both REST and MCP —
-  then `--concurrency=1` genuinely serializes every write *and* removes the
-  cross-service read-staleness entirely, since there's one mount). Small code
-  change, not yet implemented — see the follow-up note at the end.
-- **Accept the write-race for personal single-user use.** Two simultaneous
-  writes to the *same* song id are what corrupt history; a single-user
-  workflow rarely fires an API write and an MCP write concurrently. Fine to
-  start here; don't rely on it for anything shared.
-- **Implement a GCS-native lock.** Replace `flock` with conditional writes
-  via object-generation preconditions (the store already has an
-  `expected_version` CAS path to build on). The durable fix; not built yet.
-
-## 5. Deploy — `snoocle-mcp`
-
-Same image, overridden startup command; MCP tool calls are typically
-longer-running than plain API calls (audio download + MIR + LLM chained
-inside one `analyze_and_store_song` tool call), so the timeout is generous.
-
-**`--concurrency=1` is safe here only because the server runs in stateless
-HTTP mode** (the default in `streamable-http` transport; `SNOOCLE_MCP_STATELESS`
-defaults true). A *stateful* streamable-HTTP MCP server holds a long-lived
-GET SSE stream open per client for server-initiated messages; under
-`--concurrency=1` that stream would occupy the container's single request slot
-and every tool-call POST would queue behind it until it times out — a
-deadlock. Stateless mode issues no such persistent stream (each request is
-independent), so `--concurrency=1` serializes tool calls without deadlocking.
-If you set `SNOOCLE_MCP_STATELESS=false`, you must also raise `--concurrency`
-to at least 2 (SSE stream + command POSTs) — which then reintroduces the
-intra-service write-race concern from step 4.
+## 5. Grant yourself access
 
 ```sh
-gcloud run deploy snoocle-mcp \
-    --project="$PROJECT_ID" --region="$REGION" \
-    --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/snoocle:latest" \
-    --command=snoocle-mcp \
-    --service-account="snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --no-allow-unauthenticated \
-    --execution-environment=gen2 \
-    --cpu=1 --memory=2Gi --timeout=900 --concurrency=1 \
-    --min-instances=0 --max-instances=1 \
-    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750;metadata-cache-ttl-secs=0" \
-    --add-volume-mount=volume=data,mount-path=/data \
-    --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRANSPORT=streamable-http,SNOOCLE_MCP_TRUST_PROXY=true" \
-    --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
-```
-
-`SNOOCLE_MCP_TRUST_PROXY=true` binds `0.0.0.0` (required so Cloud Run can
-route traffic to the container) and disables the MCP SDK's DNS-rebinding host
-check — correct **only** because Cloud Run IAM (`--no-allow-unauthenticated`)
-authenticates every request before it reaches the container. Without a
-remote-serving flag the server binds loopback (`127.0.0.1`) with the host
-check ON, so a local HTTP run is never exposed on the LAN; set this flag only
-when an authenticating proxy sits in front. (Alternatively, once you know the
-assigned hostname, set `SNOOCLE_MCP_ALLOWED_HOSTS=snoocle-mcp-….run.app` — it
-also binds `0.0.0.0` but keeps the host check on, scoped to that host.)
-
-Both services point at the **same bucket/mount** — they see the same song
-store, so a song analyzed via the API is immediately visible to the MCP
-`get_song`/`list_songs` tools and vice versa.
-
-## 6. Grant yourself access
-
-```sh
-gcloud run services add-iam-policy-binding snoocle-api --region="$REGION" \
-    --member="user:vreich@kugelbrands.com" --role=roles/run.invoker
-gcloud run services add-iam-policy-binding snoocle-mcp --region="$REGION" \
+gcloud run services add-iam-policy-binding snoocle --region="$REGION" \
     --member="user:vreich@kugelbrands.com" --role=roles/run.invoker
 ```
 
-## 7. Calling the API
+## 6. Calling the REST API
 
 ```sh
-API_URL=$(gcloud run services describe snoocle-api --region="$REGION" --format='value(status.url)')
-TOKEN=$(gcloud auth print-identity-token --audiences="$API_URL")
+URL=$(gcloud run services describe snoocle --region="$REGION" --format='value(status.url)')
+TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
 
-curl -H "Authorization: Bearer $TOKEN" "$API_URL/healthz"
+curl -H "Authorization: Bearer $TOKEN" "$URL/healthz"
 
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"title":"Let It Be","artist":"The Beatles"}' \
-    "$API_URL/v1/songs/analyze"
+    "$URL/v1/songs/analyze"
 ```
 
 Identity tokens expire (~1 hour) — re-run `print-identity-token` for a fresh
 one rather than hardcoding it anywhere.
 
-## 8. Connecting an MCP client
+## 7. Connecting an MCP client
+
+The MCP endpoint is `/mcp` on the **same** service URL:
 
 ```sh
-MCP_URL=$(gcloud run services describe snoocle-mcp --region="$REGION" --format='value(status.url)')
-MCP_TOKEN=$(gcloud auth print-identity-token --audiences="$MCP_URL")
+URL=$(gcloud run services describe snoocle --region="$REGION" --format='value(status.url)')
+TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
 ```
 
-Any MCP client that supports the streamable-HTTP transport with custom
-headers can connect to `"$MCP_URL/mcp"` sending
-`Authorization: Bearer $MCP_TOKEN`. With the Python SDK directly:
+Any MCP client that supports the streamable-HTTP transport with custom headers
+can connect to `"$URL/mcp"` sending `Authorization: Bearer $TOKEN`. With the
+Python SDK directly:
 
 ```python
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 async with streamablehttp_client(
-    f"{MCP_URL}/mcp", headers={"Authorization": f"Bearer {MCP_TOKEN}"}
+    f"{URL}/mcp", headers={"Authorization": f"Bearer {TOKEN}"}
 ) as (read, write, _):
     async with ClientSession(read, write) as session:
         await session.initialize()
@@ -245,30 +186,26 @@ async with streamablehttp_client(
 ```
 
 For a GUI client (Claude Desktop, etc.) whose remote-MCP config supports a
-`headers` field alongside `url`, pass the same Bearer header there. As with
-the API, the token expires in ~1 hour — for anything longer-lived, a small
-wrapper that refreshes the token per-connection is needed; not built here
-since this is a personal-use, manually-invoked tool per the brief, not a
-persistent multi-user integration.
+`headers` field alongside `url`, pass the same Bearer header there. As with the
+API, the token expires in ~1 hour — for anything longer-lived, a small wrapper
+that refreshes the token per-connection is needed; not built here since this is
+a personal-use, manually-invoked tool per the brief, not a persistent
+multi-user integration.
 
-**For purely local use** (no Cloud Run involvement, no IAM token dance):
-`snoocle-mcp` still defaults to stdio — run it as a subprocess from your own
-machine's MCP client config exactly as before; only the deployed variant
-needs any of this.
+**For purely local use** (no Cloud Run, no IAM token dance): `snoocle-mcp` still
+defaults to **stdio** — run it as a subprocess from your own machine's MCP
+client config. Or run the combined app locally with `uvicorn
+snoocle_server.api:app` and point an MCP client at `http://127.0.0.1:8000/mcp`.
 
 ## Known gaps / follow-ups
 
-- **Two services sharing one GCS-FUSE git store** (see step 4). Read
-  staleness (60s stat-cache TTL) is mitigated by `metadata-cache-ttl-secs=0`
-  in the mount-options. The write race is NOT: per-service `--concurrency=1`
-  doesn't serialize across the two services, and `flock` doesn't work over
-  GCS FUSE. Real fixes: serve both surfaces from a single Cloud Run service
-  (mount the FastMCP ASGI app into the FastAPI app — small code change, not
-  yet done), or a GCS-native conditional-write lock in `GitSongStore`. For
-  personal single-user use the practical write-race window is small; don't
-  rely on the two-service topology for shared use.
+- **`flock` over gcsfuse is still unreliable** — but it is no longer relied on:
+  the single-service `--concurrency=1` serializes writes. If you ever run
+  `--max-instances>1` or `--concurrency>1`, you'd reintroduce a write race and
+  should implement a GCS-native conditional-write lock in `GitSongStore` (it
+  already has an `expected_version` CAS path to build on) first.
 - **madmom is not in the runtime image** (the Dockerfile excludes it — heavy
-  native build). The deployed beat engine is the librosa fallback, not the
-  one used in this session's local acceptance run.
+  native build). The deployed beat engine is the librosa fallback, not the one
+  used in this session's local acceptance run.
 - **No automated re-deploy pipeline** — these are one-shot `gcloud` commands;
   wire up Cloud Build triggers or GitHub Actions if you want push-to-deploy.

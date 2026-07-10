@@ -463,6 +463,18 @@ def main() -> None:
     mcp.settings.host = host
     mcp.settings.port = port
     mcp.settings.transport_security = security
+
+    # Stateless HTTP by default (no persistent server->client SSE stream).
+    # Required for a Cloud Run --concurrency=1 deployment: otherwise the MCP
+    # client's long-lived GET SSE stream (opened after initialize) occupies the
+    # single request slot and every subsequent tool-call POST queues behind it
+    # until it times out — a deadlock. This tool server issues no
+    # server-initiated notifications, so statelessness costs nothing here.
+    # Opt out (restore the stateful session + SSE stream) with
+    # SNOOCLE_MCP_STATELESS=false — then the service needs concurrency >= 2.
+    if transport == "streamable-http" and _truthy(os.environ.get("SNOOCLE_MCP_STATELESS", "true")):
+        mcp.settings.stateless_http = True
+        mcp.settings.json_response = True
     mcp.run(transport=transport)
 
 

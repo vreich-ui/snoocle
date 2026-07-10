@@ -152,7 +152,19 @@ The mount-option above closes (1). For (2), pick one:
 
 Same image, overridden startup command; MCP tool calls are typically
 longer-running than plain API calls (audio download + MIR + LLM chained
-inside one `analyze_and_store_song` tool call), so the timeout is generous:
+inside one `analyze_and_store_song` tool call), so the timeout is generous.
+
+**`--concurrency=1` is safe here only because the server runs in stateless
+HTTP mode** (the default in `streamable-http` transport; `SNOOCLE_MCP_STATELESS`
+defaults true). A *stateful* streamable-HTTP MCP server holds a long-lived
+GET SSE stream open per client for server-initiated messages; under
+`--concurrency=1` that stream would occupy the container's single request slot
+and every tool-call POST would queue behind it until it times out — a
+deadlock. Stateless mode issues no such persistent stream (each request is
+independent), so `--concurrency=1` serializes tool calls without deadlocking.
+If you set `SNOOCLE_MCP_STATELESS=false`, you must also raise `--concurrency`
+to at least 2 (SSE stream + command POSTs) — which then reintroduces the
+intra-service write-race concern from step 4.
 
 ```sh
 gcloud run deploy snoocle-mcp \

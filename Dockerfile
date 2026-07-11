@@ -82,8 +82,13 @@ RUN apt-get update \
 # Copy the fully-built virtualenv from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
 
-# Non-root user for security. Fixed high UID keeps it clearly non-privileged.
-RUN useradd --create-home --uid 10001 appuser
+# Non-root user for security. Fixed high UID *and GID* keep it clearly
+# non-privileged and — critically — let a Cloud Run GCS-FUSE volume be mounted
+# with matching uid=10001;gid=10001 mount-options (GCS mounts are root-owned by
+# default, so a non-root user can't write without that). Pinning the GID makes
+# the value the deploy runbook references reliable. See docs/DEPLOY_CLOUD_RUN.md.
+RUN groupadd --gid 10001 appuser \
+    && useradd --create-home --uid 10001 --gid 10001 appuser
 
 WORKDIR /app
 

@@ -228,6 +228,7 @@ class MockProvider(LLMProvider):
     name = "mock"
     default_model = "mock-reconciler-v1"
     supports_audio = False
+    wants_context = True
 
     # engine.py injects the structured inputs here before calling complete()
     context: dict | None = None
@@ -237,16 +238,132 @@ class MockProvider(LLMProvider):
             raise ProviderError("mock provider requires engine-injected context")
         from .mock_reconciler import reconcile_deterministically
 
-        song = reconcile_deterministically(**self.context)
+        ctx = self.context
+        song = reconcile_deterministically(
+            title=ctx["title"],
+            artist=ctx["artist"],
+            song_id=ctx["song_id"],
+            youtube_video_id=ctx["youtube_video_id"],
+            candidates=ctx["candidates"],
+            mir=ctx["mir"],
+        )
         return LLMResponse(
             text=song.model_dump_json(), provider=self.name, model=self.default_model
         )
+
+
+class AgentMcpProvider(LLMProvider):
+    """Delegates reconciliation to an EXTERNAL AGENT over MCP.
+
+    In this mode Snoocle holds no LLM keys and runs no AI itself: it is the
+    MCP *client*. The configured agent workspace (e.g. a Claude Agent SDK
+    environment with specialty agents) exposes an MCP server; Snoocle calls
+    one tool there (SNOOCLE_AGENT_MCP_TOOL, default "reconcile_song") with a
+    structured JSON request:
+
+        {"request": {
+            "songId": ..., "title": ..., "artist": ...,
+            "mediaUrl": <YouTube watch URL or other media URL>,
+            "youtubeVideoId": ...,
+            "chords": [{"start": s, "end": s, "chord": "Am7"}, ...],  # MIR-timestamped
+            "mir": {bpm, key, beats, sections, ...},
+            "candidates": [...web text sources...],
+            "songSchema": {...}
+        }}
+
+    and on repair rounds adds {"previousOutput": ..., "validationErrors": ...}.
+    The tool's text result must be (or contain) the reconciled Song JSON; the
+    engine's schema validation and repair loop apply to it exactly as they do
+    to a direct LLM response.
+    """
+
+    name = "agent"
+    default_model = "agent-mcp"
+    supports_audio = False  # media is referenced by URL, not attached
+    wants_context = True
+
+    context: dict | None = None
+
+    def complete(self, system, turns, model=None, max_tokens=None, audio=None):
+        import asyncio
+
+        if not settings.agent_mcp_url:
+            raise ProviderError(
+                "agent: SNOOCLE_AGENT_MCP_URL is not configured — point it at the "
+                "agent workspace's MCP endpoint (streamable HTTP)"
+            )
+        if not self.context:
+            raise ProviderError("agent provider requires engine-injected context")
+
+        ctx = self.context
+        mir = ctx.get("mir")
+        request: dict = {
+            "songId": ctx["song_id"],
+            "title": ctx["title"],
+            "artist": ctx["artist"],
+            "mediaUrl": ctx.get("media_url"),
+            "youtubeVideoId": ctx.get("youtube_video_id"),
+            # the timestamped chord changes, first-class per the integration contract
+            "chords": [c.model_dump() for c in mir.chords] if mir is not None else [],
+            "mir": mir.to_prompt_payload() if mir is not None else None,
+            "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
+            "songSchema": ctx["song_schema"],
+        }
+        args: dict = {"request": request}
+        # Repair round: turns are [user, assistant, repair-user, ...] — hand the
+        # agent its previous output and the validation errors verbatim.
+        if len(turns) >= 3:
+            args["previousOutput"] = turns[-2]["text"]
+            args["validationErrors"] = turns[-1]["text"]
+
+        try:
+            text = asyncio.run(self._call_tool(args))
+        except ProviderError:
+            raise
+        except Exception as e:  # noqa: BLE001 — SDK raises ExceptionGroups/transport errors
+            raise ProviderError(f"agent: MCP call failed: {e}") from e
+        return LLMResponse(
+            text=text,
+            provider=self.name,
+            model=f"mcp:{settings.agent_mcp_tool}",
+        )
+
+    async def _call_tool(self, args: dict) -> str:
+        from datetime import timedelta
+
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        headers = {}
+        if settings.agent_mcp_auth_token:
+            headers["Authorization"] = f"Bearer {settings.agent_mcp_auth_token}"
+        timeout = timedelta(seconds=settings.agent_mcp_timeout_seconds)
+        async with streamablehttp_client(
+            settings.agent_mcp_url, headers=headers or None, timeout=timeout, sse_read_timeout=timeout
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    settings.agent_mcp_tool, args, read_timeout_seconds=timeout
+                )
+        texts = [b.text for b in result.content if getattr(b, "type", "") == "text"]
+        if result.isError:
+            raise ProviderError(
+                f"agent: tool {settings.agent_mcp_tool!r} returned an error: "
+                + (" ".join(texts)[:500] or "(no message)")
+            )
+        if not texts:
+            raise ProviderError(
+                f"agent: tool {settings.agent_mcp_tool!r} returned no text content"
+            )
+        return "\n".join(texts)
 
 
 _PROVIDERS: dict[str, type[LLMProvider]] = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
     "gemini": GeminiProvider,
+    "agent": AgentMcpProvider,
     "mock": MockProvider,
 }
 

@@ -61,7 +61,7 @@ def test_extract_json_tolerates_fences_and_preamble():
 
 def test_provider_registry():
     caps = provider_capabilities()
-    assert set(caps) == {"anthropic", "openai", "gemini", "mock"}
+    assert set(caps) == {"anthropic", "openai", "gemini", "agent", "mock"}
     assert caps["anthropic"]["supportsAudioInput"] is False  # baseline is structured-only
     assert caps["openai"]["supportsAudioInput"] is True
     assert caps["gemini"]["supportsAudioInput"] is True

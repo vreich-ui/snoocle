@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     gemini_api_key: str = ""
 
+    # --- agent-delegated reconciliation (provider "agent") ---
+    # Snoocle holds no LLM keys in this mode: reconciliation is delegated to an
+    # external agent workspace (e.g. Claude Agent SDK with specialty agents)
+    # reachable as an MCP server over streamable HTTP. Snoocle is the MCP
+    # CLIENT: it calls one tool there, passing title/artist, the media URL, and
+    # the timestamped MIR chord timeline, and expects Song JSON back.
+    agent_mcp_url: str = ""  # e.g. https://my-agent.example.run.app/mcp
+    agent_mcp_tool: str = "reconcile_song"
+    agent_mcp_auth_token: str = ""  # sent as Authorization: Bearer <token>
+    agent_mcp_timeout_seconds: float = 600.0  # agent runs can be slow
+
     anthropic_base_url: str = "https://api.anthropic.com"
     openai_base_url: str = "https://api.openai.com"
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
@@ -63,10 +74,12 @@ class Settings(BaseSettings):
     port: int = 8765
 
     def provider_key(self, provider: str) -> str:
+        """The credential/endpoint whose presence makes a provider usable."""
         return {
             "anthropic": self.anthropic_api_key,
             "openai": self.openai_api_key,
             "gemini": self.gemini_api_key,
+            "agent": self.agent_mcp_url,
         }.get(provider, "")
 
 

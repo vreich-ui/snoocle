@@ -26,7 +26,7 @@ from ..mir.base import MirAnalysis
 from ..schema import Song, song_json_schema
 from ..schema.song import ProvenanceEntry, slugify_song_id
 from .prompt import SYSTEM_PROMPT, build_repair_prompt, build_user_prompt
-from .providers import AudioAttachment, LLMProvider, MockProvider, get_provider
+from .providers import AudioAttachment, LLMProvider, get_provider
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +155,7 @@ def reconcile(
     attach_audio: bool | None = None,
     youtube_video_id: str | None = None,
     song_id: str | None = None,
+    media_url: str | None = None,
 ) -> ReconcileResult:
     if not candidates and mir is None:
         raise ReconcileError("nothing to reconcile: no candidate sources and no MIR analysis")
@@ -162,14 +163,21 @@ def reconcile(
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
 
-    if isinstance(provider, MockProvider):
+    if media_url is None and youtube_video_id:
+        media_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
+
+    # Context-driven providers (mock, agent) consume the structured inputs
+    # directly instead of the rendered prompt text.
+    if getattr(provider, "wants_context", False):
         provider.context = {
             "title": title,
             "artist": artist,
             "song_id": song_id,
             "youtube_video_id": youtube_video_id,
+            "media_url": media_url,
             "candidates": candidates,
             "mir": mir,
+            "song_schema": song_json_schema(),
         }
 
     audio: AudioAttachment | None = None

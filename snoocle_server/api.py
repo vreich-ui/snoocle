@@ -222,11 +222,14 @@ class ReconcileRequest(BaseModel):
     artist: str
     candidates: list[CandidateSource] = Field(default_factory=list)
     mir: Optional[MirAnalysis] = None
-    provider: Optional[str] = None  # anthropic | openai | gemini | mock
+    provider: Optional[str] = None  # anthropic | openai | gemini | agent | mock
     model: Optional[str] = None
     audioPath: Optional[str] = None
     attachAudio: Optional[bool] = None
     youtubeVideoId: Optional[str] = None
+    # For the "agent" provider: the media the song came from (YouTube watch URL
+    # or another media URL). Defaults to the YouTube URL when youtubeVideoId set.
+    mediaUrl: Optional[str] = None
 
 
 def _reconcile_response(result: ReconcileResult) -> dict:
@@ -253,6 +256,7 @@ def post_reconcile(req: ReconcileRequest) -> dict:
             audio_path=req.audioPath,
             attach_audio=req.attachAudio,
             youtube_video_id=req.youtubeVideoId,
+            media_url=req.mediaUrl,
         )
     except (ReconcileError, ProviderError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

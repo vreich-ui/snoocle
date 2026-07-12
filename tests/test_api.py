@@ -44,7 +44,7 @@ def test_healthz():
     body = r.json()
     assert body["status"] == "ok"
     assert body["ffmpeg"] is True
-    assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "mock"}
+    assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "agent", "mock"}
 
 
 def test_song_schema_endpoint():

@@ -81,7 +81,7 @@ async def test_mcp_tools_over_stdio(tone_wav_b64, tmp_path):
             status = await session.call_tool("server_status", {})
             payload = json.loads(status.content[0].text)
             assert payload["ffmpeg"] is True
-            assert set(payload["llmProviders"]) == {"anthropic", "openai", "gemini", "mock"}
+            assert set(payload["llmProviders"]) == {"anthropic", "openai", "gemini", "agent", "mock"}
 
             # deterministic audio utility over MCP with base64 fallback (no AI)
             trimmed = await session.call_tool(

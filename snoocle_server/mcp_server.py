@@ -140,12 +140,17 @@ def reconcile_song(
     audio_path: Optional[str] = None,
     attach_audio: Optional[bool] = None,
     youtube_video_id: Optional[str] = None,
+    media_url: Optional[str] = None,
 ) -> dict:
     """Reconcile candidate text sources + MIR analysis into a schema-compliant
-    Song JSON via the configured LLM (step 5). candidates_json/mir_json accept
-    the outputs of discover_song / analyze_audio; when candidates_json is
-    omitted, discovery runs first. Does NOT persist — use save_song or
-    analyze_and_store_song for that. provider: anthropic | openai | gemini | mock."""
+    Song JSON via the configured reconciler (step 5). candidates_json/mir_json
+    accept the outputs of discover_song / analyze_audio; when candidates_json
+    is omitted, discovery runs first. Does NOT persist — use save_song or
+    analyze_and_store_song for that. provider: anthropic | openai | gemini |
+    agent | mock. The "agent" provider delegates to an external agent
+    workspace's MCP server (SNOOCLE_AGENT_MCP_URL), sending title/artist,
+    media_url (YouTube watch URL or other media URL; derived from
+    youtube_video_id when omitted), and the timestamped MIR chord timeline."""
     if candidates_json:
         candidates = [CandidateSource.model_validate(c) for c in json.loads(candidates_json)]
     else:
@@ -164,6 +169,7 @@ def reconcile_song(
         audio_path=audio_path,
         attach_audio=attach_audio,
         youtube_video_id=youtube_video_id,
+        media_url=media_url,
     )
     return {
         "song": result.song.model_dump(),

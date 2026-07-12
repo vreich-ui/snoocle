@@ -157,6 +157,30 @@ curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     "$URL/v1/songs/analyze"
 ```
 
+**iOS read surface** — the app lists songs and downloads each one as Song JSON
+(the exact schema `GET /v1/schema/song` returns):
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs"                       # list ids
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs/the-beatles--let-it-be" # full Song JSON
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs/the-beatles--let-it-be/versions"
+```
+
+**Bring your own recording** — upload an audio *or* video file and get MIR pitch
+analysis (beats/downbeats, sounding-harmony chord timeline, sections, bpm, key)
+with no YouTube step. For a video, the audio track is extracted automatically;
+a file with no audio stream returns 422:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/path/to/song.mp3" \
+    "$URL/v1/audio/analyze/upload"
+
+curl -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/path/to/clip.mp4" \
+    "$URL/v1/audio/analyze/upload"
+```
+
 Identity tokens expire (~1 hour) — re-run `print-identity-token` for a fresh
 one rather than hardcoding it anywhere.
 

@@ -231,5 +231,13 @@ snoocle_server.api:app` and point an MCP client at `http://127.0.0.1:8000/mcp`.
 - **madmom is not in the runtime image** (the Dockerfile excludes it — heavy
   native build). The deployed beat engine is the librosa fallback, not the one
   used in this session's local acceptance run.
+- **Chord-CNN-LSTM IS in the runtime image** (cloned + CPU torch in the
+  Dockerfile builder stage; `SNOOCLE_CHORD_CNN_LSTM_DIR=/opt/models/
+  chord-cnn-lstm` preset). `/healthz` should report `mirEngines.chords:
+  "chord-cnn-lstm"`. Expect a few minutes of CPU inference per song — raise
+  `--timeout` accordingly if full-pipeline requests start hitting it. For a
+  local (non-Docker) install run `scripts/setup_chord_model.sh` and
+  `pip install -e .[chordmodel]` (CPU torch: add
+  `--index-url https://download.pytorch.org/whl/cpu`).
 - **No automated re-deploy pipeline** — these are one-shot `gcloud` commands;
   wire up Cloud Build triggers or GitHub Actions if you want push-to-deploy.

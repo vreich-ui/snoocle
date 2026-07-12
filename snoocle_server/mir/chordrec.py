@@ -82,7 +82,12 @@ def _runner_path() -> Path | None:
 def recognize_chords_cnn_lstm(wav_path: str) -> list[ChordSegment]:
     runner = _runner_path()
     assert runner is not None
-    lab_path = Path(wav_path).with_suffix(".lab")
+    # subprocess runs with cwd=runner.parent (the model resolves its data/ and
+    # cache_data/ relative to cwd) — so both paths must be absolute or a
+    # relative SNOOCLE_CHORD_CNN_LSTM_DIR would re-resolve against the new cwd.
+    runner = runner.resolve()
+    lab_path = Path(wav_path).resolve().with_suffix(".lab")
+    wav_path = str(Path(wav_path).resolve())
     proc = subprocess.run(
         [sys.executable, str(runner), wav_path, str(lab_path)],
         capture_output=True,

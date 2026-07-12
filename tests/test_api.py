@@ -44,7 +44,7 @@ def test_healthz():
     body = r.json()
     assert body["status"] == "ok"
     assert body["ffmpeg"] is True
-    assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "mock"}
+    assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "agent", "mock"}
 
 
 def test_song_schema_endpoint():
@@ -183,3 +183,65 @@ def test_audio_trim_bad_range(tone_bytes):
         files={"file": ("tone.wav", io.BytesIO(tone_bytes), "audio/wav")},
     )
     assert r.status_code == 400
+
+
+@pytest.fixture(scope="module")
+def video_bytes(tmp_path_factory):
+    """A tiny mp4 with a real audio track — the 'bring your own video' case."""
+    p = tmp_path_factory.mktemp("api-video") / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc=size=128x72:rate=10:duration=3",
+         "-f", "lavfi", "-i", "sine=frequency=330:duration=3",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(p)],
+        check=True, capture_output=True,
+    )
+    return p.read_bytes()
+
+
+@pytest.fixture(scope="module")
+def silent_video_bytes(tmp_path_factory):
+    """A video with NO audio stream — must be rejected, not silently analyzed."""
+    p = tmp_path_factory.mktemp("api-silent") / "silent.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc=size=128x72:rate=10:duration=2",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(p)],
+        check=True, capture_output=True,
+    )
+    return p.read_bytes()
+
+
+@pytestmark_audio
+def test_analyze_upload_audio_file(tone_bytes):
+    r = client.post(
+        "/v1/audio/analyze/upload",
+        files={"file": ("tone.wav", io.BytesIO(tone_bytes), "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["filename"] == "tone.wav"
+    a = body["analysis"]
+    assert a["duration_seconds"] > 0
+    assert "beats" in a["engines"] and "chords" in a["engines"] and "structure" in a["engines"]
+
+
+@pytestmark_audio
+def test_analyze_upload_video_file_extracts_audio(video_bytes):
+    # A video container: the audio track is extracted and analyzed.
+    r = client.post(
+        "/v1/audio/analyze/upload",
+        files={"file": ("clip.mp4", io.BytesIO(video_bytes), "video/mp4")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["analysis"]["duration_seconds"] > 0
+
+
+@pytestmark_audio
+def test_analyze_upload_rejects_streamless_video(silent_video_bytes):
+    r = client.post(
+        "/v1/audio/analyze/upload",
+        files={"file": ("silent.mp4", io.BytesIO(silent_video_bytes), "video/mp4")},
+    )
+    assert r.status_code == 422
+    assert "audio stream" in r.json()["detail"]

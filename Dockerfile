@@ -56,6 +56,20 @@ COPY snoocle_server ./snoocle_server
 # (dev/pytest and the heavy madmom build are intentionally excluded.)
 RUN pip install ".[mir]" anthropic python-multipart
 
+# Real chord-recognition model: Chord-CNN-LSTM (ISMIR2019, music-x-lab).
+# The pretrained 5-fold checkpoints (~28MB) ship in the upstream repo, so a
+# shallow clone is a complete install. CPU-only torch keeps the image ~800MB
+# smaller than the default CUDA build; inference is a few minutes per song on
+# one Cloud Run CPU, well under the 1800s runner timeout. This is the single
+# biggest accuracy lever over the chroma-template fallback.
+RUN git clone --depth 1 \
+        https://github.com/music-x-lab/ISMIR2019-Large-Vocabulary-Chord-Recognition.git \
+        /opt/models/chord-cnn-lstm \
+    && rm -rf /opt/models/chord-cnn-lstm/.git \
+    && pip install torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install h5py pretty_midi mir_eval pydub
+COPY scripts/snoocle_runner.py /opt/models/chord-cnn-lstm/snoocle_runner.py
+
 
 # -----------------------------------------------------------------------------
 # Runtime stage
@@ -79,8 +93,9 @@ RUN apt-get update \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the fully-built virtualenv from the builder stage.
+# Copy the fully-built virtualenv and the chord model from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/models /opt/models
 
 # Non-root user for security. Fixed high UID *and GID* keep it clearly
 # non-privileged and — critically — let a Cloud Run GCS-FUSE volume be mounted
@@ -103,6 +118,7 @@ RUN mkdir -p /data/songstore /data/audio-cache \
 ENV SNOOCLE_DATA_DIR=/data \
     SNOOCLE_STORE_DIR=/data/songstore \
     SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache \
+    SNOOCLE_CHORD_CNN_LSTM_DIR=/opt/models/chord-cnn-lstm \
     SNOOCLE_HOST=0.0.0.0 \
     PORT=8080
 

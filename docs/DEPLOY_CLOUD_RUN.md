@@ -157,6 +157,30 @@ curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     "$URL/v1/songs/analyze"
 ```
 
+**iOS read surface** — the app lists songs and downloads each one as Song JSON
+(the exact schema `GET /v1/schema/song` returns):
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs"                       # list ids
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs/the-beatles--let-it-be" # full Song JSON
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs/the-beatles--let-it-be/versions"
+```
+
+**Bring your own recording** — upload an audio *or* video file and get MIR pitch
+analysis (beats/downbeats, sounding-harmony chord timeline, sections, bpm, key)
+with no YouTube step. For a video, the audio track is extracted automatically;
+a file with no audio stream returns 422:
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/path/to/song.mp3" \
+    "$URL/v1/audio/analyze/upload"
+
+curl -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/path/to/clip.mp4" \
+    "$URL/v1/audio/analyze/upload"
+```
+
 Identity tokens expire (~1 hour) — re-run `print-identity-token` for a fresh
 one rather than hardcoding it anywhere.
 
@@ -207,5 +231,13 @@ snoocle_server.api:app` and point an MCP client at `http://127.0.0.1:8000/mcp`.
 - **madmom is not in the runtime image** (the Dockerfile excludes it — heavy
   native build). The deployed beat engine is the librosa fallback, not the one
   used in this session's local acceptance run.
+- **Chord-CNN-LSTM IS in the runtime image** (cloned + CPU torch in the
+  Dockerfile builder stage; `SNOOCLE_CHORD_CNN_LSTM_DIR=/opt/models/
+  chord-cnn-lstm` preset). `/healthz` should report `mirEngines.chords:
+  "chord-cnn-lstm"`. Expect a few minutes of CPU inference per song — raise
+  `--timeout` accordingly if full-pipeline requests start hitting it. For a
+  local (non-Docker) install run `scripts/setup_chord_model.sh` and
+  `pip install -e .[chordmodel]` (CPU torch: add
+  `--index-url https://download.pytorch.org/whl/cpu`).
 - **No automated re-deploy pipeline** — these are one-shot `gcloud` commands;
   wire up Cloud Build triggers or GitHub Actions if you want push-to-deploy.

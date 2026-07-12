@@ -102,18 +102,29 @@ def acquire_audio(
 @mcp.tool()
 def analyze_audio(
     audio_path: Optional[str] = None,
+    input_base64: Optional[str] = None,
+    input_format: str = "bin",
     title: Optional[str] = None,
     artist: Optional[str] = None,
     youtube_url_or_id: Optional[str] = None,
 ) -> dict:
     """MIR analysis of a recording (step 4): beats/downbeats, chord timeline,
     structural sections, bpm, key — audio-grounded, independent of any text
-    source. Pass audio_path, or acquisition params to fetch first."""
+    source. Provide ONE of: audio_path (a server-side file); input_base64 (the
+    bytes of an uploaded audio OR video file — set input_format to its
+    extension, e.g. "mp4"/"mov"/"mp3"; for video the audio track is extracted
+    automatically); or acquisition params (title/artist/youtube_url_or_id) to
+    fetch from YouTube first. Chords are the sounding harmony, never a
+    fretboard shape."""
     video_id = None
-    if audio_path is None:
+    if audio_path is None and input_base64 is None:
         acquired = _acquire(title=title, artist=artist, video_url_or_id=youtube_url_or_id)
         audio_path = acquired.path
         video_id = acquired.video_id
+    else:
+        # A client-supplied path (validated) or uploaded bytes (materialized to
+        # a temp file). Video containers decode fine — MIR strips video first.
+        audio_path = str(_materialize_input(audio_path, input_base64, input_format))
     analysis = _analyze_audio(audio_path)
     return {"audioPath": audio_path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
 
@@ -129,12 +140,17 @@ def reconcile_song(
     audio_path: Optional[str] = None,
     attach_audio: Optional[bool] = None,
     youtube_video_id: Optional[str] = None,
+    media_url: Optional[str] = None,
 ) -> dict:
     """Reconcile candidate text sources + MIR analysis into a schema-compliant
-    Song JSON via the configured LLM (step 5). candidates_json/mir_json accept
-    the outputs of discover_song / analyze_audio; when candidates_json is
-    omitted, discovery runs first. Does NOT persist — use save_song or
-    analyze_and_store_song for that. provider: anthropic | openai | gemini | mock."""
+    Song JSON via the configured reconciler (step 5). candidates_json/mir_json
+    accept the outputs of discover_song / analyze_audio; when candidates_json
+    is omitted, discovery runs first. Does NOT persist — use save_song or
+    analyze_and_store_song for that. provider: anthropic | openai | gemini |
+    agent | mock. The "agent" provider delegates to an external agent
+    workspace's MCP server (SNOOCLE_AGENT_MCP_URL), sending title/artist,
+    media_url (YouTube watch URL or other media URL; derived from
+    youtube_video_id when omitted), and the timestamped MIR chord timeline."""
     if candidates_json:
         candidates = [CandidateSource.model_validate(c) for c in json.loads(candidates_json)]
     else:
@@ -153,6 +169,7 @@ def reconcile_song(
         audio_path=audio_path,
         attach_audio=attach_audio,
         youtube_video_id=youtube_video_id,
+        media_url=media_url,
     )
     return {
         "song": result.song.model_dump(),

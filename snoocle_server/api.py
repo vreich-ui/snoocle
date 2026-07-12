@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -186,6 +187,33 @@ def post_analyze(req: AnalyzeRequest) -> dict:
     return {"audioPath": path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
 
 
+@app.post("/v1/audio/analyze/upload")
+async def post_analyze_upload(file: UploadFile = File(...)) -> dict:
+    """MIR pitch analysis of an UPLOADED audio OR video file — no YouTube, no
+    network, no AI. Any ffmpeg-readable container works: audio
+    (mp3/wav/m4a/flac/ogg/opus) or video (mp4/mov/webm/mkv/...); for video the
+    audio track is extracted with ffmpeg before analysis. Returns beats/
+    downbeats, chord timeline (sounding harmony), structural sections, bpm, and
+    key. A file with no decodable audio stream is a 422.
+
+    This is the "bring your own recording" path for a file the caller already
+    holds — the counterpart to POST /v1/audio/analyze, which takes a server
+    path or acquires from YouTube.
+    """
+    import shutil
+
+    src = await _save_upload(file)
+    try:
+        # MIR is CPU-bound and can run for seconds; offload it so it doesn't
+        # block the event loop shared with the embedded MCP transport.
+        analysis = await run_in_threadpool(analyze_audio, src)
+    except audio_utils.AudioToolError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    finally:
+        shutil.rmtree(src.parent, ignore_errors=True)
+    return {"filename": file.filename, "analysis": analysis.model_dump()}
+
+
 # --- step 5: reconciliation --------------------------------------------------
 
 
@@ -194,11 +222,14 @@ class ReconcileRequest(BaseModel):
     artist: str
     candidates: list[CandidateSource] = Field(default_factory=list)
     mir: Optional[MirAnalysis] = None
-    provider: Optional[str] = None  # anthropic | openai | gemini | mock
+    provider: Optional[str] = None  # anthropic | openai | gemini | agent | mock
     model: Optional[str] = None
     audioPath: Optional[str] = None
     attachAudio: Optional[bool] = None
     youtubeVideoId: Optional[str] = None
+    # For the "agent" provider: the media the song came from (YouTube watch URL
+    # or another media URL). Defaults to the YouTube URL when youtubeVideoId set.
+    mediaUrl: Optional[str] = None
 
 
 def _reconcile_response(result: ReconcileResult) -> dict:
@@ -225,6 +256,7 @@ def post_reconcile(req: ReconcileRequest) -> dict:
             audio_path=req.audioPath,
             attach_audio=req.attachAudio,
             youtube_video_id=req.youtubeVideoId,
+            media_url=req.mediaUrl,
         )
     except (ReconcileError, ProviderError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e

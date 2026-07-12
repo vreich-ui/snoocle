@@ -6,7 +6,7 @@ __pycache__/
 .env
 data/
 temp/
-models/checkpoints/
+models/
 *.wav
 *.mp3
 *.m4a

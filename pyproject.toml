@@ -26,6 +26,17 @@ mir = [
     "numpy>=1.24",
     "scipy>=1.10",
 ]
+# Runtime deps of the vendored Chord-CNN-LSTM checkout (scripts/
+# setup_chord_model.sh). torch is intentionally NOT pinned to a CPU build
+# here — pass --index-url https://download.pytorch.org/whl/cpu at install
+# time (as the Dockerfile does) to avoid the multi-GB CUDA wheel.
+chordmodel = [
+    "torch>=2.0",
+    "h5py>=3.0",
+    "pretty_midi>=0.2.9",
+    "mir_eval>=0.7",
+    "pydub>=0.23",
+]
 dev = ["pytest>=8"]
 
 [project.scripts]

@@ -31,10 +31,10 @@ snoocle_server/
 │                    provenance. Heavy-model contract: point
 │                    SNOOCLE_CHORD_CNN_LSTM_DIR / SNOOCLE_SONGFORMER_DIR at a
 │                    checkout containing snoocle_runner.py (see module docs).
-├── reconcile/       step 5: providers.py (anthropic/openai/gemini/mock as a
-│                    RUNTIME choice; audio-input capability map), prompt.py
-│                    (baseline = ALL candidates + MIR timeline as JSON,
-│                    identical across providers), engine.py (validate ->
+├── reconcile/       step 5: providers.py (anthropic/openai/gemini/agent/mock
+│                    as a RUNTIME choice; audio-input capability map),
+│                    prompt.py (baseline = ALL candidates + MIR timeline as
+│                    JSON, identical across providers), engine.py (validate ->
 │                    repair loop -> server-side provenance/guardrails),
 │                    mock_reconciler.py (deterministic offline reconciler)
 ├── store/gitstore.py step 7: dedicated git repo; every save is a commit;
@@ -54,6 +54,34 @@ snoocle_server/
                      bind-host + DNS-rebinding-security resolver used by both
                      the standalone server and the embedded /mcp route.
 ```
+
+## Reconciliation providers
+
+Provider is a runtime choice (`provider` request param or
+`SNOOCLE_LLM_PROVIDER`): `anthropic | openai | gemini | agent | mock`.
+
+- `anthropic`/`openai`/`gemini` call the LLM APIs directly with Snoocle-held
+  keys.
+- **`agent` inverts the direction: Snoocle becomes an MCP *client*.** It calls
+  one tool (`SNOOCLE_AGENT_MCP_TOOL`, default `reconcile_song`) on an external
+  agent workspace's MCP server (`SNOOCLE_AGENT_MCP_URL`, e.g. a Claude Agent
+  SDK environment running specialty agents), passing `{title, artist,
+  mediaUrl, chords (MIR-timestamped), mir, candidates, songSchema}` and
+  expecting Song JSON back. Snoocle holds no LLM keys in this mode; schema
+  validation, the repair loop (`previousOutput`/`validationErrors` are resent),
+  and server-side finalization apply to the agent's output exactly as to a
+  direct LLM response.
+- `mock` is the deterministic offline reconciler used by tests.
+
+## Chord recognition engine
+
+`scripts/setup_chord_model.sh` vendors the real Chord-CNN-LSTM (ISMIR2019)
+checkout — pretrained 5-fold checkpoints included in the upstream repo — and
+`scripts/snoocle_runner.py` adapts it to the external-runner contract
+(`<in.wav> <out.lab>`), shimming the removed numpy aliases and CPU checkpoint
+loading so the research code runs unmodified. The Dockerfile bakes it into the
+runtime image (CPU torch; `SNOOCLE_CHORD_CNN_LSTM_DIR` preset). Without it,
+chordrec falls back to beat-synchronous chroma templates.
 
 ## Key decisions & assumptions (made overnight, flag anything wrong)
 

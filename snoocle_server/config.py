@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # --- API ---
     host: str = "127.0.0.1"
     port: int = 8765
+    # Optional app-level static bearer token, enforced uniformly on the REST API
+    # AND the embedded /mcp transport. When set, every request (except /healthz)
+    # must send `Authorization: Bearer <token>`. Leave empty to rely solely on
+    # Cloud Run IAM (the default posture). Store it in Secret Manager, not here.
+    api_token: str = ""
 
     def provider_key(self, provider: str) -> str:
         """The credential/endpoint whose presence makes a provider usable."""

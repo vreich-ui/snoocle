@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import secrets
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,8 +17,10 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
 from .audio import utils as audio_utils
@@ -79,6 +82,43 @@ app = FastAPI(
     "Personal-use tool.",
     lifespan=_lifespan,
 )
+
+
+class _BearerTokenMiddleware:
+    """Optional app-level static bearer token, enforced uniformly on the REST
+    API and the embedded /mcp transport (this middleware wraps the whole ASGI
+    app, so both surfaces share the one token — send it as
+    `Authorization: Bearer <token>`).
+
+    Active only when SNOOCLE_API_TOKEN is set; otherwise a pass-through so the
+    default posture (Cloud Run IAM gates access) is unchanged. `/healthz` is
+    always exempt so liveness probes work without the token. The token is read
+    per request so it can be rotated/toggled without re-importing the app.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        token = settings.api_token
+        if not token or scope["type"] != "http" or scope.get("path") == "/healthz":
+            await self.app(scope, receive, send)
+            return
+        auth = Headers(scope=scope).get("authorization", "")
+        if not (auth.startswith("Bearer ") and secrets.compare_digest(auth, f"Bearer {token}")):
+            response = JSONResponse(
+                {"detail": "missing or invalid bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+# Wrap the entire app (REST routes + the /mcp transport appended below) so one
+# token authorizes both surfaces when SNOOCLE_API_TOKEN is configured.
+app.add_middleware(_BearerTokenMiddleware)
 
 
 def _asdict(obj: Any) -> Any:

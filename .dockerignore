@@ -38,7 +38,12 @@ models/checkpoints/
 
 # --- not needed to run the service ---
 tests/
-scripts/
+# Exclude scripts/ EXCEPT snoocle_runner.py, which the Dockerfile copies into
+# the chord-cnn-lstm checkout. Glob the contents (scripts/*) rather than the
+# directory (scripts/) so the re-include below is honored — Docker cannot
+# re-include a file whose parent *directory* is itself excluded.
+scripts/*
+!scripts/snoocle_runner.py
 docs/
 README.md
 *.md

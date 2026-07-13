@@ -28,12 +28,12 @@ from .discovery.search import SearchError
 from .mcp_server import mcp as _mcp
 from .mcp_server import resolve_http_transport as _resolve_mcp_security
 from .mir import MirAnalysis, analyze_audio
-from .pipeline import get_store, run_pipeline
+from .pipeline import PipelineStepError, get_store, run_pipeline_async
 from .reconcile import ReconcileResult, provider_capabilities, reconcile
 from .reconcile.engine import ReconcileError
 from .reconcile.providers import ProviderError
 from .schema import Song, song_json_schema
-from .store import StoreError, VersionConflictError
+from .store import StoreError, VersionConflictError, backend_label
 
 # --- Single-service topology: embed the MCP endpoint in this FastAPI app -----
 # One Cloud Run service / container / process serves BOTH the REST API and the
@@ -111,7 +111,7 @@ def healthz() -> dict:
             "structure": "songformer" if settings.songformer_dir else "librosa-agglomerative-fallback",
         },
         "llmProviders": provider_capabilities(),
-        "store": str(settings.store_dir),
+        "store": backend_label(),  # "firestore" | "memory"
         "mcpEndpoint": _mcp.settings.streamable_http_path,  # embedded MCP transport
     }
 
@@ -279,9 +279,9 @@ class PipelineRequest(BaseModel):
 
 
 @app.post("/v1/songs/analyze")
-def post_songs_analyze(req: PipelineRequest) -> dict:
+async def post_songs_analyze(req: PipelineRequest) -> dict:
     try:
-        report = run_pipeline(
+        report = await run_pipeline_async(
             req.title,
             req.artist,
             youtube_url_or_id=req.youtubeUrlOrId,
@@ -294,8 +294,10 @@ def post_songs_analyze(req: PipelineRequest) -> dict:
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    except (ReconcileError, ProviderError) as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+    except PipelineStepError as e:
+        # A fatal step (reconcile/store) failed or timed out — name it so the
+        # client shows exactly where the pipeline broke.
+        raise HTTPException(status_code=502, detail=f"{e.step}: {e.message}") from e
     assert report.reconcile is not None
     return {
         "songId": report.song_id,
@@ -354,7 +356,7 @@ def post_song(song_id: str, req: SaveSongRequest) -> dict:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except StoreError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    return dataclasses.asdict(saved)
+    return {"version": saved.version, "timestamp": saved.timestamp, "message": saved.message}
 
 
 # --- deterministic audio utilities (no AI) -----------------------------------

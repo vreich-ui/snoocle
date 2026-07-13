@@ -36,7 +36,7 @@ def combined_server(tmp_path):
     port = _free_port()
     env = {
         **os.environ,
-        "SNOOCLE_STORE_DIR": str(tmp_path / "store"),
+        "SNOOCLE_STORE_BACKEND": "memory",  # hermetic: no Firestore/network
         "SNOOCLE_MCP_TRUST_PROXY": "true",  # single service behind IAM in deploy
     }
     proc = subprocess.Popen(

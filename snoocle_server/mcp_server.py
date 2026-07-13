@@ -37,16 +37,18 @@ from .audio.acquire import acquire as _acquire
 from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .mir import MirAnalysis, analyze_audio as _analyze_audio
-from .pipeline import get_store, run_pipeline
+from .pipeline import get_store, run_pipeline_async
 from .reconcile import provider_capabilities, reconcile as _reconcile
 from .schema import Song, song_json_schema
+from .store import backend_label as _store_backend_label
 
 mcp = FastMCP(
     "snoocle",
     instructions=(
         "Snoocle audio-to-song-data foundry (personal-use). Pipeline tools: "
         "discover_song -> acquire_audio -> analyze_audio -> reconcile_song, or "
-        "analyze_and_store_song for the full flow with git-versioned persistence. "
+        "analyze_and_store_song for the full flow with Firestore-backed, "
+        "content-versioned persistence. "
         "Deterministic audio utilities (convert/trim/normalize/probe) never invoke AI."
     ),
 )
@@ -181,7 +183,7 @@ def reconcile_song(
 
 
 @mcp.tool()
-def analyze_and_store_song(
+async def analyze_and_store_song(
     title: str,
     artist: str,
     youtube_url_or_id: Optional[str] = None,
@@ -191,9 +193,11 @@ def analyze_and_store_song(
     expected_version: Optional[str] = None,
 ) -> dict:
     """Full pipeline: discover -> acquire -> MIR -> reconcile -> commit a new
-    version to the git-backed store (never overwrites). Returns the song, the
-    per-step report, and the committed version sha."""
-    report = run_pipeline(
+    version to the Firestore-backed store (never overwrites; content-hash
+    versions). Each external step runs under its own timeout so the call can't
+    hang; a fatal step failure raises with the step name. Returns the song, the
+    per-step report, and the stored version sha."""
+    report = await run_pipeline_async(
         title,
         artist,
         youtube_url_or_id=youtube_url_or_id,
@@ -216,20 +220,20 @@ def analyze_and_store_song(
 
 @mcp.tool()
 def list_songs() -> dict:
-    """List song ids present in the git-backed store."""
+    """List song ids present in the store."""
     return {"songs": get_store().list_songs()}
 
 
 @mcp.tool()
 def get_song(song_id: str, version: Optional[str] = None) -> dict:
-    """Fetch a song's JSON from the store — latest, or a specific committed
+    """Fetch a song's JSON from the store — latest, or a specific stored
     version sha."""
     return get_store().get(song_id, version=version).model_dump()
 
 
 @mcp.tool()
 def list_song_versions(song_id: str) -> dict:
-    """List the committed versions (sha, timestamp, message) of a song,
+    """List the stored versions (sha, timestamp, message) of a song,
     newest first."""
     return {
         "songId": song_id,
@@ -239,7 +243,7 @@ def list_song_versions(song_id: str) -> dict:
 
 @mcp.tool()
 def diff_song_versions(song_id: str, version_a: str, version_b: str) -> str:
-    """Unified git diff of a song between two committed versions."""
+    """Unified diff (pretty-printed JSON) of a song between two stored versions."""
     return get_store().diff(song_id, version_a, version_b)
 
 
@@ -347,7 +351,7 @@ def server_status() -> dict:
             "structure": "songformer" if settings.songformer_dir else "librosa-agglomerative-fallback",
         },
         "llmProviders": provider_capabilities(),
-        "store": str(settings.store_dir),
+        "store": _store_backend_label(),
     }
 
 

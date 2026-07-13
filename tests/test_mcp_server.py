@@ -62,7 +62,7 @@ async def test_mcp_tools_over_stdio(tone_wav_b64, tmp_path):
         command=sys.executable,
         args=["-m", "snoocle_server.mcp_server"],
         env={
-            "SNOOCLE_STORE_DIR": str(tmp_path / "store"),
+            "SNOOCLE_STORE_BACKEND": "memory",  # hermetic: no Firestore/network
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", "/root"),
         },
@@ -127,7 +127,7 @@ def _http_mcp_server(tmp_path, **extra_env):
         **os.environ,
         "SNOOCLE_MCP_TRANSPORT": "streamable-http",
         "SNOOCLE_MCP_PORT": str(port),
-        "SNOOCLE_STORE_DIR": str(tmp_path / "store"),
+        "SNOOCLE_STORE_BACKEND": "memory",  # hermetic: no Firestore/network
         **extra_env,
     }
     proc = subprocess.Popen(

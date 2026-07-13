@@ -1,12 +1,13 @@
 # Snoocle server — architecture
 
 One Python service (FastAPI + an MCP server sharing the same service layer).
-State lives only in the git-backed song store and the audio cache; everything
-else is stateless and env-configured (`.env.example`). Deployed to Cloud Run
-as a **single** service: the MCP streamable-HTTP transport is embedded into
-the FastAPI app at `/mcp` (one ASGI app, one lifespan), so one container is
-the sole writer to the store — `--concurrency=1` then fully serializes writes
-with no cross-service race. See `docs/DEPLOY_CLOUD_RUN.md`.
+Durable state lives in **Firestore** (the song store); the audio cache is
+disposable local disk. Everything else is stateless and env-configured
+(`.env.example`). Deployed to Cloud Run as a **single** service: the MCP
+streamable-HTTP transport is embedded into the FastAPI app at `/mcp` (one ASGI
+app, one lifespan). Firestore transactions provide the write serialization
+(optimistic locking), so correctness no longer depends on `--concurrency=1`.
+See `docs/DEPLOY_CLOUD_RUN.md`.
 
 ```
 snoocle_server/
@@ -37,11 +38,14 @@ snoocle_server/
 │                    JSON, identical across providers), engine.py (validate ->
 │                    repair loop -> server-side provenance/guardrails),
 │                    mock_reconciler.py (deterministic offline reconciler)
-├── store/gitstore.py step 7: dedicated git repo; every save is a commit;
-│                    expected_version optimistic locking
-│                    (saveRecordIfVersionUnchanged), OS write lock,
-│                    append-only provenance enforcement
-├── pipeline.py      orchestration, tolerant of partial failure
+├── store/           step 6-7: SongRepository interface (base.py) with
+│                    Firestore (firestore_store.py, durable) and in-memory
+│                    (memory.py, hermetic) backends; content-hash versions,
+│                    expected_version optimistic locking via a Firestore
+│                    transaction, append-only provenance, JSON diffs
+├── pipeline.py      orchestration: per-step timeouts, best-effort
+│                    discover/acquire/mir + fatal reconcile/store (502 names
+│                    the failed step), truthful per-step status report
 ├── api.py           HTTP surface (one endpoint per step + full pipeline);
 │                    ALSO embeds the MCP transport at /mcp (single-service
 │                    topology) — imports the FastMCP instance, runs its
@@ -93,8 +97,9 @@ chordrec falls back to beat-synchronous chroma templates.
   lines carry ordinal chord slots; ids are `artist--title` slugs.
 - **Wolf's repos** (Dr-Lurie-Blog, CMS-Agent, pdf-tool) were likewise
   unreachable, so the primitives the brief named were reimplemented from its
-  descriptions: `save(expected_version=...)` CAS + store-level write lock,
-  base64 artifact fallback on MCP audio tools, local-first routing.
+  descriptions: `save(expected_version=...)` CAS (now atomic via a Firestore
+  transaction; an in-memory lock for the offline backend), base64 artifact
+  fallback on MCP audio tools, local-first routing.
 - **Chord rule enforcement is layered:** parser transposes declared capo at
   ingestion → reconciliation prompt states the rule → schema validator
   rejects shapes/tab/N.C. → repair loop feeds violations back to the LLM →

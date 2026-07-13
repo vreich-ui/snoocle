@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,9 +19,21 @@ class Settings(BaseSettings):
 
     # --- storage ---
     data_dir: Path = Path("data")
-    # Git-backed artifact store. Its own repository, separate from the code repo.
-    store_dir: Path = Path("data/songstore")
     audio_cache_dir: Path = Path("data/audio-cache")
+
+    # Song persistence backend. "auto" (default) picks Firestore when a GCP
+    # project or the Firestore emulator is configured, else an in-process
+    # in-memory store (fast, hermetic — used by tests and local dev). Force one
+    # with SNOOCLE_STORE_BACKEND=firestore|memory.
+    store_backend: str = "auto"  # auto | firestore | memory
+    # Firestore (Native mode) is the durable store on Cloud Run. Project comes
+    # from GOOGLE_CLOUD_PROJECT (Application Default Credentials — no key files).
+    google_cloud_project: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_CLOUD_PROJECT", "SNOOCLE_GOOGLE_CLOUD_PROJECT"),
+    )
+    firestore_database: str = "(default)"
+    firestore_collection: str = "songs"
 
     # --- LLM reconciliation ---
     # Provider is a runtime choice: anthropic | openai | gemini | mock.
@@ -68,6 +81,19 @@ class Settings(BaseSettings):
     chord_cnn_lstm_dir: Path | None = None
     songformer_dir: Path | None = None
     mir_max_analysis_seconds: int = 0  # 0 = analyze full track
+
+    # --- pipeline reliability ---
+    # Per-step wall-clock ceilings (seconds) for POST /v1/songs/analyze so no
+    # single external step can hang the request forever. discover/acquire/mir
+    # are best-effort (a timeout is recorded and the pipeline continues from
+    # whatever it has); reconcile/store are fatal (a timeout -> HTTP 502 naming
+    # the step). Cloud Run's own request timeout must be >= the sum that a real
+    # run can take (deploy with --timeout=3600; see README/DEPLOY docs).
+    discover_timeout_seconds: float = 90.0
+    acquire_timeout_seconds: float = 600.0
+    mir_timeout_seconds: float = 1500.0
+    reconcile_timeout_seconds: float = 900.0
+    store_timeout_seconds: float = 60.0
 
     # --- API ---
     host: str = "127.0.0.1"

@@ -137,7 +137,7 @@ def main() -> int:
 
     work = Path(tempfile.mkdtemp(prefix="snoocle-acceptance-"))
     env = {**os.environ,
-           "SNOOCLE_STORE_DIR": str(work / "songstore"),
+           "SNOOCLE_STORE_BACKEND": "memory",  # hermetic acceptance run (no Firestore)
            "SNOOCLE_AUDIO_CACHE_DIR": str(work / "audio-cache")}
 
     fixture_httpd = None
@@ -241,7 +241,7 @@ def run_steps(base: str, args) -> None:
     status = "PASS" if live_ok >= 2 else "BLOCKED" if args.offline else "FAIL"
     record(2, "reconciliation on >=2 of 3 LLM providers, same input, all sources used", status, ev)
 
-    # ---- Step 3: re-run -> new committed version, old preserved, diffable ---
+    # ---- Step 3: re-run -> new stored version, old preserved, diffable -----
     ev = []
     code1, run1 = curl_json("POST", f"{base}/v1/songs/analyze", pipeline_req)
     v_prior = run1.get("storedVersion") if isinstance(run1, dict) else None
@@ -256,11 +256,11 @@ def run_steps(base: str, args) -> None:
         ev.append(f"versions endpoint lists {len(listed)} versions; both runs present={set([v_prior, v_new]) <= set(listed)}")
         rc, diff = curl("-G", f"{base}/v1/songs/{song_id}/diff",
                         "--data-urlencode", f"a={v_prior}", "--data-urlencode", f"b={v_new}")
-        ev.append(f"git diff between runs: {len(diff.splitlines())} lines (rc={rc})")
+        ev.append(f"JSON diff between runs: {len(diff.splitlines())} lines (rc={rc})")
         code, old = curl_json("GET", f"{base}/v1/songs/{song_id}?version={v_prior}")
         ev.append(f"prior version still retrievable: HTTP {code}")
         ok3 = ok3 and rc == 0 and code == 200
-    record(3, "re-run creates new committed version; prior preserved and git-diffable",
+    record(3, "re-run creates new stored version; prior preserved and diffable",
            "PASS" if ok3 else "FAIL", ev)
 
     # ---- Step 4: schema validation + no shape chords ------------------------

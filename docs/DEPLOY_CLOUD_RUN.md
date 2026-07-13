@@ -1,10 +1,14 @@
 # Deploying Snoocle server to Cloud Run
 
 **One** Cloud Run service runs the combined app: the FastAPI REST API plus the
-MCP streamable-HTTP transport, served at `/mcp` on the same service. A single
-container/process is therefore the **sole writer** to the git store — which
-fully serializes writes (no cross-service race) and removes any cross-mount
-read-staleness.
+MCP streamable-HTTP transport, served at `/mcp` on the same service.
+
+Songs persist in **Firestore (Native mode)** — durable across instance restarts
+and horizontally safe (writes use Firestore transactions with optimistic
+locking, so concurrent writers can't corrupt version history). The container
+filesystem is used only for a disposable audio cache. Auth to Firestore is via
+**Application Default Credentials**; the runtime service account needs
+`roles/datastore.user`, and the project id comes from `GOOGLE_CLOUD_PROJECT`.
 
 | Path | Surface | Auth |
 |---|---|---|
@@ -39,29 +43,30 @@ gcloud config set project "$PROJECT_ID"
 ## 1. One-time project setup
 
 ```sh
-# Includes iam (service-account creation, this step) and cloudbuild (image
-# build, step 3) — on a fresh project those commands fail without their APIs
-# enabled.
+# Includes firestore (the song store), iam (service-account creation, this
+# step) and cloudbuild (image build, step 3) — on a fresh project those
+# commands fail without their APIs enabled.
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
-    secretmanager.googleapis.com storage.googleapis.com \
+    secretmanager.googleapis.com firestore.googleapis.com \
     iam.googleapis.com cloudbuild.googleapis.com
 
 gcloud artifacts repositories create "$REPO" \
     --repository-format=docker --location="$REGION"
 
-# GCS bucket backing the git-versioned song store + audio cache.
-# Not multi-region: colocate with the Cloud Run region for latency/cost.
-gcloud storage buckets create "gs://${PROJECT_ID}-snoocle-data" \
-    --location="$REGION" --uniform-bucket-level-access
+# Firestore in NATIVE mode, colocated with Cloud Run. This is the durable song
+# store (collection `songs` + a `versions` subcollection per song). One
+# Firestore database per project; if it already exists, skip this.
+gcloud firestore databases create --location="$REGION"
 
 # Dedicated service account, least-privilege (narrower than the default
 # Compute Engine SA your placeholder service currently runs as).
 gcloud iam service-accounts create snoocle-run \
     --display-name="Snoocle Cloud Run runtime"
 
-gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}-snoocle-data" \
+# Read/write access to Firestore documents (the song store).
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role=roles/storage.objectAdmin
+    --role=roles/datastore.user
 ```
 
 ## 2. Secrets
@@ -96,11 +101,9 @@ gcloud run deploy snoocle \
     --service-account="snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
     --no-allow-unauthenticated \
     --execution-environment=gen2 \
-    --cpu=1 --memory=2Gi --timeout=900 --concurrency=1 \
-    --min-instances=0 --max-instances=1 \
-    --add-volume=name=data,type=cloud-storage,bucket="${PROJECT_ID}-snoocle-data",mount-options="uid=10001;gid=10001;file-mode=0640;dir-mode=0750;metadata-cache-ttl-secs=0" \
-    --add-volume-mount=volume=data,mount-path=/data \
-    --set-env-vars="SNOOCLE_STORE_DIR=/data/songstore,SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache,SNOOCLE_MCP_TRUST_PROXY=true" \
+    --cpu=1 --memory=2Gi --timeout=3600 --concurrency=4 \
+    --min-instances=0 --max-instances=2 \
+    --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},SNOOCLE_STORE_BACKEND=firestore,SNOOCLE_MCP_TRUST_PROXY=true" \
     --set-secrets="SNOOCLE_ANTHROPIC_API_KEY=snoocle-anthropic-key:latest,SNOOCLE_OPENAI_API_KEY=snoocle-openai-key:latest,SNOOCLE_GEMINI_API_KEY=snoocle-gemini-key:latest"
 ```
 
@@ -109,14 +112,21 @@ the REST API and mounts the MCP transport at `/mcp` (embedded in the same ASGI
 app, one lifespan). `--command`/`--args` are **not** overridden — there is only
 one service.
 
-**`--concurrency=1` is genuinely safe here.** Because this one service is the
-only writer to the store, the concurrency cap serializes *every* write — API
-and MCP alike — with no cross-service interleaving. Combined with the MCP
-transport running **stateless** (no persistent GET SSE stream that would
-otherwise occupy the single request slot and deadlock tool-call POSTs;
-`SNOOCLE_MCP_STATELESS` defaults true), `--concurrency=1` is both correct and
-non-deadlocking. `GitSongStore`'s `fcntl.flock` — unreliable over gcsfuse — is
-no longer load-bearing, since the concurrency cap does the serialization.
+**`--timeout=3600` is required, not optional.** A real analyze
+(discover → yt-dlp → MIR chord model → LLM/agent reconcile) takes 2–8 minutes;
+Cloud Run's default 300s request timeout would silently kill it mid-flight and
+the client would see nothing. Each pipeline step also has its own in-app
+timeout (`SNOOCLE_*_TIMEOUT_SECONDS`) so a single stuck step fails loudly (HTTP
+502 naming the step) instead of hanging.
+
+**Persistence is Firestore, so writes are safe under concurrency.** Optimistic
+locking (`expectedVersion` → a Firestore transaction) means concurrent writers
+can't corrupt version history, so `--concurrency` and `--max-instances` no
+longer need to be pinned to 1 for correctness (the old git-on-gcsfuse store did
+need that). They're kept modest here only because MIR is CPU-bound on
+`--cpu=1`; raise them if you add CPU. The MCP transport still runs **stateless**
+(`SNOOCLE_MCP_STATELESS` defaults true) so no persistent GET SSE stream occupies
+a request slot.
 
 **`SNOOCLE_MCP_TRUST_PROXY=true`** disables the MCP DNS-rebinding host check on
 the `/mcp` route — correct **only** because Cloud Run IAM
@@ -125,17 +135,6 @@ the container, and because the co-located REST routes have no such check
 either: the whole service's exposure is governed uniformly at the IAM/bind
 edge, not per-route. Locally (no flag), the `/mcp` host check stays on with a
 localhost allowlist; bind uvicorn to `127.0.0.1` for local runs.
-
-**The `mount-options` uid/gid are required, not optional.** Cloud Run mounts a
-GCS FUSE volume **root-owned** by default, but the image runs as non-root
-`appuser` (UID/GID 10001, pinned in the Dockerfile). Without
-`uid=10001;gid=10001`, the very first write — `GitSongStore._ensure_repo()`
-initializing the store, or the first audio-cache write — fails with permission
-denied, so the service starts but can't analyze or store anything. (`file-mode`/
-`dir-mode` are needed too because GCS FUSE ignores `chmod`, so the app can't fix
-perms at runtime.) `metadata-cache-ttl-secs=0` is belt-and-suspenders now that
-one process owns the mount (it forces a generation re-check per read); harmless
-to keep.
 
 ## 5. Grant yourself access
 
@@ -223,11 +222,11 @@ snoocle_server.api:app` and point an MCP client at `http://127.0.0.1:8000/mcp`.
 
 ## Known gaps / follow-ups
 
-- **`flock` over gcsfuse is still unreliable** — but it is no longer relied on:
-  the single-service `--concurrency=1` serializes writes. If you ever run
-  `--max-instances>1` or `--concurrency>1`, you'd reintroduce a write race and
-  should implement a GCS-native conditional-write lock in `GitSongStore` (it
-  already has an `expected_version` CAS path to build on) first.
+- **Firestore document size** — each `versions/{sha}` snapshot stores the full
+  Song JSON as a nested map, capped at Firestore's 1 MiB/document limit. That is
+  ample for normal songs; a pathologically large chart could exceed it, at which
+  point the snapshot would need gzip+bytes or a GCS spill. Not a concern for the
+  personal-use corpus.
 - **madmom is not in the runtime image** (the Dockerfile excludes it — heavy
   native build). The deployed beat engine is the librosa fallback, not the one
   used in this session's local acceptance run.

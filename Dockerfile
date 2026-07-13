@@ -14,9 +14,13 @@
 #     (default 8080). We run uvicorn directly against the ASGI app so the
 #     app's own SNOOCLE_HOST/SNOOCLE_PORT config (which defaults to
 #     127.0.0.1:8765) is bypassed.
-#   * The filesystem is ephemeral; the git-backed store writes to /data, which
-#     does NOT persist across instances/restarts. Wire up a real backing store
-#     (e.g. a GCS-mounted volume or external repo) before relying on history.
+#   * Songs persist in Firestore (Native mode), NOT on disk — the container
+#     filesystem is ephemeral and songs must survive instance restarts. The
+#     store uses Application Default Credentials; set GOOGLE_CLOUD_PROJECT at
+#     deploy time (the runtime service account needs roles/datastore.user).
+#   * /data holds only the audio-cache (a best-effort, disposable cache).
+#   * Deploy with --timeout=3600: a real analyze can take 2-8 min and Cloud
+#     Run's default 300s request timeout would silently kill it.
 # =============================================================================
 
 # Pin one base image and reuse it for both stages so the venv's interpreter
@@ -84,12 +88,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Runtime-only OS deps discovered in the code:
 #   ffmpeg      -> provides ffmpeg + ffprobe (yt-dlp audio extraction, audio utils)
-#   git         -> the git-backed versioned song store shells out to `git`
 #   libsndfile1 -> libsndfile for soundfile (insurance; wheels usually bundle it)
+# (yt-dlp is a Python dep installed into the venv; the song store is Firestore,
+#  so `git` is no longer a runtime dependency.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
-        git \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -107,16 +111,16 @@ RUN groupadd --gid 10001 appuser \
 
 WORKDIR /app
 
-# Writable, app-owned location for the ephemeral git store + audio cache.
-# Cloud Run's filesystem is in-memory/ephemeral — this survives a single
-# instance's lifetime only.
-RUN mkdir -p /data/songstore /data/audio-cache \
+# Writable, app-owned location for the audio cache (disposable — the durable
+# store is Firestore). Cloud Run's filesystem is in-memory/ephemeral.
+RUN mkdir -p /data/audio-cache \
     && chown -R appuser:appuser /data /app
 
-# Point the service's storage at the writable /data dir and make it listen on
-# all interfaces. PORT is honored by the CMD below (Cloud Run injects it).
-ENV SNOOCLE_DATA_DIR=/data \
-    SNOOCLE_STORE_DIR=/data/songstore \
+# Songs persist in Firestore (SNOOCLE_STORE_BACKEND=firestore); GOOGLE_CLOUD_PROJECT
+# is injected at deploy time. Listen on all interfaces; PORT is honored by the
+# CMD below (Cloud Run injects it).
+ENV SNOOCLE_STORE_BACKEND=firestore \
+    SNOOCLE_DATA_DIR=/data \
     SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache \
     SNOOCLE_CHORD_CNN_LSTM_DIR=/opt/models/chord-cnn-lstm \
     SNOOCLE_HOST=0.0.0.0 \

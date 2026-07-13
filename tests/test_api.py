@@ -10,7 +10,7 @@ from snoocle_server import api as api_mod
 from snoocle_server.api import app
 from snoocle_server.config import settings
 from snoocle_server.discovery.search import SearchHit
-from snoocle_server.store import GitSongStore
+from snoocle_server.store.memory import InMemorySongRepository
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -18,8 +18,8 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def isolated_store(tmp_path, monkeypatch):
-    store = GitSongStore(tmp_path / "songstore")
+def isolated_store(monkeypatch):
+    store = InMemorySongRepository()
     monkeypatch.setattr(api_mod, "get_store", lambda: store)
     monkeypatch.setattr("snoocle_server.pipeline.get_store", lambda: store)
     return store
@@ -43,8 +43,13 @@ def test_healthz():
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
-    assert body["ffmpeg"] is True
+    # healthz reports ffmpeg availability; it need not be installed to test the
+    # contract shape (it is present in the deployed image).
+    assert isinstance(body["ffmpeg"], bool)
+    assert set(body["mirEngines"]) == {"beats", "chords", "structure"}
     assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "agent", "mock"}
+    assert body["mcpEndpoint"] == "/mcp"
+    assert "version" in body
 
 
 def test_song_schema_endpoint():
@@ -62,7 +67,9 @@ def test_discover(offline_web):
     assert len(set(ids)) == 2
 
 
-def test_full_pipeline_and_versioning(offline_web):
+def test_full_pipeline_and_versioning():
+    # provider=mock is the fully-offline path: no discovery, no network. No
+    # offline_web fixture needed — it must work with zero external calls.
     req = {
         "title": "Let It Be",
         "artist": "The Beatles",
@@ -75,17 +82,22 @@ def test_full_pipeline_and_versioning(offline_web):
     assert body1["songId"] == "the-beatles--let-it-be"
     assert body1["provider"] == "mock"
     assert body1["storedVersion"]
-    assert body1["steps"]["discover"].startswith("ok: 2")
+    assert body1["steps"]["discover"].startswith("skipped")  # mock: offline
     assert body1["steps"]["acquire"] == "skipped"
+    assert body1["steps"]["mir"] == "skipped"
+    assert body1["steps"]["reconcile"].startswith("ok:")
+    assert body1["steps"]["store"].startswith("ok:")
+    assert body1["song"]["lines"]  # a real, schema-valid song was produced
 
-    # re-run: new committed version, prior one preserved and diffable
+    # re-run: new stored version, prior one preserved and diffable
     r2 = client.post("/v1/songs/analyze", json=req)
     assert r2.status_code == 200, r2.text
     v1, v2 = body1["storedVersion"], r2.json()["storedVersion"]
     assert v1 != v2
 
     versions = client.get("/v1/songs/the-beatles--let-it-be/versions").json()["versions"]
-    assert [v["version"] for v in versions] == [v2, v1]
+    assert [v["version"] for v in versions] == [v2, v1]  # newest first
+    assert all({"version", "timestamp", "message"} <= set(v) for v in versions)
 
     old = client.get("/v1/songs/the-beatles--let-it-be", params={"version": v1})
     assert old.status_code == 200
@@ -93,20 +105,62 @@ def test_full_pipeline_and_versioning(offline_web):
         "/v1/songs/the-beatles--let-it-be/diff", params={"a": v1, "b": v2}
     )
     assert diff.status_code == 200
-    assert "provenance" in diff.text  # re-run extends provenance history
+    assert diff.headers["content-type"].startswith("text/plain")
+    assert diff.text.startswith("--- ")  # a unified diff
+    # the re-run appended a provenance entry: added (+) lines carrying a new
+    # reconciled entry's timestamp
+    added = [ln for ln in diff.text.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
+    assert added and any("timestamp" in ln for ln in added)
 
-    # second run's provenance extends the first (append-only)
+    # second run's provenance extends the first (append-only): one "reconciled"
+    # entry per run (no discovery in the mock path).
     latest = client.get("/v1/songs/the-beatles--let-it-be").json()
-    assert len(latest["provenance"]) == 4  # discover+reconcile, then again
+    assert len(latest["provenance"]) == 2
+    assert all(p["action"] == "reconciled" for p in latest["provenance"])
 
 
-def test_pipeline_expected_version_conflict(offline_web):
+def test_pipeline_expected_version_conflict():
     req = {"title": "Let It Be", "artist": "The Beatles", "provider": "mock", "skipAudio": True}
     r1 = client.post("/v1/songs/analyze", json=req)
     stale = r1.json()["storedVersion"]
-    client.post("/v1/songs/analyze", json=req)  # moves HEAD past `stale`
+    client.post("/v1/songs/analyze", json=req)  # moves latest past `stale`
     r3 = client.post("/v1/songs/analyze", json={**req, "expectedVersion": stale})
     assert r3.status_code == 409
+
+
+def test_analyze_persists_and_survives_new_store_instance(monkeypatch):
+    """A song created via analyze is listable/fetchable afterward — the
+    persistence acceptance bar (here proven against the same in-memory backend
+    the request wrote to; Firestore is proven in test_store.py)."""
+    req = {"title": "Yesterday", "artist": "The Beatles", "provider": "mock", "skipAudio": True}
+    r = client.post("/v1/songs/analyze", json=req)
+    assert r.status_code == 200, r.text
+    sid = r.json()["songId"]
+    assert sid in client.get("/v1/songs").json()["songs"]
+    got = client.get(f"/v1/songs/{sid}")
+    assert got.status_code == 200
+    assert got.json()["id"] == sid
+
+
+def test_save_song_returns_version_timestamp_message():
+    song = {
+        "id": "manual--save",
+        "metadata": {"title": "Manual", "artist": "Save"},
+        "lines": [{"lineIndex": 0, "lyrics": "la", "chordPlacements": [{"charIndex": 0, "chord": "C"}]}],
+        "provenance": [{"timestamp": "2026-07-09T00:00:00Z", "actor": "test", "action": "created"}],
+    }
+    r = client.post("/v1/songs/manual--save", json={"song": song, "message": "first"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"version", "timestamp", "message"}  # exact contract shape
+    assert body["message"] == "first"
+
+    # stale expectedVersion -> 409
+    r2 = client.post(
+        "/v1/songs/manual--save",
+        json={"song": song, "message": "again", "expectedVersion": "deadbeef0000"},
+    )
+    assert r2.status_code == 409
 
 
 def test_reconcile_endpoint_with_inline_candidates(offline_web):

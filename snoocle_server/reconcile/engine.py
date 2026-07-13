@@ -157,11 +157,14 @@ def reconcile(
     song_id: str | None = None,
     media_url: str | None = None,
 ) -> ReconcileResult:
-    if not candidates and mir is None:
-        raise ReconcileError("nothing to reconcile: no candidate sources and no MIR analysis")
-
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
+
+    # The mock provider is a deterministic offline reconciler: it can synthesize
+    # a small Song from title/artist alone, so it never requires inputs. Every
+    # other provider needs something concrete to reconcile.
+    if not candidates and mir is None and provider.name != "mock":
+        raise ReconcileError("nothing to reconcile: no candidate sources and no MIR analysis")
 
     if media_url is None and youtube_video_id:
         media_url = f"https://www.youtube.com/watch?v={youtube_video_id}"

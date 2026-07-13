@@ -17,6 +17,9 @@ dependencies = [
     # 1.10.0 is the first release with the streamable-HTTP transport AND the
     # transport_security (DNS-rebinding) settings the HTTP MCP server uses.
     "mcp>=1.10.0",
+    # Durable song store (Firestore Native). Uses Application Default
+    # Credentials; the project comes from GOOGLE_CLOUD_PROJECT.
+    "google-cloud-firestore>=2.11",
 ]
 
 [project.optional-dependencies]

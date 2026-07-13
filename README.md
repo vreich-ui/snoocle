@@ -34,7 +34,7 @@ song title + artist (+ optional YouTube ID)
   schema-compliant song JSON
         │
         ├──► returned to caller (iOS app / MCP tool consumer)
-        └──► committed to a git-backed, versioned artifact store
+        └──► persisted to Firestore as a new immutable version
 ```
 
 ## Output schema
@@ -76,9 +76,25 @@ cp .env.example .env                     # fill in API keys
 the overnight-build assumptions, and `docs/ACCEPTANCE.md` for the latest
 per-step acceptance results.
 
-## Versioned artifacts
+## Versioned persistence
 
-Every analysis run commits its output JSON to a dedicated git-backed store rather than overwriting the previous result — full history, diffing, and rollback via ordinary git tooling. This store is separate from the code in this repo.
+Songs are stored in **Firestore (Native mode)** and survive Cloud Run instance
+restarts. Every analysis run writes a new *immutable version* rather than
+overwriting the previous result:
+
+- `songs/{songId}` — the latest Song plus denormalized `{title, artist,
+  latestVersion, updatedAt}` (cheap listing/queries).
+- `songs/{songId}/versions/{versionSha}` — an immutable snapshot
+  `{song, message, timestamp, parent}`; `versionSha` is a content hash (first
+  12 hex of sha256 over the song's canonical JSON).
+
+Saves are optimistically locked (`expectedVersion` → a Firestore transaction →
+`409` on a stale write), provenance is append-only, and history/diffs are
+served by `GET /v1/songs/{id}/versions` and `…/diff?a=&b=`. All access uses
+Application Default Credentials (no key files); the project comes from
+`GOOGLE_CLOUD_PROJECT`. Storage sits behind a small repository interface, so an
+in-memory backend runs the whole path offline for tests, CI, and local dev
+(`SNOOCLE_STORE_BACKEND=memory`, the default when no GCP project is set).
 
 ## License
 

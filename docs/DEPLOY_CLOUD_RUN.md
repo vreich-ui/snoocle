@@ -15,13 +15,21 @@ filesystem is used only for a disposable audio cache. Auth to Firestore is via
 | `/healthz`, `/v1/...` | REST API (FastAPI) | Cloud Run IAM |
 | `/mcp` | MCP streamable-HTTP (stateless) | Cloud Run IAM |
 
-The service is **private** (`--no-allow-unauthenticated`) — every request must
-carry a Google-signed identity token for a principal you've explicitly granted
-`roles/run.invoker`. This is deliberate: the service can trigger YouTube
-downloads and spend your LLM API budget on request, and the original brief is
-explicit that server-side YouTube acquisition is personal-use-only until
-reconsidered for wider exposure. IAM auth keeps that posture without any
-app-level auth code.
+By default the service is **private** (`--no-allow-unauthenticated`) — every
+request must carry a Google-signed identity token for a principal you've
+explicitly granted `roles/run.invoker`. This is deliberate: the service can
+trigger YouTube downloads and spend your LLM API budget on request, and the
+original brief is explicit that server-side YouTube acquisition is
+personal-use-only until reconsidered for wider exposure. IAM auth keeps that
+posture without any app-level auth code.
+
+If the rotating-identity-token flow is inconvenient for a client (the iPad app,
+a curl script, an MCP client), there is an optional **static bearer token** that
+authorizes the REST API and `/mcp` with one fixed value — see
+[Optional: a static bearer token](#optional-a-static-bearer-token) below. The
+two schemes are mutually exclusive (both live in the `Authorization` header, so
+you pick one); the static-token mode trades Google IAM for a shared secret and a
+publicly-reachable URL, so use a long random token.
 
 **I don't have `gcloud` or credentials for your GCP project in this
 environment** — everything below is a runbook for you (or a CI pipeline with
@@ -143,6 +151,48 @@ gcloud run services add-iam-policy-binding snoocle --region="$REGION" \
     --member="user:vreich@kugelbrands.com" --role=roles/run.invoker
 ```
 
+## Optional: a static bearer token
+
+If minting a fresh Google identity token per hour is inconvenient for a client,
+set `SNOOCLE_API_TOKEN` and the app enforces a single fixed bearer token on
+**both** the REST API and `/mcp` (only `/healthz` stays open, for liveness
+probes). This replaces — it does not stack with — Cloud Run IAM: both use the
+`Authorization` header, so you deploy the service **public** and let the app
+token be the gate.
+
+> **Security note.** This makes the URL reachable by anyone on the internet,
+> gated only by the token. The service downloads from YouTube and spends your
+> LLM budget, so treat the token like a password: generate a long random one,
+> keep it in Secret Manager, and rotate it if it leaks. If you're unsure, keep
+> the default IAM posture instead.
+
+```sh
+# 1. Generate a strong token and store it in Secret Manager.
+python -c "import secrets; print(secrets.token_urlsafe(32))" \
+    | gcloud secrets create snoocle-api-token --data-file=-
+gcloud secrets add-iam-policy-binding snoocle-api-token \
+    --member="serviceAccount:snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role=roles/secretmanager.secretAccessor
+
+# 2. Redeploy PUBLIC, injecting the token (add these flags to the deploy in §4).
+gcloud run services update snoocle --region="$REGION" \
+    --allow-unauthenticated \
+    --update-secrets="SNOOCLE_API_TOKEN=snoocle-api-token:latest"
+```
+
+Clients then send the same fixed token to either surface — no `gcloud` needed:
+
+```sh
+URL=$(gcloud run services describe snoocle --region="$REGION" --format='value(status.url)')
+TOKEN=$(gcloud secrets versions access latest --secret=snoocle-api-token)
+
+curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs"          # REST
+# MCP: pass the same header (see §7) — Authorization: Bearer $TOKEN
+```
+
+To go back to IAM-only, `--no-allow-unauthenticated` and drop the secret (unset
+`SNOOCLE_API_TOKEN`); the app becomes a pass-through again.
+
 ## 6. Calling the REST API
 
 ```sh
@@ -193,7 +243,10 @@ TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
 ```
 
 Any MCP client that supports the streamable-HTTP transport with custom headers
-can connect to `"$URL/mcp"` sending `Authorization: Bearer $TOKEN`. With the
+can connect to `"$URL/mcp"` sending `Authorization: Bearer $TOKEN`. (If you
+enabled the [static bearer token](#optional-a-static-bearer-token), set
+`TOKEN=$(gcloud secrets versions access latest --secret=snoocle-api-token)`
+instead — the fixed token doesn't expire, so no per-hour refresh.) With the
 Python SDK directly:
 
 ```python

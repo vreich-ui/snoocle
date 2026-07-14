@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from fastapi.concurrency import run_in_threadpool
 
-from .audio.acquire import AcquiredAudio, acquire
+from .audio.acquire import AcquiredAudio, acquire, extract_metadata
 from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .mir import MirAnalysis, analyze_audio
@@ -159,8 +159,8 @@ async def _timed_step(name: str, fn, timeout: float):
 
 
 async def run_pipeline_async(
-    title: str,
-    artist: str,
+    title: str | None,
+    artist: str | None,
     youtube_url_or_id: str | None = None,
     provider: str | None = None,
     model: str | None = None,
@@ -170,9 +170,36 @@ async def run_pipeline_async(
     expected_version: str | None = None,
     store: SongRepository | None = None,
 ) -> PipelineReport:
-    song_id = slugify_song_id(artist, title)
-    report = PipelineReport(song_id=song_id)
     resolved_provider = (provider or settings.llm_provider).lower()
+    steps: dict[str, str] = {}
+
+    # 0. resolve identity: title+artist may be omitted when a media URL is
+    # given — derive them from the media's own metadata (no download). FATAL:
+    # without an identity there is nothing to analyze or store.
+    if not (title and artist):
+        if not youtube_url_or_id:
+            raise PipelineStepError(
+                "resolve", "provide title and artist, or a youtubeUrlOrId to derive them from"
+            )
+        try:
+            meta = await _timed_step(
+                "resolve",
+                lambda: extract_metadata(youtube_url_or_id),
+                settings.acquire_timeout_seconds,
+            )
+        except asyncio.TimeoutError as e:
+            raise PipelineStepError(
+                "resolve", f"timed out after {settings.acquire_timeout_seconds:.0f}s"
+            ) from e
+        except Exception as e:  # noqa: BLE001
+            raise PipelineStepError("resolve", str(e)) from e
+        title = title or meta.title
+        artist = artist or meta.artist
+        youtube_url_or_id = youtube_url_or_id or meta.video_id
+        steps["resolve"] = f"ok: title={title!r} artist={artist!r} (from {meta.video_id})"
+
+    song_id = slugify_song_id(artist, title)
+    report = PipelineReport(song_id=song_id, steps=steps)
 
     # 1-3. text-source discovery (best-effort). Skipped entirely for the mock
     # provider, which is the fully-offline deterministic path (no network).
@@ -266,8 +293,8 @@ def _fail_text(exc: BaseException, timeout: float) -> str:
 
 
 def run_pipeline(
-    title: str,
-    artist: str,
+    title: str | None,
+    artist: str | None,
     youtube_url_or_id: str | None = None,
     provider: str | None = None,
     model: str | None = None,

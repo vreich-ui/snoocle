@@ -18,7 +18,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -315,8 +315,10 @@ def post_reconcile(req: ReconcileRequest) -> dict:
 
 
 class PipelineRequest(BaseModel):
-    title: str
-    artist: str
+    # title+artist may be omitted when youtubeUrlOrId is given — the pipeline
+    # derives them from the media's own metadata.
+    title: Optional[str] = None
+    artist: Optional[str] = None
     youtubeUrlOrId: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
@@ -324,6 +326,12 @@ class PipelineRequest(BaseModel):
     skipAudio: bool = False
     maxCandidates: Optional[int] = Field(default=None, ge=1, le=20)
     expectedVersion: Optional[str] = None  # optimistic lock for re-analyses
+
+    @model_validator(mode="after")
+    def _identity_or_url(self) -> "PipelineRequest":
+        if not ((self.title and self.artist) or self.youtubeUrlOrId):
+            raise ValueError("provide title and artist, or youtubeUrlOrId to derive them from")
+        return self
 
 
 @app.post("/v1/songs/analyze")

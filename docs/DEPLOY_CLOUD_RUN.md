@@ -220,7 +220,15 @@ curl -H "Authorization: Bearer $TOKEN" "$URL/healthz"
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"title":"Let It Be","artist":"The Beatles"}' \
     "$URL/v1/songs/analyze"
+
+# Or give ONLY a URL — title/artist are derived from the video's own metadata:
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"youtubeUrlOrId":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}' \
+    "$URL/v1/songs/analyze"
 ```
+
+`analyze` needs **either** `title`+`artist` **or** `youtubeUrlOrId` (from which it
+derives them); neither → `422`.
 
 **iOS read surface** — the app lists songs and downloads each one as Song JSON
 (the exact schema `GET /v1/schema/song` returns):

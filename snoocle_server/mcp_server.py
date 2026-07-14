@@ -184,19 +184,21 @@ def reconcile_song(
 
 @mcp.tool()
 async def analyze_and_store_song(
-    title: str,
-    artist: str,
+    title: Optional[str] = None,
+    artist: Optional[str] = None,
     youtube_url_or_id: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
     skip_audio: bool = False,
     expected_version: Optional[str] = None,
 ) -> dict:
-    """Full pipeline: discover -> acquire -> MIR -> reconcile -> commit a new
-    version to the Firestore-backed store (never overwrites; content-hash
-    versions). Each external step runs under its own timeout so the call can't
-    hang; a fatal step failure raises with the step name. Returns the song, the
-    per-step report, and the stored version sha."""
+    """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
+    commit a new version to the Firestore-backed store (never overwrites;
+    content-hash versions). Give EITHER title+artist OR a youtube_url_or_id: if
+    title/artist are omitted, they're derived from the video's own metadata.
+    Each external step runs under its own timeout so the call can't hang; a
+    fatal step failure raises with the step name. Returns the song, the per-step
+    report, and the stored version sha."""
     report = await run_pipeline_async(
         title,
         artist,

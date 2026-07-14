@@ -17,7 +17,7 @@ Chords are not copyrightable; lyrics are. This service discovers chord/lyric tex
 ## Pipeline
 
 ```
-song title + artist (+ optional YouTube ID)
+song title + artist  — or just a YouTube URL/ID (title+artist derived from it)
         │
         ▼
   text-source discovery  ──►  multiple candidate chord/lyric sources

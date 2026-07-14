@@ -36,6 +36,87 @@ class AcquiredAudio:
     from_cache: bool = False
 
 
+@dataclass
+class ResolvedMeta:
+    """Song identity derived from a media URL's own metadata (no download)."""
+
+    video_id: str
+    video_title: str
+    title: str
+    artist: str
+    duration_seconds: float | None = None
+
+
+# Trailing decoration commonly appended to music video titles — stripped before
+# parsing "Artist - Title". Matches a parenthesized/bracketed group containing
+# one of these words: "(Official Music Video)", "[Lyric Video]", "(Remastered
+# 2009)", "(HD)", "(Audio)", etc.
+_TITLE_NOISE_RE = re.compile(
+    r"\s*[\(\[][^\)\]]*\b(?:official|video|audio|lyrics?|visuali[sz]er|remaster(?:ed)?|"
+    r"hd|4k|hq|mv|m/v|explicit|clean|full\s+album|live|performance|version)\b[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+
+
+def _strip_title_noise(text: str) -> str:
+    prev = None
+    while prev != text:
+        prev = text
+        text = _TITLE_NOISE_RE.sub("", text).strip()
+    return text.strip(" -—–|·")
+
+
+def derive_title_artist(info: dict) -> tuple[str, str]:
+    """Best-effort (title, artist) from a yt-dlp info dict.
+
+    Prefers explicit music metadata (``track``/``artist``, present on YouTube
+    Music / "Provided to YouTube by..." entries); otherwise parses the video
+    title ("Artist - Title", noise stripped) and falls back to the uploader
+    (minus a "- Topic" suffix) for the artist.
+    """
+    track = (info.get("track") or "").strip()
+    artist = (info.get("artist") or info.get("creator") or "").strip()
+    vid_title = (info.get("title") or "").strip()
+    uploader = (info.get("uploader") or info.get("channel") or "").strip()
+    uploader = re.sub(r"\s*-\s*Topic$", "", uploader, flags=re.IGNORECASE).strip()
+
+    cleaned = _strip_title_noise(vid_title)
+    if not (track and artist):
+        # "Artist - Title", tolerating hyphen / en-dash / em-dash separators
+        parts = re.split(r"\s+[-–—]\s+", cleaned, maxsplit=1)
+        if len(parts) == 2:
+            left, right = parts[0].strip(), parts[1].strip()
+            artist = artist or left
+            track = track or right
+
+    title = track or cleaned or vid_title or "Unknown"
+    artist = artist or uploader or "Unknown"
+    return title, artist
+
+
+def extract_metadata(url_or_id: str) -> ResolvedMeta:
+    """Resolve a song's identity from a YouTube URL/id WITHOUT downloading the
+    audio (yt-dlp ``download=False``) — used when the caller gives only a URL
+    and expects title/artist to be populated from the media itself."""
+    import yt_dlp
+
+    vid = extract_video_id(url_or_id)
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+    except Exception as e:  # yt_dlp raises many exception types
+        raise AcquisitionError(f"metadata fetch failed for {vid}: {e}") from e
+    title, artist = derive_title_artist(info or {})
+    return ResolvedMeta(
+        video_id=vid,
+        video_title=(info or {}).get("title") or "",
+        title=title,
+        artist=artist,
+        duration_seconds=float(info["duration"]) if (info or {}).get("duration") else None,
+    )
+
+
 def extract_video_id(url_or_id: str) -> str:
     s = url_or_id.strip()
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):

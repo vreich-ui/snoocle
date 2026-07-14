@@ -18,6 +18,7 @@ Default Credentials (no key files); the project comes from
 
 from __future__ import annotations
 
+import functools
 import logging
 
 from ..schema import Song
@@ -26,6 +27,7 @@ from .base import (
     SongRepository,
     SongVersion,
     StoreError,
+    StoreUnavailableError,
     VersionConflictError,
     check_provenance_append_only,
     next_timestamp,
@@ -34,6 +36,33 @@ from .base import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _is_infra_error(exc: BaseException) -> bool:
+    """True for a Firestore/gRPC/auth backend failure (database missing,
+    permission denied, unavailable, unauthenticated, connection error) — as
+    opposed to a bug in our own code."""
+    mod = type(exc).__module__ or ""
+    return mod.startswith(("google.api_core", "google.auth", "grpc"))
+
+
+def _translate_infra_errors(fn):
+    """Wrap a repository method so backend failures surface as
+    StoreUnavailableError (-> HTTP 503) instead of a bare 500, while our own
+    StoreError/VersionConflictError and real bugs pass through unchanged."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except (StoreError, StoreUnavailableError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            if _is_infra_error(e):
+                raise StoreUnavailableError(f"Firestore backend error: {e}") from e
+            raise
+
+    return wrapper
 
 
 class FirestoreSongRepository(SongRepository):
@@ -74,15 +103,18 @@ class FirestoreSongRepository(SongRepository):
 
     # --- reads -----------------------------------------------------------
 
+    @_translate_infra_errors
     def list_songs(self) -> list[str]:
         # list_documents() returns references without reading the (large) song
         # blobs — cheap id enumeration.
         return sorted(ref.id for ref in self._collection.list_documents())
 
+    @_translate_infra_errors
     def current_version(self, song_id: str) -> str | None:
         data = self._song_ref(song_id).get().to_dict()
         return data.get("latestVersion") if data else None
 
+    @_translate_infra_errors
     def get(self, song_id: str, version: str | None = None) -> Song:
         if version is None:
             data = self._song_ref(song_id).get().to_dict()
@@ -94,6 +126,7 @@ class FirestoreSongRepository(SongRepository):
             raise StoreError(f"song {song_id!r} at version {version!r} not found")
         return Song.model_validate(data["song"])
 
+    @_translate_infra_errors
     def versions(self, song_id: str) -> list[SongVersion]:
         if not self._song_ref(song_id).get().exists:
             return []
@@ -108,6 +141,7 @@ class FirestoreSongRepository(SongRepository):
             out.append(SongVersion(doc.id, d.get("timestamp", ""), d.get("message", "")))
         return out
 
+    @_translate_infra_errors
     def diff(self, song_id: str, version_a: str, version_b: str) -> str:
         a = self._version_ref(song_id, version_a).get().to_dict()
         b = self._version_ref(song_id, version_b).get().to_dict()
@@ -121,6 +155,7 @@ class FirestoreSongRepository(SongRepository):
 
     # --- write (transactional CAS) --------------------------------------
 
+    @_translate_infra_errors
     def save(
         self,
         song: Song,

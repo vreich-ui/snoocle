@@ -39,6 +39,16 @@ class VersionConflictError(StoreError):
     """The record changed since the caller last read it (optimistic-lock miss)."""
 
 
+class StoreUnavailableError(RuntimeError):
+    """The store backend is unreachable or misconfigured — e.g. the Firestore
+    database doesn't exist, or the runtime lacks credentials/permissions.
+
+    Deliberately NOT a subclass of StoreError so callers that map StoreError to
+    "song not found" (404) don't mistake "backend down" for a missing song: it
+    routes to its own 503 instead.
+    """
+
+
 @dataclass
 class SongVersion:
     version: str  # content sha

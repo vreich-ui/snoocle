@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,43 @@ _VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|^)([A-Za-z0-9_-]{11})(?:[?
 
 class AcquisitionError(RuntimeError):
     pass
+
+
+_cookie_tmpfile: str | None = None
+
+
+def _resolve_cookiefile() -> str | None:
+    """A cookies.txt path for yt-dlp, from SNOOCLE_YTDLP_COOKIES_FILE (a mounted
+    path) or SNOOCLE_YTDLP_COOKIES (inline content, materialized to a temp file
+    once). None when neither is configured."""
+    global _cookie_tmpfile
+    if settings.ytdlp_cookies_file:
+        return settings.ytdlp_cookies_file
+    if settings.ytdlp_cookies:
+        if _cookie_tmpfile is None or not Path(_cookie_tmpfile).exists():
+            p = Path(tempfile.mkdtemp(prefix="snoocle-ytdlp-")) / "cookies.txt"
+            p.write_text(settings.ytdlp_cookies)
+            _cookie_tmpfile = str(p)
+        return _cookie_tmpfile
+    return None
+
+
+def _ytdlp_opts(base: dict) -> dict:
+    """Merge YouTube-auth accommodations (cookies, player clients) into a base
+    yt-dlp options dict — used by every yt-dlp call so they authenticate
+    consistently. Off by default (no config -> base unchanged)."""
+    opts = dict(base)
+    cookiefile = _resolve_cookiefile()
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    clients = [c.strip() for c in settings.ytdlp_player_clients.split(",") if c.strip()]
+    if clients:
+        extractor_args = dict(opts.get("extractor_args") or {})
+        youtube = dict(extractor_args.get("youtube") or {})
+        youtube["player_client"] = clients
+        extractor_args["youtube"] = youtube
+        opts["extractor_args"] = extractor_args
+    return opts
 
 
 @dataclass
@@ -103,7 +141,7 @@ def extract_metadata(url_or_id: str) -> ResolvedMeta:
     vid = extract_video_id(url_or_id)
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     except Exception as e:  # yt_dlp raises many exception types
         raise AcquisitionError(f"metadata fetch failed for {vid}: {e}") from e
@@ -143,7 +181,7 @@ def search_video(title: str, artist: str, max_results: int = 5) -> list[dict]:
     query = f"{artist} {title}"
     opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "noplaylist": True}
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
     except Exception as e:  # yt_dlp raises many exception types
         raise AcquisitionError(f"YouTube search failed for {query!r}: {e}") from e
@@ -200,7 +238,7 @@ def download_audio(video_id: str) -> AcquiredAudio:
         "noplaylist": True,
     }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
     except Exception as e:  # yt_dlp raises many exception types
         raise AcquisitionError(f"yt-dlp failed for {video_id}: {e}") from e

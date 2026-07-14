@@ -297,6 +297,35 @@ defaults to **stdio** — run it as a subprocess from your own machine's MCP
 client config. Or run the combined app locally with `uvicorn
 snoocle_server.api:app` and point an MCP client at `http://127.0.0.1:8000/mcp`.
 
+## YouTube bot-check (server-side acquisition)
+
+YouTube challenges downloads from datacenter IPs (Cloud Run) with *"Sign in to
+confirm you're not a bot"*, which surfaces as `502 {"detail":"resolve: …"}` or
+`acquire: …`. Two ways to get past it:
+
+1. **Upload the audio instead of pulling from YouTube** — the reliable path, no
+   YouTube from the server at all. Download the track on your own machine and
+   POST the file:
+   ```sh
+   curl -H "Authorization: Bearer $TOKEN" -F "file=@paint-it-black.mp3" \
+       "$URL/v1/audio/analyze/upload"
+   ```
+2. **Give the server cookies from a signed-in browser** (what the error asks
+   for). Export `cookies.txt` (a browser extension, or `yt-dlp
+   --cookies-from-browser`), store it in Secret Manager, and inject it:
+   ```sh
+   gcloud secrets create snoocle-yt-cookies --data-file=cookies.txt
+   gcloud secrets add-iam-policy-binding snoocle-yt-cookies \
+       --member="serviceAccount:snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role=roles/secretmanager.secretAccessor
+   gcloud run services update snoocle --region="$REGION" \
+       --update-secrets="SNOOCLE_YTDLP_COOKIES=snoocle-yt-cookies:latest"
+   ```
+   (`SNOOCLE_YTDLP_COOKIES` is the cookies.txt *content*; `SNOOCLE_YTDLP_COOKIES_FILE`
+   takes a mounted path instead.) Cookies expire — refresh the secret when
+   acquisition starts failing again. As a no-cookie long shot, try alternate
+   player clients: `--update-env-vars="SNOOCLE_YTDLP_PLAYER_CLIENTS=default,android,ios,tv,web_safari"`.
+
 ## Known gaps / follow-ups
 
 - **Firestore document size** — each `versions/{sha}` snapshot stores the full

@@ -150,6 +150,27 @@ def test_get_missing_song_raises(repo):
     assert repo.current_version("nope--nothing") is None
 
 
+def test_firestore_database_config(monkeypatch):
+    """FIRESTORE_DATABASE targets a NAMED database; the project id (a different
+    thing) stays in GOOGLE_CLOUD_PROJECT. Defaults to Firestore's "(default)"."""
+    from snoocle_server.config import Settings
+
+    monkeypatch.delenv("FIRESTORE_DATABASE", raising=False)
+    monkeypatch.delenv("SNOOCLE_FIRESTORE_DATABASE", raising=False)
+    assert Settings(_env_file=None).firestore_database == "(default)"
+
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "gen-lang-client-0481163044")
+    monkeypatch.setenv("FIRESTORE_DATABASE", "snoocle-db")
+    s = Settings(_env_file=None)
+    assert s.firestore_database == "snoocle-db"  # the named database
+    assert s.google_cloud_project == "gen-lang-client-0481163044"  # still the project id
+
+    # legacy SNOOCLE_-prefixed name still honored
+    monkeypatch.delenv("FIRESTORE_DATABASE", raising=False)
+    monkeypatch.setenv("SNOOCLE_FIRESTORE_DATABASE", "legacy-db")
+    assert Settings(_env_file=None).firestore_database == "legacy-db"
+
+
 def test_firestore_infra_errors_translate_to_store_unavailable():
     """Firestore backend failures (DB missing, permission denied, unavailable)
     surface as StoreUnavailableError; our own errors and real bugs pass through."""

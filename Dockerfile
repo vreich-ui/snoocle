@@ -116,19 +116,29 @@ WORKDIR /app
 RUN mkdir -p /data/audio-cache \
     && chown -R appuser:appuser /data /app
 
-# Songs persist in Firestore (SNOOCLE_STORE_BACKEND=firestore); GOOGLE_CLOUD_PROJECT
-# is injected at deploy time. Listen on all interfaces; PORT is honored by the
-# CMD below (Cloud Run injects it).
+# Songs persist in Firestore (SNOOCLE_STORE_BACKEND=firestore). Listen on all
+# interfaces; PORT is honored by the CMD below (Cloud Run injects it).
 #
-# SNOOCLE_MCP_TRUST_PROXY=true is baked into the IMAGE (not left to the deploy
-# command) so it survives automated redeploys — a Cloud Build trigger that
-# rebuilds and redeploys can't accidentally drop it. It disables the MCP /mcp
-# DNS-rebinding Host check, which is correct here because the service's exposure
-# is governed at the Cloud Run edge (IAM, or an intentionally public service),
-# not per-route. Without it, /mcp answers every request with "Invalid Host
-# header". Local non-Docker runs (uvicorn directly) don't get this ENV, so their
-# host check stays on by default.
-ENV SNOOCLE_STORE_BACKEND=firestore \
+# GOOGLE_CLOUD_PROJECT, FIRESTORE_DATABASE and SNOOCLE_MCP_TRUST_PROXY are baked
+# into the IMAGE (not left to the deploy command) so they survive automated
+# redeploys — a Cloud Build trigger that rebuilds and redeploys can't
+# accidentally drop them. A Cloud Run service-config env var of the same name
+# still overrides the baked value at deploy time, so these are durable defaults,
+# not lock-ins.
+#   * GOOGLE_CLOUD_PROJECT: the fixed GCP *project* this image is deployed to
+#     (Firestore uses it via Application Default Credentials).
+#   * FIRESTORE_DATABASE: the *named* Firestore database within that project.
+#     This deployment uses "snoocle-db" (not Firestore's "(default)" database).
+#     These are two different things — the project id is NOT a database id.
+#   * SNOOCLE_MCP_TRUST_PROXY=true disables the MCP /mcp DNS-rebinding Host
+#     check, correct here because the service's exposure is governed at the
+#     Cloud Run edge (IAM, or an intentionally public service), not per-route;
+#     without it /mcp answers every request with "Invalid Host header".
+# Local non-Docker runs (uvicorn directly) don't get these ENVs, so their store
+# defaults to in-memory and the host check stays on.
+ENV GOOGLE_CLOUD_PROJECT=gen-lang-client-0481163044 \
+    FIRESTORE_DATABASE=snoocle-db \
+    SNOOCLE_STORE_BACKEND=firestore \
     SNOOCLE_MCP_TRUST_PROXY=true \
     SNOOCLE_DATA_DIR=/data \
     SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache \

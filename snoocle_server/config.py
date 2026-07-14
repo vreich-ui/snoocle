@@ -32,7 +32,15 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("GOOGLE_CLOUD_PROJECT", "SNOOCLE_GOOGLE_CLOUD_PROJECT"),
     )
-    firestore_database: str = "(default)"
+    # Firestore database ID. Defaults to Firestore's "(default)" database; set
+    # FIRESTORE_DATABASE to target a NAMED database (e.g. "snoocle-db"). This is
+    # the database *within* the project — GOOGLE_CLOUD_PROJECT stays the project
+    # ID and is unrelated. (Read from FIRESTORE_DATABASE, not the SNOOCLE_ prefix,
+    # so it lines up with the conventional GCP-style variable name.)
+    firestore_database: str = Field(
+        default="(default)",
+        validation_alias=AliasChoices("FIRESTORE_DATABASE", "SNOOCLE_FIRESTORE_DATABASE"),
+    )
     firestore_collection: str = "songs"
 
     # --- LLM reconciliation ---

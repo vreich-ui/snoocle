@@ -326,6 +326,35 @@ confirm you're not a bot"*, which surfaces as `502 {"detail":"resolve: …"}` or
    acquisition starts failing again. As a no-cookie long shot, try alternate
    player clients: `--update-env-vars="SNOOCLE_YTDLP_PLAYER_CLIENTS=default,android,ios,tv,web_safari"`.
 
+   **Make cookies last (the hands-off recipe).** YouTube rotates cookies
+   aggressively when the *same browser session* keeps using them. So: create a
+   throwaway Google account → sign in to youtube.com in a **private/incognito
+   window** → export cookies.txt from that window → close the window and never
+   sign in with that session again. Cookies exported this way routinely last
+   weeks–months for a single-user tool, versus days for cookies from your
+   daily-driver browser.
+
+3. **Route yt-dlp through a residential IP** (`SNOOCLE_YTDLP_PROXY`). Only
+   acquisition traffic uses the proxy; everything else is direct. Two flavors:
+   - **Your own home IP via a Tailscale exit node** — free, personal-use-clean
+     (it's your IP and your account). Run Tailscale on an always-on device at
+     home (a Mac, Raspberry Pi, or even an Apple TV) as an exit node, add
+     `tailscaled` (userspace, SOCKS5 on localhost:1055) to the container, and
+     set `SNOOCLE_YTDLP_PROXY=socks5://localhost:1055`.
+   - **A commercial residential proxy** — zero infra, paid:
+     `SNOOCLE_YTDLP_PROXY=http://user:pass@proxy.vendor.example:8080` (keep the
+     credential in Secret Manager).
+
+4. **PO-token provider sidecar** — the yt-dlp-native fix for datacenter IPs:
+   run `bgutil-ytdlp-pot-provider` as a Cloud Run sidecar container and install
+   its yt-dlp plugin in the image; yt-dlp then attaches Proof-of-Origin tokens
+   automatically. Most robust long-term, most moving parts.
+
+Note: the bot-check is per-request IP reputation — it fires **before any bytes
+download**, so "only analyze part of the song" does not avoid it. (Partial
+analysis exists anyway for speed: set `SNOOCLE_MIR_MAX_ANALYSIS_SECONDS` to clip
+what the MIR engines process.)
+
 ## Known gaps / follow-ups
 
 - **Firestore document size** — each `versions/{sha}` snapshot stores the full

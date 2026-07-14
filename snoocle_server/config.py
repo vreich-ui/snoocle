@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     ytdlp_cookies: str = ""
     ytdlp_cookies_file: str = ""
     ytdlp_player_clients: str = ""
+    # Route ONLY yt-dlp traffic through a proxy so YouTube sees a residential
+    # IP instead of Cloud Run's datacenter IP — e.g. a Tailscale exit node at
+    # home (socks5://localhost:1055) or a commercial residential proxy
+    # (http://user:pass@proxy.example:8080). Empty = direct.
+    ytdlp_proxy: str = ""
 
     # --- audio / MIR ---
     ffmpeg_bin: str = "ffmpeg"

@@ -145,11 +145,14 @@ edge, not per-route. Without it, `/mcp` rejects every request with `Invalid
 Host header`. Locally (no flag, non-Docker), the `/mcp` host check stays on
 with a localhost allowlist; bind uvicorn to `127.0.0.1` for local runs.
 
-> This value is **baked into the image** (`Dockerfile` `ENV`), so it survives an
-> automated rebuild/redeploy (e.g. a Cloud Build trigger) even if the deploy
-> command doesn't repeat it. Passing it in `--set-env-vars` too is harmless
-> belt-and-suspenders. `GOOGLE_CLOUD_PROJECT` is *not* baked (it's
-> environment-specific) — it must come from the deploy/trigger.
+> This value **and `GOOGLE_CLOUD_PROJECT`** are **baked into the image**
+> (`Dockerfile` `ENV`), so they survive an automated rebuild/redeploy (e.g. a
+> Cloud Build trigger) even if the deploy command doesn't repeat them. A Cloud
+> Run service-config env var of the same name still overrides the baked value at
+> deploy time, so the baked project id is a durable default, not a lock-in — to
+> target a different project, set `GOOGLE_CLOUD_PROJECT` in `--set-env-vars` (or
+> edit the `Dockerfile` `ENV`). Passing either in `--set-env-vars` is harmless
+> belt-and-suspenders.
 
 ## 5. Grant yourself access
 

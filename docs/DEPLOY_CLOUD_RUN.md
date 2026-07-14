@@ -62,9 +62,15 @@ gcloud artifacts repositories create "$REPO" \
     --repository-format=docker --location="$REGION"
 
 # Firestore in NATIVE mode, colocated with Cloud Run. This is the durable song
-# store (collection `songs` + a `versions` subcollection per song). One
-# Firestore database per project; if it already exists, skip this.
+# store (collection `songs` + a `versions` subcollection per song). This creates
+# the "(default)" database; if it already exists, skip this.
 gcloud firestore databases create --location="$REGION"
+
+# To use a NAMED database instead of "(default)" (e.g. snoocle-db), create it
+# with --database and point the app at it with the FIRESTORE_DATABASE env var
+# (see the deploy step below). The project id (GOOGLE_CLOUD_PROJECT) is separate
+# and unchanged — a database id is not a project id.
+#   gcloud firestore databases create --database=snoocle-db --location="$REGION" --type=firestore-native
 
 # Dedicated service account, least-privilege (narrower than the default
 # Compute Engine SA your placeholder service currently runs as).

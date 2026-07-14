@@ -55,6 +55,8 @@ def _ytdlp_opts(base: dict) -> dict:
     cookiefile = _resolve_cookiefile()
     if cookiefile:
         opts["cookiefile"] = cookiefile
+    if settings.ytdlp_proxy:
+        opts["proxy"] = settings.ytdlp_proxy
     clients = [c.strip() for c in settings.ytdlp_player_clients.split(",") if c.strip()]
     if clients:
         extractor_args = dict(opts.get("extractor_args") or {})

@@ -29,8 +29,11 @@ from .base import (
     StoreError,
     StoreUnavailableError,
     VersionConflictError,
+    YouTubeCookieRecord,
     check_provenance_append_only,
+    count_cookie_lines,
     next_timestamp,
+    now_iso,
     unified_song_diff,
     version_sha,
 )
@@ -100,6 +103,36 @@ class FirestoreSongRepository(SongRepository):
 
     def _version_ref(self, song_id: str, sha: str):
         return self._song_ref(song_id).collection("versions").document(sha)
+
+    def _config_ref(self, name: str):
+        # a separate collection so config never shows up in list_songs()
+        return self._client.collection("snoocle_config").document(name)
+
+    # --- YouTube cookies -------------------------------------------------
+
+    @_translate_infra_errors
+    def set_youtube_cookies(self, cookies_txt: str, source: str) -> YouTubeCookieRecord:
+        ts, lc = now_iso(), count_cookie_lines(cookies_txt)
+        self._config_ref("youtube").set(
+            {"cookies": cookies_txt, "updatedAt": ts, "source": source, "lineCount": lc}
+        )
+        return YouTubeCookieRecord(ts, source, lc)
+
+    @_translate_infra_errors
+    def get_youtube_cookies_txt(self) -> str | None:
+        d = self._config_ref("youtube").get().to_dict()
+        return d.get("cookies") if d else None
+
+    @_translate_infra_errors
+    def youtube_cookies_status(self) -> YouTubeCookieRecord | None:
+        d = self._config_ref("youtube").get().to_dict()
+        if not d:
+            return None
+        return YouTubeCookieRecord(d.get("updatedAt", ""), d.get("source", ""), d.get("lineCount", 0))
+
+    @_translate_infra_errors
+    def clear_youtube_cookies(self) -> None:
+        self._config_ref("youtube").delete()
 
     # --- reads -----------------------------------------------------------
 

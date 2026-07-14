@@ -36,7 +36,13 @@ from .reconcile import ReconcileResult, provider_capabilities, reconcile
 from .reconcile.engine import ReconcileError
 from .reconcile.providers import ProviderError
 from .schema import Song, song_json_schema
-from .store import StoreError, StoreUnavailableError, VersionConflictError, backend_label
+from .store import (
+    StoreError,
+    StoreUnavailableError,
+    VersionConflictError,
+    backend_label,
+    count_cookie_lines,
+)
 
 # --- Single-service topology: embed the MCP endpoint in this FastAPI app -----
 # One Cloud Run service / container / process serves BOTH the REST API and the
@@ -413,6 +419,89 @@ def post_song(song_id: str, req: SaveSongRequest) -> dict:
     except StoreError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"version": saved.version, "timestamp": saved.timestamp, "message": saved.message}
+
+
+# --- YouTube acquisition cookies (in-app sign-in / manual upload) -------------
+# The iOS app can open a YouTube sign-in webview, harvest the session cookies,
+# and POST them here so server-side yt-dlp gets past YouTube's datacenter
+# bot-check — and refresh them later without a redeploy. These endpoints handle
+# the user's Google session, so they REQUIRE the app-level token to be
+# configured (SNOOCLE_API_TOKEN); otherwise they refuse (409) rather than expose
+# session cookies on an unauthenticated service.
+
+
+class YouTubeCookie(BaseModel):
+    name: str
+    value: str
+    domain: str = ".youtube.com"
+    path: str = "/"
+    expires: Optional[int] = None  # unix epoch; None/0 = session cookie
+    secure: bool = True
+    httpOnly: bool = False  # accepted from HTTPCookie; not used in the Netscape line
+
+
+class YouTubeCookiesRequest(BaseModel):
+    # provide the raw Netscape cookies.txt, OR a structured cookie array the app
+    # harvests from its webview's cookie store (converted here).
+    cookiesTxt: Optional[str] = None
+    cookies: Optional[list[YouTubeCookie]] = None
+    source: str = "app"
+
+    @model_validator(mode="after")
+    def _need_cookies(self) -> "YouTubeCookiesRequest":
+        if not (self.cookiesTxt or self.cookies):
+            raise ValueError("provide cookiesTxt (Netscape cookies.txt) or a cookies array")
+        return self
+
+
+def _cookies_to_netscape(cookies: list[YouTubeCookie]) -> str:
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        domain = c.domain or ".youtube.com"
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+        secure = "TRUE" if c.secure else "FALSE"
+        expiry = int(c.expires) if c.expires else 0
+        lines.append("\t".join([domain, include_sub, c.path or "/", secure, str(expiry), c.name, c.value]))
+    return "\n".join(lines) + "\n"
+
+
+def _require_app_auth_configured() -> None:
+    if not settings.api_token:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "refusing to manage YouTube session cookies on an unauthenticated service; "
+                "set SNOOCLE_API_TOKEN (and redeploy) first so this endpoint is gated"
+            ),
+        )
+
+
+@app.post("/v1/config/youtube-cookies")
+def post_youtube_cookies(req: YouTubeCookiesRequest) -> dict:
+    _require_app_auth_configured()
+    txt = req.cookiesTxt if req.cookiesTxt else _cookies_to_netscape(req.cookies or [])
+    if count_cookie_lines(txt) == 0:
+        raise HTTPException(status_code=422, detail="no cookie entries found")
+    rec = get_store().set_youtube_cookies(txt, source=req.source)
+    return {"status": "stored", "updatedAt": rec.updated_at, "source": rec.source,
+            "lineCount": rec.line_count}
+
+
+@app.get("/v1/config/youtube-cookies")
+def get_youtube_cookies() -> dict:
+    _require_app_auth_configured()
+    rec = get_store().youtube_cookies_status()
+    if rec is None:
+        return {"configured": False}
+    return {"configured": True, "updatedAt": rec.updated_at, "source": rec.source,
+            "lineCount": rec.line_count}
+
+
+@app.delete("/v1/config/youtube-cookies")
+def delete_youtube_cookies() -> dict:
+    _require_app_auth_configured()
+    get_store().clear_youtube_cookies()
+    return {"status": "cleared"}
 
 
 # --- deterministic audio utilities (no AI) -----------------------------------

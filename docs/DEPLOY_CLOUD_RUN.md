@@ -355,6 +355,26 @@ download**, so "only analyze part of the song" does not avoid it. (Partial
 analysis exists anyway for speed: set `SNOOCLE_MIR_MAX_ANALYSIS_SECONDS` to clip
 what the MIR engines process.)
 
+### Refresh cookies from the app (no redeploy)
+
+Cookies uploaded at runtime are stored in Firestore and take precedence over the
+env-configured ones, so refreshing is a POST — no redeploy, no Secret rotation.
+The iOS app opens a YouTube sign-in webview, harvests the session cookies from
+its cookie store, and POSTs them; when they eventually rot, the user just signs
+in again in the app.
+
+```
+POST   /v1/config/youtube-cookies   {"cookiesTxt": "<netscape cookies.txt>"}   # or a "cookies":[…] array
+GET    /v1/config/youtube-cookies   -> {"configured": true, "updatedAt": …, "lineCount": …}   # never returns the cookies
+DELETE /v1/config/youtube-cookies   -> {"status": "cleared"}
+```
+
+**These endpoints require the app token** (`SNOOCLE_API_TOKEN`) to be configured
+— they hold your Google session, so on an unauthenticated (public) service they
+refuse with `409`. Enable the [static bearer token](#optional-a-static-bearer-token)
+first; the app then sends `Authorization: Bearer <token>` on these calls like any
+other. Resolution order for yt-dlp cookies: **uploaded (Firestore) → `SNOOCLE_YTDLP_COOKIES_FILE` → `SNOOCLE_YTDLP_COOKIES`**.
+
 ## Known gaps / follow-ups
 
 - **Firestore document size** — each `versions/{sha}` snapshot stores the full

@@ -21,7 +21,9 @@ def _reset(monkeypatch):
     monkeypatch.setattr(settings, "ytdlp_cookies_file", "")
     monkeypatch.setattr(settings, "ytdlp_player_clients", "")
     monkeypatch.setattr(settings, "ytdlp_proxy", "")
-    monkeypatch.setattr(acquire, "_cookie_tmpfile", None)
+    # isolate from runtime-uploaded cookies (tested separately)
+    monkeypatch.setattr(acquire, "_stored_cookies_txt", lambda: None)
+    monkeypatch.setattr(acquire, "_materialized", {})
 
 
 def test_passthrough_when_unconfigured():

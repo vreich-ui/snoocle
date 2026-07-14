@@ -28,22 +28,45 @@ class AcquisitionError(RuntimeError):
     pass
 
 
-_cookie_tmpfile: str | None = None
+_materialized: dict[str, str] = {}  # content hash -> temp cookies.txt path
+
+
+def _materialize_cookies(content: str) -> str:
+    """Write cookies.txt content to a temp file, cached by content hash so a
+    refreshed cookie set takes effect immediately without re-writing."""
+    import hashlib
+
+    key = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    path = _materialized.get(key)
+    if path is None or not Path(path).exists():
+        p = Path(tempfile.mkdtemp(prefix="snoocle-ytc-")) / "cookies.txt"
+        p.write_text(content)
+        _materialized[key] = path = str(p)
+    return path
+
+
+def _stored_cookies_txt() -> str | None:
+    """Cookies uploaded at runtime (in-app sign-in / manual upload), from the
+    durable store. Best-effort — never let a store hiccup break acquisition."""
+    try:
+        from ..store import get_repository
+
+        return get_repository().get_youtube_cookies_txt()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _resolve_cookiefile() -> str | None:
-    """A cookies.txt path for yt-dlp, from SNOOCLE_YTDLP_COOKIES_FILE (a mounted
-    path) or SNOOCLE_YTDLP_COOKIES (inline content, materialized to a temp file
-    once). None when neither is configured."""
-    global _cookie_tmpfile
+    """A cookies.txt path for yt-dlp. Precedence: runtime-uploaded cookies
+    (refreshable without redeploy) > SNOOCLE_YTDLP_COOKIES_FILE (mounted path) >
+    SNOOCLE_YTDLP_COOKIES (env content). None when nothing is configured."""
+    stored = _stored_cookies_txt()
+    if stored:
+        return _materialize_cookies(stored)
     if settings.ytdlp_cookies_file:
         return settings.ytdlp_cookies_file
     if settings.ytdlp_cookies:
-        if _cookie_tmpfile is None or not Path(_cookie_tmpfile).exists():
-            p = Path(tempfile.mkdtemp(prefix="snoocle-ytdlp-")) / "cookies.txt"
-            p.write_text(settings.ytdlp_cookies)
-            _cookie_tmpfile = str(p)
-        return _cookie_tmpfile
+        return _materialize_cookies(settings.ytdlp_cookies)
     return None
 
 

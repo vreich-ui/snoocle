@@ -81,6 +81,18 @@ class Settings(BaseSettings):
     search_max_candidates: int = 8  # gather generously; reconciliation uses all of them
     fetch_timeout_seconds: float = 20.0
 
+    # --- YouTube acquisition (yt-dlp) ---
+    # YouTube blocks datacenter IPs (Cloud Run) with a "confirm you're not a
+    # bot" challenge. Supply cookies from a signed-in browser to authenticate:
+    #   * SNOOCLE_YTDLP_COOKIES       — the cookies.txt CONTENT (e.g. a Secret
+    #     Manager value injected as an env var); written to a temp file for yt-dlp.
+    #   * SNOOCLE_YTDLP_COOKIES_FILE  — a path to a mounted cookies.txt instead.
+    # And/or try alternate player clients (sometimes bypasses the check without
+    # cookies): SNOOCLE_YTDLP_PLAYER_CLIENTS="default,android,ios,tv,web_safari".
+    ytdlp_cookies: str = ""
+    ytdlp_cookies_file: str = ""
+    ytdlp_player_clients: str = ""
+
     # --- audio / MIR ---
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"

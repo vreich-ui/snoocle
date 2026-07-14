@@ -16,6 +16,8 @@ from .base import (  # noqa: F401
     StoreError,
     StoreUnavailableError,
     VersionConflictError,
+    YouTubeCookieRecord,
+    count_cookie_lines,
     version_sha,
 )
 

@@ -150,6 +150,23 @@ def test_get_missing_song_raises(repo):
     assert repo.current_version("nope--nothing") is None
 
 
+def test_youtube_cookies_persist(repo):
+    assert repo.youtube_cookies_status() is None
+    assert repo.get_youtube_cookies_txt() is None
+
+    txt = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n"
+    rec = repo.set_youtube_cookies(txt, source="app")
+    assert rec.source == "app" and rec.line_count == 1 and rec.updated_at
+
+    assert repo.get_youtube_cookies_txt() == txt
+    status = repo.youtube_cookies_status()
+    assert status.source == "app" and status.line_count == 1
+
+    repo.clear_youtube_cookies()
+    assert repo.youtube_cookies_status() is None
+    assert repo.get_youtube_cookies_txt() is None
+
+
 def test_firestore_database_config(monkeypatch):
     """FIRESTORE_DATABASE targets a NAMED database; the project id (a different
     thing) stays in GOOGLE_CLOUD_PROJECT. Defaults to Firestore's "(default)"."""

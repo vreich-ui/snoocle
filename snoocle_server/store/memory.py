@@ -23,8 +23,11 @@ from .base import (
     SongVersion,
     StoreError,
     VersionConflictError,
+    YouTubeCookieRecord,
     check_provenance_append_only,
+    count_cookie_lines,
     next_timestamp,
+    now_iso,
     unified_song_diff,
     version_sha,
 )
@@ -51,7 +54,30 @@ class _Record:
 class InMemorySongRepository(SongRepository):
     def __init__(self) -> None:
         self._songs: dict[str, _Record] = {}
+        self._yt_cookies: dict | None = None
         self._lock = threading.RLock()
+
+    # --- YouTube cookies -------------------------------------------------
+
+    def set_youtube_cookies(self, cookies_txt: str, source: str) -> YouTubeCookieRecord:
+        with self._lock:
+            rec = {"txt": cookies_txt, "updated_at": now_iso(), "source": source,
+                   "line_count": count_cookie_lines(cookies_txt)}
+            self._yt_cookies = rec
+            return YouTubeCookieRecord(rec["updated_at"], rec["source"], rec["line_count"])
+
+    def get_youtube_cookies_txt(self) -> str | None:
+        with self._lock:
+            return self._yt_cookies["txt"] if self._yt_cookies else None
+
+    def youtube_cookies_status(self) -> YouTubeCookieRecord | None:
+        with self._lock:
+            r = self._yt_cookies
+            return YouTubeCookieRecord(r["updated_at"], r["source"], r["line_count"]) if r else None
+
+    def clear_youtube_cookies(self) -> None:
+        with self._lock:
+            self._yt_cookies = None
 
     def list_songs(self) -> list[str]:
         with self._lock:

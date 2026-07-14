@@ -64,6 +64,21 @@ class SaveResult:
     message: str
 
 
+@dataclass
+class YouTubeCookieRecord:
+    """Non-secret status of the stored YouTube cookies (never the cookies)."""
+
+    updated_at: str
+    source: str  # e.g. "app" (in-app sign-in) | "api" (manual upload)
+    line_count: int  # number of cookie entries — a coarse "is it populated" signal
+
+
+def count_cookie_lines(cookies_txt: str) -> int:
+    return sum(
+        1 for ln in cookies_txt.splitlines() if ln.strip() and not ln.lstrip().startswith("#")
+    )
+
+
 def canonical_json(song: Song) -> str:
     """Deterministic, sorted-key, compact JSON — the hashing input."""
     return json.dumps(song.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
@@ -169,3 +184,24 @@ class SongRepository(ABC):
         enforce_expected: when True, a None expected_version is only valid for a
         song that does not exist yet (strict create-or-CAS semantics).
         """
+
+    # --- YouTube acquisition cookies (durable server config) -------------
+    # Lets the iOS app (or a manual upload) hand the server a signed-in
+    # cookies.txt so yt-dlp can get past YouTube's datacenter bot-check, and
+    # refresh it later without a redeploy.
+
+    @abstractmethod
+    def set_youtube_cookies(self, cookies_txt: str, source: str) -> YouTubeCookieRecord:
+        """Persist a cookies.txt; returns its (non-secret) status."""
+
+    @abstractmethod
+    def get_youtube_cookies_txt(self) -> str | None:
+        """The stored cookies.txt for yt-dlp, or None. (Secret — server-side use.)"""
+
+    @abstractmethod
+    def youtube_cookies_status(self) -> YouTubeCookieRecord | None:
+        """Non-secret status of the stored cookies, or None if unset."""
+
+    @abstractmethod
+    def clear_youtube_cookies(self) -> None:
+        """Remove any stored cookies."""

@@ -14,6 +14,7 @@ from .base import (  # noqa: F401
     SongRepository,
     SongVersion,
     StoreError,
+    StoreUnavailableError,
     VersionConflictError,
     version_sha,
 )

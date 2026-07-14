@@ -148,3 +148,38 @@ def test_get_missing_song_raises(repo):
         repo.get("nope--nothing")
     assert repo.versions("nope--nothing") == []
     assert repo.current_version("nope--nothing") is None
+
+
+def test_firestore_infra_errors_translate_to_store_unavailable():
+    """Firestore backend failures (DB missing, permission denied, unavailable)
+    surface as StoreUnavailableError; our own errors and real bugs pass through."""
+    from google.api_core import exceptions as gexc
+
+    from snoocle_server.store import StoreUnavailableError, VersionConflictError
+    from snoocle_server.store.firestore_store import _is_infra_error, _translate_infra_errors
+
+    assert _is_infra_error(gexc.NotFound("db missing")) is True
+    assert _is_infra_error(gexc.PermissionDenied("nope")) is True
+    assert _is_infra_error(gexc.ServiceUnavailable("down")) is True
+    assert _is_infra_error(ValueError("real bug")) is False
+
+    class Dummy:
+        @_translate_infra_errors
+        def db_missing(self):
+            raise gexc.NotFound("the database (default) does not exist")
+
+        @_translate_infra_errors
+        def conflict(self):
+            raise VersionConflictError("stale")
+
+        @_translate_infra_errors
+        def real_bug(self):
+            raise ValueError("a genuine bug we must not mask")
+
+    d = Dummy()
+    with pytest.raises(StoreUnavailableError):
+        d.db_missing()
+    with pytest.raises(VersionConflictError):  # our own error passes through
+        d.conflict()
+    with pytest.raises(ValueError):  # non-infra bug is not masked
+        d.real_bug()

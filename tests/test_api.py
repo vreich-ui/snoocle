@@ -186,6 +186,25 @@ def test_song_not_found():
     assert client.get("/v1/songs/nope--nothing").status_code == 404
 
 
+def test_store_unavailable_maps_to_503(monkeypatch):
+    """A backend outage (e.g. Firestore DB missing) is a clean 503, never a bare
+    500 and never a misleading 404."""
+    from snoocle_server.store import StoreUnavailableError
+
+    class DownRepo:
+        def list_songs(self):
+            raise StoreUnavailableError("the database (default) does not exist")
+
+        def get(self, song_id, version=None):
+            raise StoreUnavailableError("the database (default) does not exist")
+
+    monkeypatch.setattr(api_mod, "get_store", lambda: DownRepo())
+    r1 = client.get("/v1/songs")
+    assert r1.status_code == 503
+    assert "store unavailable" in r1.json()["detail"]
+    assert client.get("/v1/songs/the-beatles--let-it-be").status_code == 503
+
+
 pytestmark_audio = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg")
 
 

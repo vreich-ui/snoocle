@@ -36,7 +36,7 @@ from .reconcile import ReconcileResult, provider_capabilities, reconcile
 from .reconcile.engine import ReconcileError
 from .reconcile.providers import ProviderError
 from .schema import Song, song_json_schema
-from .store import StoreError, VersionConflictError, backend_label
+from .store import StoreError, StoreUnavailableError, VersionConflictError, backend_label
 
 # --- Single-service topology: embed the MCP endpoint in this FastAPI app -----
 # One Cloud Run service / container / process serves BOTH the REST API and the
@@ -119,6 +119,14 @@ class _BearerTokenMiddleware:
 # Wrap the entire app (REST routes + the /mcp transport appended below) so one
 # token authorizes both surfaces when SNOOCLE_API_TOKEN is configured.
 app.add_middleware(_BearerTokenMiddleware)
+
+
+@app.exception_handler(StoreUnavailableError)
+async def _store_unavailable_handler(request, exc: StoreUnavailableError) -> JSONResponse:
+    # The store backend is down/misconfigured (e.g. the Firestore database
+    # doesn't exist). 503, not a bare 500 — and never 404, which would falsely
+    # read as "song not found".
+    return JSONResponse({"detail": f"store unavailable: {exc}"}, status_code=503)
 
 
 def _asdict(obj: Any) -> Any:

@@ -141,8 +141,15 @@ the `/mcp` route — correct **only** because Cloud Run IAM
 (`--no-allow-unauthenticated`) authenticates every request before it reaches
 the container, and because the co-located REST routes have no such check
 either: the whole service's exposure is governed uniformly at the IAM/bind
-edge, not per-route. Locally (no flag), the `/mcp` host check stays on with a
-localhost allowlist; bind uvicorn to `127.0.0.1` for local runs.
+edge, not per-route. Without it, `/mcp` rejects every request with `Invalid
+Host header`. Locally (no flag, non-Docker), the `/mcp` host check stays on
+with a localhost allowlist; bind uvicorn to `127.0.0.1` for local runs.
+
+> This value is **baked into the image** (`Dockerfile` `ENV`), so it survives an
+> automated rebuild/redeploy (e.g. a Cloud Build trigger) even if the deploy
+> command doesn't repeat it. Passing it in `--set-env-vars` too is harmless
+> belt-and-suspenders. `GOOGLE_CLOUD_PROJECT` is *not* baked (it's
+> environment-specific) — it must come from the deploy/trigger.
 
 ## 5. Grant yourself access
 

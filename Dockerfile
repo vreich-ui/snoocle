@@ -119,7 +119,17 @@ RUN mkdir -p /data/audio-cache \
 # Songs persist in Firestore (SNOOCLE_STORE_BACKEND=firestore); GOOGLE_CLOUD_PROJECT
 # is injected at deploy time. Listen on all interfaces; PORT is honored by the
 # CMD below (Cloud Run injects it).
+#
+# SNOOCLE_MCP_TRUST_PROXY=true is baked into the IMAGE (not left to the deploy
+# command) so it survives automated redeploys — a Cloud Build trigger that
+# rebuilds and redeploys can't accidentally drop it. It disables the MCP /mcp
+# DNS-rebinding Host check, which is correct here because the service's exposure
+# is governed at the Cloud Run edge (IAM, or an intentionally public service),
+# not per-route. Without it, /mcp answers every request with "Invalid Host
+# header". Local non-Docker runs (uvicorn directly) don't get this ENV, so their
+# host check stays on by default.
 ENV SNOOCLE_STORE_BACKEND=firestore \
+    SNOOCLE_MCP_TRUST_PROXY=true \
     SNOOCLE_DATA_DIR=/data \
     SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache \
     SNOOCLE_CHORD_CNN_LSTM_DIR=/opt/models/chord-cnn-lstm \

@@ -357,9 +357,10 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except PipelineStepError as e:
-        # A fatal step (reconcile/store) failed or timed out — name it so the
-        # client shows exactly where the pipeline broke.
-        raise HTTPException(status_code=502, detail=f"{e.step}: {e.message}") from e
+        # A fatal step (reconcile/store) failed or timed out — name it, and
+        # include the per-step outcomes so the client shows exactly where the
+        # pipeline broke (str(e) carries the "[steps: ...]" summary).
+        raise HTTPException(status_code=502, detail=str(e)) from e
     assert report.reconcile is not None
     return {
         "songId": report.song_id,

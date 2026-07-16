@@ -14,6 +14,7 @@ plugged in.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -27,6 +28,15 @@ log = logging.getLogger(__name__)
 
 SearchFn = Callable[[str, int], list[SearchHit]]
 FetchFn = Callable[[str], str]
+
+_QUOTE_RE = re.compile(r'["“”„‟]+')
+
+
+def _phrase(term: str) -> str:
+    """Exact-phrase query term; quotes embedded in the term itself (common in
+    video-derived titles like 'Blues Traveler "Hook" at ...') would otherwise
+    terminate the phrase early and garble the whole query."""
+    return '"' + " ".join(_QUOTE_RE.sub(" ", term).split()) + '"'
 
 
 def _confidence(sheet) -> float:
@@ -82,7 +92,7 @@ def discover_sources(
     search_fn = search_fn or (lambda q, n: web_search(q, n))
     fetch_fn = fetch_fn or fetch_page
 
-    query = f'"{title}" "{artist}" chords'
+    query = f"{_phrase(title)} {_phrase(artist)} chords"
     # ask for more hits than we need: many pages won't parse into a sheet
     hits = search_fn(query, max_candidates * 3)
     log.info("discovery: %d search hits for %s — %s", len(hits), artist, title)

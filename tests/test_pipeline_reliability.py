@@ -89,6 +89,24 @@ def test_fatal_reconcile_failure_returns_502_naming_step(monkeypatch):
     assert "provider exploded" in r.json()["detail"]
 
 
+def test_fatal_502_detail_includes_step_outcomes(monkeypatch):
+    """The 502 detail carries the per-step outcomes so the client can see WHY
+    the fatal step had nothing to work with (not just that it failed)."""
+    def fail(*a, **k):  # noqa: ANN001
+        raise ReconcileError("nothing to reconcile: no candidate sources and no MIR analysis")
+
+    monkeypatch.setattr(pipeline_mod, "reconcile", fail)
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True},
+    )
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail.startswith("reconcile: nothing to reconcile")
+    assert "[steps:" in detail
+    assert "discover=" in detail and "mir=skipped" in detail
+
+
 def test_reconcile_timeout_returns_502(monkeypatch):
     monkeypatch.setattr(settings, "reconcile_timeout_seconds", 0.2)
 

@@ -13,7 +13,8 @@ Reliability contract (POST /v1/songs/analyze):
   pipeline continues from whatever it has (a song can still come from text
   sources alone, or MIR alone). reconcile/store are *fatal* — a failure or
   timeout raises :class:`PipelineStepError`, which the API turns into a
-  ``502 {"detail": "<step>: <msg>"}`` so the client sees exactly what broke.
+  ``502 {"detail": "<step>: <msg> [steps: ...]"}`` (the per-step outcomes so
+  far) so the client sees exactly what broke — and why upstream.
 - **Truthful ``steps``.** Each entry is the real per-step outcome
   (``"ok: ..."`` / ``"skipped"`` / ``"failed: ..."``).
 - **Offline mock.** ``provider="mock"`` never touches the network: discovery is
@@ -42,12 +43,24 @@ log = logging.getLogger(__name__)
 
 
 class PipelineStepError(RuntimeError):
-    """A fatal pipeline step failed; carries the step name for a 502 detail."""
+    """A fatal pipeline step failed; carries the step name for a 502 detail,
+    plus the per-step outcomes so far so the client can see WHY the fatal step
+    had nothing to work with (e.g. reconcile failing only because discover,
+    acquire, and mir all came up empty)."""
 
-    def __init__(self, step: str, message: str):
+    def __init__(self, step: str, message: str, steps: dict[str, str] | None = None):
         self.step = step
         self.message = message
-        super().__init__(f"{step}: {message}")
+        self.steps = dict(steps or {})
+        detail = f"{step}: {message}"
+        if self.steps:
+            summary = "; ".join(f"{k}={_truncate(v)}" for k, v in self.steps.items())
+            detail += f" [steps: {summary}]"
+        super().__init__(detail)
+
+
+def _truncate(text: str, limit: int = 160) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 @dataclass
@@ -254,10 +267,12 @@ async def run_pipeline_async(
         )
     except asyncio.TimeoutError as e:
         raise PipelineStepError(
-            "reconcile", f"timed out after {settings.reconcile_timeout_seconds:.0f}s"
+            "reconcile",
+            f"timed out after {settings.reconcile_timeout_seconds:.0f}s",
+            steps=report.steps,
         ) from e
     except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
-        raise PipelineStepError("reconcile", str(e)) from e
+        raise PipelineStepError("reconcile", str(e), steps=report.steps) from e
     result = report.reconcile
     report.steps["reconcile"] = (
         f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"
@@ -276,10 +291,12 @@ async def run_pipeline_async(
         raise  # -> HTTP 409, not a 502
     except asyncio.TimeoutError as e:
         raise PipelineStepError(
-            "store", f"timed out after {settings.store_timeout_seconds:.0f}s"
+            "store",
+            f"timed out after {settings.store_timeout_seconds:.0f}s",
+            steps=report.steps,
         ) from e
     except Exception as e:  # noqa: BLE001
-        raise PipelineStepError("store", str(e)) from e
+        raise PipelineStepError("store", str(e), steps=report.steps) from e
     report.stored_version = saved.version
     report.stored_timestamp = saved.timestamp
     report.steps["store"] = f"ok: version {saved.version}"

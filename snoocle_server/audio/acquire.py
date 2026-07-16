@@ -129,6 +129,17 @@ def _strip_title_noise(text: str) -> str:
     return text.strip(" -—–|·")
 
 
+_QUOTE_CHARS = '"“”„‟'
+
+# 'Artist "Track" <anything>' — live/one-off uploads often quote the song name
+# instead of using an "Artist - Title" separator (e.g. 'Blues Traveler "Hook"
+# at Howard Stern's 1996 Birthday Show').
+_QUOTED_TRACK_RE = re.compile(
+    rf"^(?P<artist>[^{_QUOTE_CHARS}]{{2,60}}?)\s+[{_QUOTE_CHARS}]"
+    rf"(?P<track>[^{_QUOTE_CHARS}]{{1,80}})[{_QUOTE_CHARS}]"
+)
+
+
 def derive_title_artist(info: dict) -> tuple[str, str]:
     """Best-effort (title, artist) from a yt-dlp info dict.
 
@@ -148,9 +159,14 @@ def derive_title_artist(info: dict) -> tuple[str, str]:
         # "Artist - Title", tolerating hyphen / en-dash / em-dash separators
         parts = re.split(r"\s+[-–—]\s+", cleaned, maxsplit=1)
         if len(parts) == 2:
-            left, right = parts[0].strip(), parts[1].strip()
+            left, right = (p.strip().strip(_QUOTE_CHARS).strip() for p in parts)
             artist = artist or left
             track = track or right
+        else:
+            m = _QUOTED_TRACK_RE.match(cleaned)
+            if m:
+                artist = artist or m.group("artist").strip()
+                track = track or m.group("track").strip()
 
     title = track or cleaned or vid_title or "Unknown"
     artist = artist or uploader or "Unknown"

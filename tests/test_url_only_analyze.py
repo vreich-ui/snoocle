@@ -44,6 +44,18 @@ def isolated_store(monkeypatch):
         # plain fallback: title as-is, uploader as artist
         ({"title": "Some Jam", "uploader": "GarageBandTV"},
          ("Some Jam", "GarageBandTV")),
+        # quoted song name, no dash separator (live/one-off uploads); uploader
+        # is a show channel, not the artist
+        ({"title": "Blues Traveler \"Hook\" at Howard Stern's 1996 Birthday Show",
+          "uploader": "The Howard Stern Show"},
+         ("Hook", "Blues Traveler")),
+        # same pattern with curly quotes
+        ({"title": "Blues Traveler “Hook” at Howard Stern's 1996 Birthday Show",
+          "uploader": "The Howard Stern Show"},
+         ("Hook", "Blues Traveler")),
+        # dash separator with a quoted right side: wrapping quotes stripped
+        ({"title": 'Taylor Swift - "Blank Space" (Official Video)', "uploader": "TaylorSwiftVEVO"},
+         ("Blank Space", "Taylor Swift")),
     ],
 )
 def test_derive_title_artist(info, expected):

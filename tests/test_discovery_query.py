@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from snoocle_server.discovery.search import SearchHit
 from snoocle_server.discovery.service import discover_sources
 
@@ -70,6 +72,63 @@ def test_falls_back_to_quoted_track_identity_when_literal_finds_nothing():
     ]
     assert len(cands) == 1
     assert cands[0].url == "https://example.com/hook-chords"
+
+
+def test_falls_back_to_dash_identity(tmp_path):
+    """The Amy Winehouse case: the app passes the raw video title and the
+    channel name; the literal query finds nothing, so discovery retries with
+    the 'Artist - Track' identity embedded in the title."""
+    queries: list[str] = []
+    sheet = (FIXTURES / "sheet_over_lyrics.txt").read_text()
+
+    def search_fn(query: str, n: int) -> list[SearchHit]:
+        queries.append(query)
+        if len(queries) == 1:
+            return []
+        return [SearchHit(url="https://example.com/btb-chords", title="Back To Black chords")]
+
+    cands = discover_sources(
+        "Amy Winehouse - Back To Black",
+        "AmyWinehouse",
+        search_fn=search_fn,
+        fetch_fn=lambda url: sheet,
+    )
+    assert queries[1] == '"Back To Black" "Amy Winehouse" chords'
+    assert len(cands) == 1
+
+
+def test_fallback_also_runs_when_primary_search_errors():
+    """An over-specific literal query can make every backend raise (e.g.
+    'duckduckgo: 0 results'); the embedded-identity retry must still happen."""
+    from snoocle_server.discovery.search import SearchError
+
+    queries: list[str] = []
+    sheet = (FIXTURES / "sheet_over_lyrics.txt").read_text()
+
+    def search_fn(query: str, n: int) -> list[SearchHit]:
+        queries.append(query)
+        if len(queries) == 1:
+            raise SearchError("all search backends failed: duckduckgo: 0 results")
+        return [SearchHit(url="https://example.com/btb-chords", title="Back To Black chords")]
+
+    cands = discover_sources(
+        "Amy Winehouse - Back To Black",
+        "AmyWinehouse",
+        search_fn=search_fn,
+        fetch_fn=lambda url: sheet,
+    )
+    assert len(queries) == 2
+    assert len(cands) == 1
+
+
+def test_primary_search_error_reraised_when_no_embedded_identity():
+    from snoocle_server.discovery.search import SearchError
+
+    def search_fn(query: str, n: int) -> list[SearchHit]:
+        raise SearchError("all search backends failed")
+
+    with pytest.raises(SearchError):
+        discover_sources("Hook", "Blues Traveler", search_fn=search_fn)
 
 
 def test_no_fallback_for_plain_identity_with_no_results():

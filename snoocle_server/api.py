@@ -25,7 +25,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
 from .audio import utils as audio_utils
-from .audio.acquire import AcquisitionError, acquire
+from .audio.acquire import AcquisitionError, YouTubeAuthError, acquire
 from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .discovery.search import SearchError
@@ -228,6 +228,33 @@ def post_discover(req: DiscoverRequest) -> dict:
 # --- step 4: audio acquisition + MIR ----------------------------------------
 
 
+
+# Human-readable, action-oriented reasons for machine-readable error codes.
+# Clients key UI actions off errorCode (e.g. "youtube_auth_required" -> the
+# in-app Reconnect YouTube flow) and show `reason` as the headline message.
+_ERROR_REASONS = {
+    "youtube_auth_required": (
+        "YouTube connection expired or was blocked. Reconnect YouTube "
+        "(sign in again in the app) and retry."
+    ),
+}
+
+
+def _error_response(status_code: int, detail: str, error_code: str | None) -> JSONResponse:
+    body: dict = {"detail": detail}
+    if error_code:
+        body["errorCode"] = error_code
+        reason = _ERROR_REASONS.get(error_code)
+        if reason:
+            body["reason"] = reason
+    return JSONResponse(body, status_code=status_code)
+
+
+def _acquisition_error_response(e: AcquisitionError) -> JSONResponse:
+    code = "youtube_auth_required" if isinstance(e, YouTubeAuthError) else None
+    return _error_response(502, str(e), code)
+
+
 class AcquireRequest(BaseModel):
     title: Optional[str] = None
     artist: Optional[str] = None
@@ -235,11 +262,11 @@ class AcquireRequest(BaseModel):
 
 
 @app.post("/v1/audio/acquire")
-def post_acquire(req: AcquireRequest) -> dict:
+def post_acquire(req: AcquireRequest):
     try:
         acquired = acquire(title=req.title, artist=req.artist, video_url_or_id=req.youtubeUrlOrId)
     except AcquisitionError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        return _acquisition_error_response(e)
     return _asdict(acquired)
 
 
@@ -264,7 +291,7 @@ async def post_analyze(req: AnalyzeRequest) -> dict:
                 acquire, title=req.title, artist=req.artist, video_url_or_id=req.youtubeUrlOrId
             )
         except AcquisitionError as e:
-            raise HTTPException(status_code=502, detail=str(e)) from e
+            return _acquisition_error_response(e)
         path = acquired.path
         video_id = acquired.video_id
     if not Path(path).exists():
@@ -399,10 +426,11 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except PipelineStepError as e:
-        # A fatal step (reconcile/store) failed or timed out — name it, and
-        # include the per-step outcomes so the client shows exactly where the
-        # pipeline broke (str(e) carries the "[steps: ...]" summary).
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        # A fatal step (reconcile/store) failed or timed out — name it, include
+        # the per-step outcomes (str(e) carries the "[steps: ...]" summary),
+        # and when the root cause is classified (e.g. dead YouTube session),
+        # add errorCode + reason so the client can offer the fix action.
+        return _error_response(502, str(e), e.error_code)
     assert report.reconcile is not None
     return {
         "songId": report.song_id,

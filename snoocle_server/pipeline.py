@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 
 from fastapi.concurrency import run_in_threadpool
 
-from .audio.acquire import AcquiredAudio, acquire, extract_metadata
+from .audio.acquire import AcquiredAudio, YouTubeAuthError, acquire, extract_metadata
 from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .mir import MirAnalysis, analyze_audio
@@ -48,10 +48,19 @@ class PipelineStepError(RuntimeError):
     had nothing to work with (e.g. reconcile failing only because discover,
     acquire, and mir all came up empty)."""
 
-    def __init__(self, step: str, message: str, steps: dict[str, str] | None = None):
+    def __init__(
+        self,
+        step: str,
+        message: str,
+        steps: dict[str, str] | None = None,
+        error_code: str | None = None,
+    ):
         self.step = step
         self.message = message
         self.steps = dict(steps or {})
+        # Machine-readable classification for clients that offer a fix action
+        # (e.g. "youtube_auth_required" -> the app's Reconnect YouTube flow).
+        self.error_code = error_code
         detail = f"{step}: {message}"
         if self.steps:
             summary = "; ".join(f"{k}={_truncate(v)}" for k, v in self.steps.items())
@@ -73,6 +82,7 @@ class PipelineReport:
     reconcile: ReconcileResult | None = None
     stored_version: str | None = None
     stored_timestamp: str | None = None
+    error_code: str | None = None  # machine-readable cause from a failed step
 
 
 def get_store() -> SongRepository:
@@ -207,7 +217,8 @@ async def run_pipeline_async(
                 "resolve", f"timed out after {settings.acquire_timeout_seconds:.0f}s"
             ) from e
         except Exception as e:  # noqa: BLE001
-            raise PipelineStepError("resolve", str(e)) from e
+            code = "youtube_auth_required" if isinstance(e, YouTubeAuthError) else None
+            raise PipelineStepError("resolve", str(e), error_code=code) from e
         title = title or meta.title
         artist = artist or meta.artist
         youtube_url_or_id = youtube_url_or_id or meta.video_id
@@ -245,6 +256,8 @@ async def run_pipeline_async(
             report.steps["acquire"] = f"ok: {report.audio.video_id} ({report.audio.video_title})"
         except Exception as e:  # noqa: BLE001 — best-effort (incl. timeout)
             report.steps["acquire"] = _fail_text(e, settings.acquire_timeout_seconds)
+            if isinstance(e, YouTubeAuthError):
+                report.error_code = "youtube_auth_required"
         if report.audio is not None:
             audio_path = report.audio.path
             try:
@@ -274,7 +287,9 @@ async def run_pipeline_async(
             steps=report.steps,
         ) from e
     except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
-        raise PipelineStepError("reconcile", str(e), steps=report.steps) from e
+        raise PipelineStepError(
+            "reconcile", str(e), steps=report.steps, error_code=report.error_code
+        ) from e
     result = report.reconcile
     report.steps["reconcile"] = (
         f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"

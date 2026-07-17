@@ -241,19 +241,27 @@ class AnalyzeRequest(BaseModel):
 
 
 @app.post("/v1/audio/analyze")
-def post_analyze(req: AnalyzeRequest) -> dict:
+async def post_analyze(req: AnalyzeRequest) -> dict:
     path = req.audioPath
     video_id = None
     if path is None:
         try:
-            acquired = acquire(title=req.title, artist=req.artist, video_url_or_id=req.youtubeUrlOrId)
+            acquired = await run_in_threadpool(
+                acquire, title=req.title, artist=req.artist, video_url_or_id=req.youtubeUrlOrId
+            )
         except AcquisitionError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
         path = acquired.path
         video_id = acquired.video_id
     if not Path(path).exists():
         raise HTTPException(status_code=404, detail=f"no such audio file: {path}")
-    analysis = analyze_audio(path)
+    # MIR is CPU-bound and runs for minutes on a full song; offload it so it
+    # doesn't block the event loop shared with the embedded MCP transport
+    # (same treatment as /v1/audio/analyze/upload).
+    try:
+        analysis = await run_in_threadpool(analyze_audio, path)
+    except audio_utils.AudioToolError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     return {"audioPath": path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
 
 

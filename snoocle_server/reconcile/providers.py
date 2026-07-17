@@ -465,8 +465,13 @@ class AgentMcpProvider(LLMProvider):
         return output
 
 
+# Imported here (not at module top) so the new module can import LLMProvider/
+# LLMResponse/ProviderError from this one without a circular import.
+from .anthropic_agent import AnthropicAgentProvider  # noqa: E402
+
 _PROVIDERS: dict[str, type[LLMProvider]] = {
     "anthropic": AnthropicProvider,
+    "anthropic-agent": AnthropicAgentProvider,
     "openai": OpenAIProvider,
     "gemini": GeminiProvider,
     "agent": AgentMcpProvider,

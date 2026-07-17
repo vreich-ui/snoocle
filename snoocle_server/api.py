@@ -303,7 +303,7 @@ class ReconcileRequest(BaseModel):
     artist: str
     candidates: list[CandidateSource] = Field(default_factory=list)
     mir: Optional[MirAnalysis] = None
-    provider: Optional[str] = None  # anthropic | openai | gemini | agent | mock
+    provider: Optional[str] = None  # anthropic | anthropic-agent | openai | gemini | agent | mock
     model: Optional[str] = None
     audioPath: Optional[str] = None
     attachAudio: Optional[bool] = None

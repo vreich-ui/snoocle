@@ -44,7 +44,8 @@ class Settings(BaseSettings):
     firestore_collection: str = "songs"
 
     # --- LLM reconciliation ---
-    # Provider is a runtime choice: anthropic | openai | gemini | mock.
+    # Provider is a runtime choice: anthropic | anthropic-agent | openai |
+    # gemini | agent | mock.
     llm_provider: str = "anthropic"
     llm_model: str = ""  # empty -> provider default
     llm_max_tokens: int = 16000
@@ -57,6 +58,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
     gemini_api_key: str = ""
+
+    # --- in-process Anthropic agent (provider "anthropic-agent") ---
+    # Agentic reconciliation inside this server: Claude + server-side web search
+    # + local tools (chord-sheet fetch/parse, windowed MIR). Uses the same
+    # SNOOCLE_ANTHROPIC_API_KEY as the plain "anthropic" provider.
+    anthropic_agent_model: str = "claude-opus-4-8"
+    anthropic_agent_max_turns: int = 20  # hard cap on agent loop iterations
 
     # --- agent-delegated reconciliation (provider "agent") ---
     # Snoocle holds no LLM keys in this mode: reconciliation is delegated to an
@@ -162,6 +170,7 @@ class Settings(BaseSettings):
         """The credential/endpoint whose presence makes a provider usable."""
         return {
             "anthropic": self.anthropic_api_key,
+            "anthropic-agent": self.anthropic_api_key,
             "openai": self.openai_api_key,
             "gemini": self.gemini_api_key,
             "agent": self.agent_mcp_url,

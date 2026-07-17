@@ -181,6 +181,7 @@ def reconcile(
             "candidates": candidates,
             "mir": mir,
             "song_schema": song_json_schema(),
+            "audio_path": audio_path,
         }
 
     audio: AudioAttachment | None = None

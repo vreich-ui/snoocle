@@ -146,6 +146,13 @@ def _analyze_windows(
     )
 
 
+def analyze_window(audio_path: str | Path, start: float, end: float) -> MirAnalysis:
+    """Windowed analysis with timestamps in the ORIGINAL track's coordinates."""
+    duration = probe(audio_path).duration_seconds
+    with tempfile.TemporaryDirectory(prefix="snoocle-mir-") as td:
+        return _analyze_windows(Path(audio_path), duration, [(max(start, 0.0), min(end, duration))], td)
+
+
 def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnalysis:
     """Run the MIR stack over an audio file (any ffmpeg-readable format).
 

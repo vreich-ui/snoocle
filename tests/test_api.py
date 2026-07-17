@@ -47,7 +47,7 @@ def test_healthz():
     # contract shape (it is present in the deployed image).
     assert isinstance(body["ffmpeg"], bool)
     assert set(body["mirEngines"]) == {"beats", "chords", "structure"}
-    assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "agent", "mock"}
+    assert set(body["llmProviders"]) == {"anthropic", "anthropic-agent", "openai", "gemini", "agent", "mock"}
     assert body["mcpEndpoint"] == "/mcp"
     assert "version" in body
     # YouTube acquisition health: yt-dlp version + JS challenge-solver bits

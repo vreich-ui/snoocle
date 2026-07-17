@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     agent_mcp_tool: str = "reconcile_song"
     agent_mcp_auth_token: str = ""  # sent as Authorization: Bearer <token>
     agent_mcp_timeout_seconds: float = 600.0  # agent runs can be slow
+    # CMS-Agent-style workspaces expose a node graph instead of one bespoke
+    # tool. Set a comma-separated ordered list of node ids to drive that graph
+    # via the workspace's generic `node_execute` tool — each node's output is
+    # fed forward as dependencyOutputs and the LAST node's output must be the
+    # Song JSON. Empty (default) -> call SNOOCLE_AGENT_MCP_TOOL once.
+    # e.g. "snoocle_source_search,snoocle_source_compare,snoocle_reconciler"
+    agent_mcp_nodes: str = ""
 
     anthropic_base_url: str = "https://api.anthropic.com"
     openai_base_url: str = "https://api.openai.com"

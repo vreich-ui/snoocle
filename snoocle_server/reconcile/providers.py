@@ -15,6 +15,7 @@ receives audio.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -316,8 +317,12 @@ class AgentMcpProvider(LLMProvider):
             args["previousOutput"] = turns[-2]["text"]
             args["validationErrors"] = turns[-1]["text"]
 
+        nodes = [n.strip() for n in settings.agent_mcp_nodes.split(",") if n.strip()]
         try:
-            text = asyncio.run(self._call_tool(args))
+            if nodes:
+                text = asyncio.run(self._run_node_chain(nodes, args))
+            else:
+                text = asyncio.run(self._call_tool(args))
         except ProviderError:
             raise
         except Exception as e:  # noqa: BLE001 — SDK raises ExceptionGroups/transport errors
@@ -325,7 +330,7 @@ class AgentMcpProvider(LLMProvider):
         return LLMResponse(
             text=text,
             provider=self.name,
-            model=f"mcp:{settings.agent_mcp_tool}",
+            model=f"mcp:{'+'.join(nodes) if nodes else settings.agent_mcp_tool}",
         )
 
     async def _call_tool(self, args: dict) -> str:
@@ -357,6 +362,81 @@ class AgentMcpProvider(LLMProvider):
                 f"agent: tool {settings.agent_mcp_tool!r} returned no text content"
             )
         return "\n".join(texts)
+
+    # --- CMS-Agent node-chain mode (SNOOCLE_AGENT_MCP_NODES) -----------------
+
+    _chain_outputs: dict | None = None  # completed upstream node outputs, kept across repair rounds
+
+    async def _run_node_chain(self, nodes: list[str], args: dict) -> str:
+        """Drive a CMS-Agent-style node graph over MCP.
+
+        Calls the workspace's generic ``node_execute`` tool for each node in
+        order, feeding every completed node's output forward as
+        ``dependencyOutputs``; the LAST node's output must be the Song JSON.
+        On repair rounds only the last node re-runs (validation errors are a
+        final-assembly concern; the gathered evidence upstream is unchanged).
+        """
+        from datetime import timedelta
+
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        repair = "validationErrors" in args
+        outputs: dict = dict(self._chain_outputs or {}) if repair else {}
+        final = nodes[-1]
+        to_run = nodes[-1:] if repair and all(n in outputs for n in nodes[:-1]) else nodes
+
+        headers = {}
+        if settings.agent_mcp_auth_token:
+            headers["Authorization"] = f"Bearer {settings.agent_mcp_auth_token}"
+        timeout = timedelta(seconds=settings.agent_mcp_timeout_seconds)
+        async with streamablehttp_client(
+            settings.agent_mcp_url, headers=headers or None, timeout=timeout, sse_read_timeout=timeout
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                for node_id in to_run:
+                    node_input: dict = {"request": args["request"]}
+                    if node_id == final:
+                        for key in ("previousOutput", "validationErrors"):
+                            if key in args:
+                                node_input[key] = args[key]
+                    call_args: dict = {
+                        "nodeId": node_id,
+                        "executionMode": "openai",
+                        "input": node_input,
+                    }
+                    if outputs:
+                        call_args["dependencyOutputs"] = dict(outputs)
+                    result = await session.call_tool(
+                        "node_execute", call_args, read_timeout_seconds=timeout
+                    )
+                    outputs[node_id] = self._extract_node_output(node_id, result)
+
+        self._chain_outputs = {k: v for k, v in outputs.items() if k != final}
+        return json.dumps(outputs[final])
+
+    @staticmethod
+    def _extract_node_output(node_id: str, result) -> dict:
+        """Pull the node's output object out of a node_execute tool result."""
+        texts = [b.text for b in result.content if getattr(b, "type", "") == "text"]
+        joined = "\n".join(texts)
+        if result.isError:
+            raise ProviderError(f"agent: node {node_id!r} errored: {joined[:500] or '(no message)'}")
+        try:
+            payload = json.loads(joined)
+        except json.JSONDecodeError as e:
+            raise ProviderError(f"agent: node {node_id!r} returned non-JSON content") from e
+        execution = ((payload.get("data") or {}).get("execution")) or {}
+        entries = [n for n in execution.get("nodes") or [] if n.get("nodeId") == node_id]
+        entry = entries[0] if entries else {}
+        output = entry.get("output")
+        if entry.get("status") != "completed" or output is None:
+            errors = entry.get("errors") or execution.get("errors") or []
+            raise ProviderError(
+                f"agent: node {node_id!r} did not complete: " + ("; ".join(map(str, errors)) or "(no errors reported)")
+            )
+        return output
 
 
 _PROVIDERS: dict[str, type[LLMProvider]] = {

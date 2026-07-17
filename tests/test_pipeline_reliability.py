@@ -107,6 +107,50 @@ def test_fatal_502_detail_includes_step_outcomes(monkeypatch):
     assert "discover=" in detail and "mir=skipped" in detail
 
 
+def test_youtube_auth_failure_gets_error_code_and_reason(monkeypatch):
+    """When the run dies because the YouTube session is dead (bot-check /
+    expired cookies), the 502 body carries a machine-readable errorCode and an
+    action-oriented reason so the app can show a Reconnect YouTube action
+    instead of a wall of diagnostics."""
+    from snoocle_server.audio.acquire import YouTubeAuthError
+    from snoocle_server.discovery.search import SearchError
+
+    def fail_acquire(*a, **k):  # noqa: ANN001
+        raise YouTubeAuthError(
+            "yt-dlp failed for TJAfLE39ZZ8: Sign in to confirm you're not a bot."
+        )
+
+    def fail_discover(*a, **k):  # noqa: ANN001
+        raise SearchError("all search backends failed: duckduckgo: 0 results")
+
+    monkeypatch.setattr(pipeline_mod, "acquire", fail_acquire)
+    monkeypatch.setattr(pipeline_mod, "discover_sources", fail_discover)
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "Back To Black", "artist": "Amy Winehouse", "provider": "anthropic"},
+    )
+    assert r.status_code == 502
+    body = r.json()
+    assert body["errorCode"] == "youtube_auth_required"
+    assert "Reconnect YouTube" in body["reason"]
+    # the diagnostic detail is unchanged for humans/logs
+    assert body["detail"].startswith("reconcile: ")
+    assert "[steps:" in body["detail"]
+
+
+def test_non_auth_failures_have_no_error_code(monkeypatch):
+    def fail(*a, **k):  # noqa: ANN001
+        raise ReconcileError("provider exploded")
+
+    monkeypatch.setattr(pipeline_mod, "reconcile", fail)
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True},
+    )
+    assert r.status_code == 502
+    assert "errorCode" not in r.json()
+
+
 def test_reconcile_timeout_returns_502(monkeypatch):
     monkeypatch.setattr(settings, "reconcile_timeout_seconds", 0.2)
 

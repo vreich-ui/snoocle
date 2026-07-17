@@ -28,6 +28,37 @@ class AcquisitionError(RuntimeError):
     pass
 
 
+class YouTubeAuthError(AcquisitionError):
+    """YouTube refused the request for AUTH reasons — the datacenter bot-check,
+    expired/invalid session cookies, or an age-restricted video. Retrying won't
+    help; the fix is reconnecting the YouTube session (the in-app cookie
+    upload). Surfaced to clients as errorCode "youtube_auth_required"."""
+
+
+# yt-dlp error fragments that mean the YouTube SESSION is the problem, not the
+# video or the network. Matched case-insensitively against the wrapped error.
+_AUTH_ERROR_MARKERS = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm your age",
+    "confirm you're not a robot",
+    "use --cookies",
+    "cookies are no longer valid",
+    "please sign in",
+    "login required",
+    "not a bot",
+)
+
+
+def _acquisition_error(message: str, cause: Exception) -> AcquisitionError:
+    """Wrap a yt-dlp failure, classifying YouTube auth problems so callers can
+    tell "reconnect YouTube" apart from every other failure."""
+    text = f"{message}: {cause}"
+    low = str(cause).lower()
+    if any(marker in low for marker in _AUTH_ERROR_MARKERS):
+        return YouTubeAuthError(text)
+    return AcquisitionError(text)
+
+
 _materialized: dict[str, str] = {}  # content hash -> temp cookies.txt path
 
 
@@ -151,6 +182,18 @@ def parse_quoted_track(text: str) -> tuple[str, str] | None:
     return None
 
 
+def parse_dash_title(text: str) -> tuple[str, str] | None:
+    """(artist, track) from an 'Artist - Track' video title (hyphen / en-dash /
+    em-dash separators, decoration stripped), or None when it doesn't apply."""
+    cleaned = _strip_title_noise(text)
+    parts = re.split(r"\s+[-\u2013\u2014]\s+", cleaned, maxsplit=1)
+    if len(parts) == 2:
+        left, right = (p.strip().strip(_QUOTE_CHARS).strip() for p in parts)
+        if left and right:
+            return left, right
+    return None
+
+
 def derive_title_artist(info: dict) -> tuple[str, str]:
     """Best-effort (title, artist) from a yt-dlp info dict.
 
@@ -196,7 +239,7 @@ def extract_metadata(url_or_id: str) -> ResolvedMeta:
         with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     except Exception as e:  # yt_dlp raises many exception types
-        raise AcquisitionError(f"metadata fetch failed for {vid}: {e}") from e
+        raise _acquisition_error(f"metadata fetch failed for {vid}", e) from e
     title, artist = derive_title_artist(info or {})
     return ResolvedMeta(
         video_id=vid,
@@ -236,7 +279,7 @@ def search_video(title: str, artist: str, max_results: int = 5) -> list[dict]:
         with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
     except Exception as e:  # yt_dlp raises many exception types
-        raise AcquisitionError(f"YouTube search failed for {query!r}: {e}") from e
+        raise _acquisition_error(f"YouTube search failed for {query!r}", e) from e
     entries = [e for e in (info.get("entries") or []) if e]
     if not entries:
         raise AcquisitionError(f"no YouTube results for {query!r}")
@@ -297,7 +340,7 @@ def download_audio(video_id: str) -> AcquiredAudio:
         with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
     except Exception as e:  # yt_dlp raises many exception types
-        raise AcquisitionError(f"yt-dlp failed for {video_id}: {e}") from e
+        raise _acquisition_error(f"yt-dlp failed for {video_id}", e) from e
 
     path = _cache_hit(video_id)
     if path is None:

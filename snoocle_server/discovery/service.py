@@ -21,8 +21,8 @@ from typing import Callable
 from .chordsheet import parse_chord_sheet
 from .fetch import extract_sheet_text, fetch_page
 from .models import CandidateSource, SectionStart
-from .search import SearchHit, web_search
-from ..audio.acquire import parse_quoted_track
+from .search import SearchError, SearchHit, web_search
+from ..audio.acquire import parse_dash_title, parse_quoted_track
 from ..config import settings
 
 log = logging.getLogger(__name__)
@@ -93,24 +93,47 @@ def discover_sources(
     search_fn = search_fn or (lambda q, n: web_search(q, n))
     fetch_fn = fetch_fn or fetch_page
 
-    candidates = _search_and_parse(title, artist, max_candidates, search_fn, fetch_fn)
+    # Video-derived identities ('Amy Winehouse - Back To Black' with the channel
+    # name as the artist, or 'Artist "Track" at some show') rarely match any
+    # chord sheet literally. When the literal identity finds nothing — INCLUDING
+    # when its over-specific query makes every search backend return zero hits —
+    # retry with the cleaner identity embedded in the title itself.
+    primary_error: SearchError | None = None
+    try:
+        candidates = _search_and_parse(title, artist, max_candidates, search_fn, fetch_fn)
+    except SearchError as e:
+        primary_error = e
+        candidates = []
 
-    # Video-derived identities ('Artist "Track" at some show' with the uploader
-    # as the artist) rarely match any chord sheet literally. When the literal
-    # identity finds nothing and the title itself carries a quoted song name,
-    # retry with that extracted identity.
     if not candidates:
-        extracted = parse_quoted_track(title)
+        extracted = _embedded_identity(title, artist)
         if extracted:
             ex_artist, ex_track = extracted
             log.info(
                 "discovery: 0 candidates for %s — %s; retrying as %s — %s",
                 artist, title, ex_artist, ex_track,
             )
-            candidates = _search_and_parse(ex_track, ex_artist, max_candidates, search_fn, fetch_fn)
+            try:
+                candidates = _search_and_parse(
+                    ex_track, ex_artist, max_candidates, search_fn, fetch_fn
+                )
+            except SearchError:
+                pass  # fall through to the primary outcome below
+        if not candidates and primary_error is not None:
+            raise primary_error
 
     candidates.sort(key=lambda c: c.confidence, reverse=True)
     return candidates
+
+
+def _embedded_identity(title: str, artist: str) -> tuple[str, str] | None:
+    """(artist, track) recovered from the title itself: a quoted song name
+    ('Artist "Track" at ...') or an 'Artist - Track' separator. None when the
+    title carries no cleaner identity than the literal request."""
+    extracted = parse_quoted_track(title) or parse_dash_title(title)
+    if extracted and (extracted[0], extracted[1]) != (artist, title):
+        return extracted
+    return None
 
 
 def _search_and_parse(

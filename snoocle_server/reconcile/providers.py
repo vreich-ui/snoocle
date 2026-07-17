@@ -487,6 +487,34 @@ def get_provider(name: str | None = None) -> LLMProvider:
     return cls()
 
 
+# The env var whose absence makes a provider unable to serve ANY request.
+_PROVIDER_ENV = {
+    "anthropic": "SNOOCLE_ANTHROPIC_API_KEY",
+    "anthropic-agent": "SNOOCLE_ANTHROPIC_API_KEY",
+    "openai": "SNOOCLE_OPENAI_API_KEY",
+    "gemini": "SNOOCLE_GEMINI_API_KEY",
+    "agent": "SNOOCLE_AGENT_MCP_URL",
+}
+
+
+def provider_preflight(name: str | None = None) -> str | None:
+    """Why this provider can't serve any request right now, or None if it can.
+
+    Config-only check (no network) so the pipeline can reject a doomed run
+    instantly instead of after minutes of discover/acquire/MIR.
+    """
+    name = (name or settings.llm_provider).lower()
+    if name not in _PROVIDERS:
+        return f"unknown LLM provider {name!r} (have: {sorted(_PROVIDERS)})"
+    if name != "mock" and not settings.provider_key(name):
+        return (
+            f"provider {name!r} is not configured: set {_PROVIDER_ENV[name]} "
+            "on the server, or choose a different provider (SNOOCLE_LLM_PROVIDER "
+            "or the request's \"provider\" field)"
+        )
+    return None
+
+
 def provider_capabilities() -> dict[str, dict]:
     out = {}
     for name, cls in _PROVIDERS.items():

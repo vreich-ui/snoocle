@@ -33,7 +33,12 @@ from .mcp_server import mcp as _mcp
 from .mcp_server import resolve_http_transport as _resolve_mcp_security
 from .mir import MirAnalysis, analyze_audio
 from .pipeline import PipelineStepError, get_store, run_pipeline_async
-from .reconcile import ReconcileResult, provider_capabilities, reconcile
+from .reconcile import (
+    ReconcileResult,
+    provider_capabilities,
+    provider_preflight,
+    reconcile,
+)
 from .reconcile.engine import ReconcileError
 from .reconcile.providers import ProviderError
 from .schema import Song, song_json_schema
@@ -192,6 +197,16 @@ def healthz() -> dict:
             "structure": "songformer" if settings.songformer_dir else "librosa-agglomerative-fallback",
         },
         "llmProviders": provider_capabilities(),
+        # The provider a bare /v1/songs/analyze (no explicit "provider") will
+        # use, and whether it can actually serve a request. `ready=false` means
+        # every analyze call is doomed at the reconcile step — the usual cause
+        # of a "download + MIR then instant 502" loop (fix the server config,
+        # not the client).
+        "activeProvider": {
+            "name": settings.llm_provider.lower(),
+            "ready": provider_preflight(settings.llm_provider) is None,
+            "problem": provider_preflight(settings.llm_provider),
+        },
         "store": backend_label(),  # "firestore" | "memory"
         "mcpEndpoint": _mcp.settings.streamable_http_path,  # embedded MCP transport
     }
@@ -236,6 +251,10 @@ _ERROR_REASONS = {
     "youtube_auth_required": (
         "YouTube connection expired or was blocked. Reconnect YouTube "
         "(sign in again in the app) and retry."
+    ),
+    "provider_not_configured": (
+        "The server's reconciliation provider is misconfigured — retrying "
+        "cannot succeed until the server settings are fixed (see detail)."
     ),
 }
 

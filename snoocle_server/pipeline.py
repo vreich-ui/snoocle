@@ -93,8 +93,8 @@ def _step_acquire(
     return acquire(title=title, artist=artist, video_url_or_id=youtube_url_or_id)
 
 
-def _step_mir(audio_path: str) -> MirAnalysis:
-    return analyze_audio(audio_path)
+def _step_mir(audio_path: str, accuracy: str) -> MirAnalysis:
+    return analyze_audio(audio_path, accuracy=accuracy)
 
 
 def _step_reconcile(
@@ -182,8 +182,10 @@ async def run_pipeline_async(
     max_candidates: int | None = None,
     expected_version: str | None = None,
     store: SongRepository | None = None,
+    accuracy: str | None = None,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
+    accuracy = accuracy or "standard"
     steps: dict[str, str] = {}
 
     # 0. resolve identity: title+artist may be omitted when a media URL is
@@ -247,7 +249,7 @@ async def run_pipeline_async(
             audio_path = report.audio.path
             try:
                 report.mir = await _timed_step(
-                    "mir", lambda: _step_mir(audio_path), settings.mir_timeout_seconds
+                    "mir", lambda: _step_mir(audio_path, accuracy), settings.mir_timeout_seconds
                 )
                 report.steps["mir"] = "ok: engines=" + str(report.mir.engines)
             except Exception as e:  # noqa: BLE001 — best-effort (incl. timeout)
@@ -320,6 +322,7 @@ def run_pipeline(
     max_candidates: int | None = None,
     expected_version: str | None = None,
     store: SongRepository | None = None,
+    accuracy: str | None = None,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -336,5 +339,6 @@ def run_pipeline(
             max_candidates=max_candidates,
             expected_version=expected_version,
             store=store,
+            accuracy=accuracy,
         )
     )

@@ -13,7 +13,7 @@ import secrets
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -238,6 +238,9 @@ class AnalyzeRequest(BaseModel):
     title: Optional[str] = None
     artist: Optional[str] = None
     youtubeUrlOrId: Optional[str] = None
+    # fast: sample a few windows across the musical span (quick + cheap);
+    # standard: honor SNOOCLE_MIR_MAX_ANALYSIS_SECONDS; thorough: full track.
+    accuracy: Literal["fast", "standard", "thorough"] = "standard"
 
 
 @app.post("/v1/audio/analyze")
@@ -259,7 +262,7 @@ async def post_analyze(req: AnalyzeRequest) -> dict:
     # doesn't block the event loop shared with the embedded MCP transport
     # (same treatment as /v1/audio/analyze/upload).
     try:
-        analysis = await run_in_threadpool(analyze_audio, path)
+        analysis = await run_in_threadpool(analyze_audio, path, req.accuracy)
     except audio_utils.AudioToolError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     return {"audioPath": path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
@@ -356,6 +359,9 @@ class PipelineRequest(BaseModel):
     skipAudio: bool = False
     maxCandidates: Optional[int] = Field(default=None, ge=1, le=20)
     expectedVersion: Optional[str] = None  # optimistic lock for re-analyses
+    # MIR effort/speed trade-off, surfaced to the app UI as an accuracy picker:
+    # fast (sampled windows) | standard (default) | thorough (always full track)
+    accuracy: Optional[Literal["fast", "standard", "thorough"]] = None
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
@@ -377,6 +383,7 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             skip_audio=req.skipAudio,
             max_candidates=req.maxCandidates,
             expected_version=req.expectedVersion,
+            accuracy=req.accuracy,
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e

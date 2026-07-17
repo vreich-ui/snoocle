@@ -30,6 +30,10 @@ def isolated_store(monkeypatch):
     store = InMemorySongRepository()
     monkeypatch.setattr(api_mod, "get_store", lambda: store)
     monkeypatch.setattr("snoocle_server.pipeline.get_store", lambda: store)
+    # The 'anthropic' provider tests below reach reconcile on purpose; give the
+    # provider preflight a credential so it doesn't short-circuit them. Tests
+    # that assert the misconfigured-provider path set their own empty value.
+    monkeypatch.setattr(settings, "anthropic_api_key", "test-key")
     return store
 
 
@@ -149,6 +153,46 @@ def test_non_auth_failures_have_no_error_code(monkeypatch):
     )
     assert r.status_code == 502
     assert "errorCode" not in r.json()
+
+
+def test_misconfigured_provider_fails_before_expensive_steps(monkeypatch):
+    """A provider that can't serve ANY request (missing credential/endpoint)
+    must be rejected instantly — discover/acquire/mir never run, so a client
+    that retries the 502 doesn't loop over minutes of doomed work each time."""
+    def boom(*a, **k):  # noqa: ANN001
+        raise AssertionError("expensive step ran despite misconfigured provider")
+
+    monkeypatch.setattr(pipeline_mod, "discover_sources", boom)
+    monkeypatch.setattr(pipeline_mod, "acquire", boom)
+    monkeypatch.setattr(pipeline_mod, "analyze_audio", boom)
+    monkeypatch.setattr(settings, "agent_mcp_url", "")  # 'agent' provider unusable
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "X", "artist": "Anon", "provider": "agent"},
+    )
+    assert r.status_code == 502
+    body = r.json()
+    assert body["errorCode"] == "provider_not_configured"
+    assert "not configured" in body["detail"]
+    assert "SNOOCLE_AGENT_MCP_URL" in body["detail"]
+    assert "reason" in body
+
+
+def test_unknown_provider_fails_before_expensive_steps(monkeypatch):
+    def boom(*a, **k):  # noqa: ANN001
+        raise AssertionError("expensive step ran despite unknown provider")
+
+    monkeypatch.setattr(pipeline_mod, "discover_sources", boom)
+    monkeypatch.setattr(pipeline_mod, "acquire", boom)
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "X", "artist": "Anon", "provider": "does-not-exist"},
+    )
+    assert r.status_code == 502
+    assert r.json()["errorCode"] == "provider_not_configured"
+    assert "unknown LLM provider" in r.json()["detail"]
 
 
 def test_reconcile_timeout_returns_502(monkeypatch):

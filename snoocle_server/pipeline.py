@@ -35,7 +35,7 @@ from .audio.acquire import AcquiredAudio, YouTubeAuthError, acquire, extract_met
 from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .mir import MirAnalysis, analyze_audio
-from .reconcile import ReconcileResult, reconcile
+from .reconcile import ReconcileResult, provider_preflight, reconcile
 from .schema.song import slugify_song_id
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 
@@ -197,6 +197,15 @@ async def run_pipeline_async(
     resolved_provider = (provider or settings.llm_provider).lower()
     accuracy = accuracy or "standard"
     steps: dict[str, str] = {}
+
+    # Provider preflight (FATAL, instant). A provider that can't serve ANY
+    # request — unknown name or missing credential/endpoint — must fail here,
+    # not minutes later at reconcile after discover/acquire/MIR have all been
+    # paid for (clients retry 502s, so late failure multiplies into a loop of
+    # full-price doomed runs).
+    problem = provider_preflight(resolved_provider)
+    if problem:
+        raise PipelineStepError("reconcile", problem, error_code="provider_not_configured")
 
     # 0. resolve identity: title+artist may be omitted when a media URL is
     # given — derive them from the media's own metadata (no download). FATAL:

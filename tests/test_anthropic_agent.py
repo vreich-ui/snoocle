@@ -64,6 +64,7 @@ class _FakeClient:
 
     def create(self, **kwargs):
         self._captured.setdefault("calls", []).append(list(kwargs.get("messages") or []))
+        self._captured["last_kwargs"] = kwargs
         if not self._queue:
             raise AssertionError("fake Anthropic client ran out of scripted responses")
         return self._queue.pop(0)
@@ -154,6 +155,15 @@ def test_happy_path_tool_call_then_valid_song(monkeypatch):
     assert fetched["url"] == "https://ex/let-it-be"
     # and its tool_result went back in a user message
     assert _tool_result_user_messages(captured["provider"]._messages)
+
+    # request shape: consolidated effort + per-turn prefix caching — the two
+    # wall-clock levers for the loop (see config.anthropic_agent_effort)
+    kwargs = captured["last_kwargs"]
+    assert kwargs["output_config"] == {"effort": settings.anthropic_agent_effort}
+    assert kwargs["cache_control"] == {"type": "ephemeral"}
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    for banned in ("temperature", "top_p", "top_k"):
+        assert banned not in kwargs
 
 
 # --- scenario 2: repair round continues the same conversation ---------------

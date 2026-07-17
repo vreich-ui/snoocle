@@ -64,7 +64,13 @@ class Settings(BaseSettings):
     # + local tools (chord-sheet fetch/parse, windowed MIR). Uses the same
     # SNOOCLE_ANTHROPIC_API_KEY as the plain "anthropic" provider.
     anthropic_agent_model: str = "claude-opus-4-8"
-    anthropic_agent_max_turns: int = 20  # hard cap on agent loop iterations
+    anthropic_agent_max_turns: int = 12  # hard cap on agent loop iterations
+    # Reasoning effort for the agent loop. "medium" keeps tool use consolidated
+    # and turns fast — reconciliation is structured evidence-fusion, not
+    # open-ended research; raise to "high" only if quality visibly suffers.
+    # (Wall-clock is dominated by effort x turns; SNOOCLE_LLM_MODEL=
+    # claude-sonnet-5 is the other big speed lever.)
+    anthropic_agent_effort: str = "medium"
 
     # --- agent-delegated reconciliation (provider "agent") ---
     # Snoocle holds no LLM keys in this mode: reconciliation is delegated to an

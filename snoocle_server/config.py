@@ -102,8 +102,23 @@ class Settings(BaseSettings):
     # Route ONLY yt-dlp traffic through a proxy so YouTube sees a residential
     # IP instead of Cloud Run's datacenter IP — e.g. a Tailscale exit node at
     # home (socks5://localhost:1055) or a commercial residential proxy
-    # (http://user:pass@proxy.example:8080). Empty = direct.
+    # (http://user:pass@proxy.example:8080). Empty = direct. NOTE: YouTube
+    # binds stream URLs to the requesting IP, so the media bytes must flow
+    # through the proxy too — its bandwidth is then the download ceiling.
     ytdlp_proxy: str = ""
+    # --- download speed ---
+    # Audio-only preference with a sane bitrate cap; "best" only as the last
+    # resort when no audio-only format exists (that may include video and
+    # download far more bytes). MIR analyzes at 22.05 kHz mono, so >160 kbps
+    # sources buy nothing.
+    ytdlp_format: str = "bestaudio[abr<=160]/bestaudio/best"
+    # Parallel fragment downloads for HLS/DASH formats — the main lever
+    # against YouTube's per-connection throttling on segmented streams.
+    ytdlp_concurrent_fragments: int = 4
+    # Persist yt-dlp's player/challenge-solver cache (e.g. /data/ytdlp-cache)
+    # so repeat acquisitions on the same instance skip re-solving JS
+    # challenges. Empty = yt-dlp's default (~/.cache).
+    ytdlp_cache_dir: str = ""
 
     # --- audio / MIR ---
     ffmpeg_bin: str = "ffmpeg"

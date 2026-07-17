@@ -80,6 +80,8 @@ def _ytdlp_opts(base: dict) -> dict:
         opts["cookiefile"] = cookiefile
     if settings.ytdlp_proxy:
         opts["proxy"] = settings.ytdlp_proxy
+    if settings.ytdlp_cache_dir:
+        opts["cachedir"] = settings.ytdlp_cache_dir
     clients = [c.strip() for c in settings.ytdlp_player_clients.split(",") if c.strip()]
     if clients:
         extractor_args = dict(opts.get("extractor_args") or {})
@@ -283,10 +285,14 @@ def download_audio(video_id: str) -> AcquiredAudio:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "format": "bestaudio/best",
+        "format": settings.ytdlp_format,
+        "concurrent_fragment_downloads": max(settings.ytdlp_concurrent_fragments, 1),
         "outtmpl": str(cache / "%(title).80s [%(id)s].%(ext)s"),
         "noplaylist": True,
     }
+    import time
+
+    start = time.monotonic()
     try:
         with yt_dlp.YoutubeDL(_ytdlp_opts(opts)) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
@@ -296,6 +302,10 @@ def download_audio(video_id: str) -> AcquiredAudio:
     path = _cache_hit(video_id)
     if path is None:
         raise AcquisitionError(f"yt-dlp reported success but no file found for {video_id}")
+    log.info(
+        "yt-dlp downloaded %s in %.1fs (%.1f MB)",
+        video_id, time.monotonic() - start, path.stat().st_size / 1e6,
+    )
     return AcquiredAudio(
         video_id=video_id,
         video_title=info.get("title") or path.stem,

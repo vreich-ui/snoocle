@@ -21,6 +21,7 @@ def _reset(monkeypatch):
     monkeypatch.setattr(settings, "ytdlp_cookies_file", "")
     monkeypatch.setattr(settings, "ytdlp_player_clients", "")
     monkeypatch.setattr(settings, "ytdlp_proxy", "")
+    monkeypatch.setattr(settings, "ytdlp_cache_dir", "")
     # isolate from runtime-uploaded cookies (tested separately)
     monkeypatch.setattr(acquire, "_stored_cookies_txt", lambda: None)
     monkeypatch.setattr(acquire, "_materialized", {})
@@ -64,3 +65,41 @@ def test_proxy(monkeypatch):
     assert _ytdlp_opts({"quiet": True})["proxy"] == "socks5://localhost:1055"
     monkeypatch.setattr(settings, "ytdlp_proxy", "")
     assert "proxy" not in _ytdlp_opts({"quiet": True})
+
+
+def test_cache_dir(monkeypatch):
+    monkeypatch.setattr(settings, "ytdlp_cache_dir", "/data/ytdlp-cache")
+    assert _ytdlp_opts({"quiet": True})["cachedir"] == "/data/ytdlp-cache"
+    monkeypatch.setattr(settings, "ytdlp_cache_dir", "")
+    assert "cachedir" not in _ytdlp_opts({"quiet": True})
+
+
+def test_download_opts_prefer_small_audio_and_parallel_fragments(tmp_path, monkeypatch):
+    """The download call must never pull video when audio-only exists, and
+    must download HLS/DASH fragments in parallel (throttling mitigation)."""
+    import yt_dlp
+
+    from snoocle_server.audio.acquire import AcquisitionError, download_audio
+
+    captured: dict = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            captured.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, *a, **k):
+            raise RuntimeError("stop before any network")
+
+    monkeypatch.setattr(settings, "audio_cache_dir", tmp_path)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    with pytest.raises(AcquisitionError):
+        download_audio("AAAAAAAAAAA")
+
+    assert captured["format"].startswith("bestaudio[abr<=160]/bestaudio")
+    assert captured["concurrent_fragment_downloads"] >= 2

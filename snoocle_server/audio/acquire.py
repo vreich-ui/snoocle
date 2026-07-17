@@ -140,6 +140,15 @@ _QUOTED_TRACK_RE = re.compile(
 )
 
 
+def parse_quoted_track(text: str) -> tuple[str, str] | None:
+    """(artist, track) from a video title like 'Artist "Track" at X's show',
+    or None when the pattern doesn't apply."""
+    m = _QUOTED_TRACK_RE.match(_strip_title_noise(text))
+    if m:
+        return m.group("artist").strip(), m.group("track").strip()
+    return None
+
+
 def derive_title_artist(info: dict) -> tuple[str, str]:
     """Best-effort (title, artist) from a yt-dlp info dict.
 
@@ -163,10 +172,10 @@ def derive_title_artist(info: dict) -> tuple[str, str]:
             artist = artist or left
             track = track or right
         else:
-            m = _QUOTED_TRACK_RE.match(cleaned)
-            if m:
-                artist = artist or m.group("artist").strip()
-                track = track or m.group("track").strip()
+            quoted = parse_quoted_track(cleaned)
+            if quoted:
+                artist = artist or quoted[0]
+                track = track or quoted[1]
 
     title = track or cleaned or vid_title or "Unknown"
     artist = artist or uploader or "Unknown"

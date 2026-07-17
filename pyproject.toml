@@ -13,7 +13,12 @@ dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "httpx>=0.27",
-    "yt-dlp>=2024.4.9",
+    # [default] pulls in yt-dlp-ejs (YouTube JS challenge-solver scripts) and
+    # the other upstream-recommended deps. Since 2025.11.12 YouTube needs those
+    # scripts PLUS an external JS runtime (deno, installed in the Dockerfile);
+    # without them most formats are withheld and downloads fail with
+    # "Requested format is not available".
+    "yt-dlp[default]>=2025.11.12",
     # 1.10.0 is the first release with the streamable-HTTP transport AND the
     # transport_security (DNS-rebinding) settings the HTTP MCP server uses.
     "mcp>=1.10.0",

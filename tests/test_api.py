@@ -50,6 +50,11 @@ def test_healthz():
     assert set(body["llmProviders"]) == {"anthropic", "openai", "gemini", "agent", "mock"}
     assert body["mcpEndpoint"] == "/mcp"
     assert "version" in body
+    # YouTube acquisition health: yt-dlp version + JS challenge-solver bits
+    # (deno runtime, yt-dlp-ejs scripts) — booleans here, present in the image.
+    assert set(body["ytdlp"]) == {"version", "jsRuntime", "challengeSolver"}
+    assert isinstance(body["ytdlp"]["jsRuntime"], bool)
+    assert isinstance(body["ytdlp"]["challengeSolver"], bool)
 
 
 def test_song_schema_endpoint():

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from ..config import settings
 from ..discovery.fetch import extract_sheet_text, fetch_page
@@ -49,14 +50,23 @@ Hard chord rule:
 shapes or tab fingerings, and NEVER bake a capo into the chord names. \
 displayPreferences.capo MUST be 0.
 
-Tools:
-- Search the web for `"<title>" "<artist>" chords` and for the lyrics.
-- Fetch the 2-4 most promising chord/tab pages with `fetch_chord_sheet` \
-(prefer it over web_fetch for chord sites — it parses and capo-normalizes).
-- If text sources disagree about a specific passage AND the provided MIR \
-timeline is thin there, call `analyze_audio_window` for that time range \
-(absolute seconds in the video). Do not call tools you do not need — the \
-provided candidates alone are often sufficient.
+Retrieval recipe (follow it; do not improvise a research plan):
+1. Read the provided candidates and MIR timeline FIRST. If two or more \
+candidates agree with each other and with the MIR timeline on the key and \
+the core progression, SKIP the web entirely and write the Song now.
+2. Otherwise run ONE web_search: `<title> <artist> chords lyrics`. From the \
+results pick the 2-3 most promising chord pages and call `fetch_chord_sheet` \
+on each (never web_fetch a chord page — fetch_chord_sheet parses and \
+capo-normalizes in one step).
+3. At most ONE more web_search, only if the lyrics are still incomplete.
+4. Call `analyze_audio_window` only when text sources disagree about a \
+specific passage AND the provided MIR timeline does not cover it.
+
+Hard budget: at most 2 web_search calls, 4 page fetches, and 2 \
+analyze_audio_window calls per song. Disagreements are settled by the MIR \
+timeline and music theory — NOT by more searching. When you have enough \
+information to act, act: produce the Song instead of continuing to verify. \
+Two agreeing sources plus the provided MIR is always enough.
 
 Output contract:
 - Your FINAL message must be EXACTLY ONE JSON object — the Song — that \
@@ -72,8 +82,8 @@ SYSTEM_BLOCKS = [
 ]
 
 TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 6},
-    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 6},
+    {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
+    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
     {
         "name": "fetch_chord_sheet",
         "description": "Fetch a URL and parse it as a chord sheet. Returns a structured candidate (lines with chord placements at sounding pitch, declared key/capo, confidence) or an error if the page has no usable transcription. Call this for chord/tab pages found via web_search; prefer it over web_fetch for chord sites because it parses and capo-normalizes.",
@@ -221,11 +231,18 @@ class AnthropicAgentProvider(LLMProvider):
         client = self._create_client()
         usage: dict = {}
         response = None
-        for _ in range(settings.anthropic_agent_max_turns):
+        for turn in range(1, settings.anthropic_agent_max_turns + 1):
+            turn_start = time.monotonic()
             response = client.messages.create(
                 model=resolved_model,
                 max_tokens=16000,
                 thinking={"type": "adaptive"},
+                # medium effort keeps tool use consolidated — the dominant
+                # wall-clock lever for this loop (see config).
+                output_config={"effort": settings.anthropic_agent_effort},
+                # auto-cache the latest prefix so each turn reuses the whole
+                # prior conversation (system block carries its own breakpoint).
+                cache_control={"type": "ephemeral"},
                 system=SYSTEM_BLOCKS,
                 tools=TOOLS,
                 # no temperature/top_p/top_k: sampling params are rejected here
@@ -235,6 +252,14 @@ class AnthropicAgentProvider(LLMProvider):
             if u is not None:
                 usage["input_tokens"] = usage.get("input_tokens", 0) + (getattr(u, "input_tokens", 0) or 0)
                 usage["output_tokens"] = usage.get("output_tokens", 0) + (getattr(u, "output_tokens", 0) or 0)
+            tool_names = [b.name for b in response.content if getattr(b, "type", "") == "tool_use"]
+            log.info(
+                "anthropic-agent turn=%d stop=%s tools=%s dur=%.1fs in=%s out=%s cached=%s",
+                turn, response.stop_reason, ",".join(tool_names) or "-",
+                time.monotonic() - turn_start,
+                getattr(u, "input_tokens", "?"), getattr(u, "output_tokens", "?"),
+                getattr(u, "cache_read_input_tokens", "?"),
+            )
             if response.stop_reason == "refusal":
                 raise ProviderError("anthropic-agent: model refused the request")
             if response.stop_reason == "pause_turn":

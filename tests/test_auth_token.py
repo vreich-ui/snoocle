@@ -40,6 +40,13 @@ def test_healthz_is_exempt(token_enabled):
     assert client.get("/healthz").status_code == 200
 
 
+def test_ui_shell_is_exempt_but_api_still_gated(token_enabled):
+    # the static GUI shell loads without a token (it holds no secrets)...
+    assert client.get("/ui/").status_code == 200
+    # ...while every API call still requires the token
+    assert client.get("/v1/songs").status_code == 401
+
+
 def test_mcp_endpoint_shares_the_same_token(token_enabled):
     # the /mcp transport is gated by the SAME middleware (one token for both
     # surfaces): no token -> 401 before the request ever reaches MCP. The

@@ -1,0 +1,152 @@
+/* Snoocle GUI — one small stylesheet, system font stack, dark-friendly via
+   prefers-color-scheme. No frameworks, no external fonts. */
+
+:root {
+  --bg: #ffffff;
+  --panel: #f6f7f9;
+  --border: #d8dce2;
+  --text: #1c2024;
+  --muted: #626b76;
+  --accent: #2f6feb;
+  --accent-text: #ffffff;
+  --danger: #c0392b;
+  --ok: #1e8a4c;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16191d;
+    --panel: #1e2227;
+    --border: #333a42;
+    --text: #e6e9ec;
+    --muted: #9aa4af;
+    --accent: #4f8cff;
+    --accent-text: #0b0e12;
+    --danger: #ff6b5e;
+    --ok: #4cd08a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+#app { display: flex; height: 100vh; }
+
+/* --- sidebar --- */
+#sidebar {
+  width: 260px;
+  min-width: 220px;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+}
+#sidebar header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+#sidebar header h1 { font-size: 17px; margin: 0 0 8px; }
+#song-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
+#song-list li {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 13px;
+  word-break: break-all;
+}
+#song-list li:hover { background: var(--bg); }
+#song-list li.active { background: var(--accent); color: var(--accent-text); }
+
+/* --- main --- */
+#main { flex: 1; overflow-y: auto; padding: 18px 24px; }
+#tabs { display: none; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+#tabs button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 14px;
+}
+#tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* --- forms & controls --- */
+label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+input, select, textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+}
+textarea { font-family: var(--mono); min-height: 260px; white-space: pre; }
+button.btn {
+  background: var(--accent);
+  color: var(--accent-text);
+  border: none;
+  padding: 9px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+button.btn.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+button.btn:disabled { opacity: 0.5; cursor: default; }
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+.muted { color: var(--muted); font-size: 13px; }
+.err { color: var(--danger); white-space: pre-wrap; }
+.ok { color: var(--ok); }
+
+table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+
+pre.sheet, pre.diff {
+  font-family: var(--mono);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+  white-space: pre;
+}
+pre.diff { font-size: 12px; }
+.section-head { font-weight: 600; margin: 14px 0 4px; color: var(--accent); }
+
+/* --- modal --- */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+  display: flex; align-items: center; justify-content: center; z-index: 10;
+}
+.modal {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 22px;
+  width: 460px;
+  max-width: 92vw;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+.modal h2 { margin: 0 0 8px; font-size: 18px; }
+.modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+.hidden { display: none !important; }
+.building { padding: 16px; border: 1px dashed var(--border); border-radius: 8px; margin-top: 14px; }
+iframe.yt { width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: 8px; margin-bottom: 14px; }

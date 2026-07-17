@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Snoocle</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <header>
+        <h1>Snoocle</h1>
+        <div class="row">
+          <button class="btn" id="add-song-btn">Add song</button>
+          <button class="btn secondary" id="refresh-btn" title="Refresh list">&#x21bb;</button>
+        </div>
+      </header>
+      <ul id="song-list"></ul>
+    </aside>
+
+    <main id="main">
+      <div id="empty" class="muted">Select a song from the list, or add a new one.</div>
+
+      <nav id="tabs">
+        <button data-tab="edit" class="active">Edit</button>
+        <button data-tab="versions">Versions</button>
+        <button data-tab="play">Play</button>
+      </nav>
+
+      <section id="tab-edit" class="tab-panel active"></section>
+      <section id="tab-versions" class="tab-panel"></section>
+      <section id="tab-play" class="tab-panel"></section>
+    </main>
+  </div>
+
+  <!-- app.js is a dependency-free vanilla module; no build step, no CDN. -->
+  <script src="app.js"></script>
+</body>
+</html>

@@ -17,7 +17,8 @@ from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -107,7 +108,17 @@ class _BearerTokenMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         token = settings.api_token
-        if not token or scope["type"] != "http" or scope.get("path") == "/healthz":
+        # Exempt: liveness probes, and the static GUI shell (`/` redirect and
+        # everything under `/ui`). The shell carries no secrets; every API call
+        # it makes to `/v1/...` still requires the token.
+        path = scope.get("path", "")
+        if (
+            not token
+            or scope["type"] != "http"
+            or path == "/healthz"
+            or path == "/"
+            or path.startswith("/ui")
+        ):
             await self.app(scope, receive, send)
             return
         auth = Headers(scope=scope).get("authorization", "")
@@ -592,6 +603,24 @@ async def post_probe(file: UploadFile = File(...)) -> dict:
         return dataclasses.asdict(audio_utils.probe(src))
     except audio_utils.AudioToolError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+# --- static single-page GUI --------------------------------------------------
+# Browse / add / edit / versions / play, served as dependency-free static files
+# by this same app. Mounted AFTER all API routes so it never shadows them, and
+# BEFORE the /mcp route copy below. `/` redirects into it; the shell and its
+# assets are exempt from the bearer-token middleware (every /v1 call it makes
+# still carries the token). This is the ONLY static surface — no build, no CDN.
+@app.get("/")
+def root_redirect() -> RedirectResponse:
+    return RedirectResponse("/ui/")
+
+
+app.mount(
+    "/ui",
+    StaticFiles(directory=str(Path(__file__).parent / "ui"), html=True),
+    name="ui",
+)
 
 
 # --- embedded MCP route ------------------------------------------------------

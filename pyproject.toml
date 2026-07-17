@@ -59,5 +59,10 @@ snoocle-mcp = "snoocle_server.mcp_server:main"
 [tool.setuptools.packages.find]
 include = ["snoocle_server*"]
 
+# Ship the static GUI files in the wheel — the Docker image runs the installed
+# package, not the source tree, so the ui/ assets must be package data.
+[tool.setuptools.package-data]
+snoocle_server = ["ui/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

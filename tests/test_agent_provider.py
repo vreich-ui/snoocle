@@ -192,6 +192,22 @@ def test_agent_node_chain_mode_runs_all_nodes_and_returns_song(tmp_path, monkeyp
     }
 
 
+def test_agent_node_chain_refuses_non_openai_execution(tmp_path, monkeypatch):
+    """If the workspace ignores executionMode="openai" and runs its mock
+    runner, the provider must refuse the stub output loudly — not let it fail
+    obscurely (or worse, pass) downstream."""
+    capture = tmp_path / "captured.jsonl"
+    monkeypatch.setenv("FAKE_AGENT_FORCE_MODE", "mock")
+    with _fake_agent(capture) as url:
+        monkeypatch.setattr(settings, "agent_mcp_url", url)
+        monkeypatch.setattr(settings, "agent_mcp_nodes", NODES)
+        with pytest.raises(ProviderError, match="'mock' mode instead of 'openai'"):
+            reconcile(
+                "Let It Be", "The Beatles", candidates=[], mir=_mir(),
+                provider_name="agent", youtube_video_id="QDYfEBY9NM4",
+            )
+
+
 def test_agent_node_chain_repair_round_reruns_only_final_node(tmp_path, monkeypatch):
     """When the final node's Song fails validation, the repair round re-runs
     ONLY the reconciler node (with previousOutput/validationErrors) — upstream

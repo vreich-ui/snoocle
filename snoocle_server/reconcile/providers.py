@@ -253,6 +253,17 @@ class MockProvider(LLMProvider):
         )
 
 
+def _find_provider_error(exc: BaseException) -> ProviderError | None:
+    """The first ProviderError inside a (possibly nested) ExceptionGroup."""
+    if isinstance(exc, ProviderError):
+        return exc
+    for sub in getattr(exc, "exceptions", None) or []:
+        found = _find_provider_error(sub)
+        if found is not None:
+            return found
+    return None
+
+
 class AgentMcpProvider(LLMProvider):
     """Delegates reconciliation to an EXTERNAL AGENT over MCP.
 
@@ -326,6 +337,11 @@ class AgentMcpProvider(LLMProvider):
         except ProviderError:
             raise
         except Exception as e:  # noqa: BLE001 — SDK raises ExceptionGroups/transport errors
+            # A ProviderError raised inside the MCP client context gets wrapped
+            # in an anyio ExceptionGroup on exit — surface the real error.
+            wrapped = _find_provider_error(e)
+            if wrapped is not None:
+                raise wrapped from e
             raise ProviderError(f"agent: MCP call failed: {e}") from e
         return LLMResponse(
             text=text,
@@ -428,6 +444,16 @@ class AgentMcpProvider(LLMProvider):
         except json.JSONDecodeError as e:
             raise ProviderError(f"agent: node {node_id!r} returned non-JSON content") from e
         execution = ((payload.get("data") or {}).get("execution")) or {}
+        # We request executionMode="openai" on every call; if the workspace
+        # ran anything else (e.g. silently fell back to its mock runner), the
+        # output is a stub — refuse it with the real reason instead of letting
+        # it fail obscurely in downstream Song validation.
+        mode = execution.get("executionMode")
+        if mode and mode != "openai":
+            raise ProviderError(
+                f"agent: node {node_id!r} executed in {mode!r} mode instead of 'openai' — "
+                "the workspace ignored the requested executionMode; refusing stub output"
+            )
         entries = [n for n in execution.get("nodes") or [] if n.get("nodeId") == node_id]
         entry = entries[0] if entries else {}
         output = entry.get("output")

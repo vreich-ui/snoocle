@@ -107,8 +107,12 @@ def node_execute(
                   "bestSourceId": "web-1", "rankedSources": [], "keyDecision": {}, "adjustments": []}
     else:
         output = {"artifact": "snoocle_song_sources.v1", "summary": "ok", "sources": []}
+    # FAKE_AGENT_FORCE_MODE simulates a workspace that ignores the requested
+    # executionMode (e.g. silently running its mock runner).
+    reported_mode = os.environ.get("FAKE_AGENT_FORCE_MODE") or executionMode
     return {"ok": True, "data": {"execution": {
         "status": "completed",
+        "executionMode": reported_mode,
         "nodes": [{"nodeId": nodeId, "status": "completed", "output": output}],
         "errors": [],
     }}}

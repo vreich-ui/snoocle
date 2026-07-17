@@ -22,6 +22,7 @@ from .chordsheet import parse_chord_sheet
 from .fetch import extract_sheet_text, fetch_page
 from .models import CandidateSource, SectionStart
 from .search import SearchHit, web_search
+from ..audio.acquire import parse_quoted_track
 from ..config import settings
 
 log = logging.getLogger(__name__)
@@ -92,6 +93,33 @@ def discover_sources(
     search_fn = search_fn or (lambda q, n: web_search(q, n))
     fetch_fn = fetch_fn or fetch_page
 
+    candidates = _search_and_parse(title, artist, max_candidates, search_fn, fetch_fn)
+
+    # Video-derived identities ('Artist "Track" at some show' with the uploader
+    # as the artist) rarely match any chord sheet literally. When the literal
+    # identity finds nothing and the title itself carries a quoted song name,
+    # retry with that extracted identity.
+    if not candidates:
+        extracted = parse_quoted_track(title)
+        if extracted:
+            ex_artist, ex_track = extracted
+            log.info(
+                "discovery: 0 candidates for %s — %s; retrying as %s — %s",
+                artist, title, ex_artist, ex_track,
+            )
+            candidates = _search_and_parse(ex_track, ex_artist, max_candidates, search_fn, fetch_fn)
+
+    candidates.sort(key=lambda c: c.confidence, reverse=True)
+    return candidates
+
+
+def _search_and_parse(
+    title: str,
+    artist: str,
+    max_candidates: int,
+    search_fn: SearchFn,
+    fetch_fn: FetchFn,
+) -> list[CandidateSource]:
     query = f"{_phrase(title)} {_phrase(artist)} chords"
     # ask for more hits than we need: many pages won't parse into a sheet
     hits = search_fn(query, max_candidates * 3)
@@ -110,6 +138,4 @@ def discover_sources(
         cand = candidate_from_text(text, source_id=f"web-{n}", url=hit.url, title=hit.title)
         if cand is not None:
             candidates.append(cand)
-
-    candidates.sort(key=lambda c: c.confidence, reverse=True)
     return candidates

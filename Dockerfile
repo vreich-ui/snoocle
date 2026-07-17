@@ -39,8 +39,22 @@ ENV PIP_NO_CACHE_DIR=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        curl \
         git \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno: the JavaScript runtime yt-dlp (>= 2025.11.12) requires to solve
+# YouTube's signature challenges. Without it most formats are withheld and
+# audio acquisition fails with "Requested format is not available". yt-dlp
+# probes for `deno` on PATH by default; the challenge-solver scripts
+# themselves come from the yt-dlp-ejs package (yt-dlp[default] in pyproject).
+ARG DENO_VERSION=v2.9.3
+RUN curl -fsSL -o /tmp/deno.zip \
+        "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+    && unzip -q /tmp/deno.zip -d /usr/local/bin \
+    && rm /tmp/deno.zip \
+    && deno --version
 
 # Self-contained virtualenv we can copy wholesale into the runtime stage.
 RUN python -m venv /opt/venv
@@ -97,9 +111,11 @@ RUN apt-get update \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the fully-built virtualenv and the chord model from the builder stage.
+# Copy the fully-built virtualenv, the chord model, and the deno runtime
+# (yt-dlp's YouTube challenge solver) from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/models /opt/models
+COPY --from=builder /usr/local/bin/deno /usr/local/bin/deno
 
 # Non-root user for security. Fixed high UID *and GID* keep it clearly
 # non-privileged and — critically — let a Cloud Run GCS-FUSE volume be mounted

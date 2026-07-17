@@ -146,6 +146,7 @@ def _asdict(obj: Any) -> Any:
 
 @app.get("/healthz")
 def healthz() -> dict:
+    import importlib.metadata
     import shutil
 
     def has(mod: str) -> bool:
@@ -155,10 +156,25 @@ def healthz() -> dict:
         except Exception:  # noqa: BLE001
             return False
 
+    def dist_version(name: str) -> str | None:
+        try:
+            return importlib.metadata.version(name)
+        except Exception:  # noqa: BLE001
+            return None
+
     return {
         "status": "ok",
         "version": __version__,
         "ffmpeg": shutil.which(settings.ffmpeg_bin) is not None,
+        # YouTube acquisition health: since yt-dlp 2025.11.12 full support
+        # needs an external JS runtime (deno) + the yt-dlp-ejs challenge-solver
+        # scripts; without BOTH, downloads fail with "Requested format is not
+        # available" because most formats are withheld.
+        "ytdlp": {
+            "version": dist_version("yt-dlp"),
+            "jsRuntime": shutil.which("deno") is not None,
+            "challengeSolver": dist_version("yt-dlp-ejs") is not None,
+        },
         "mirEngines": {
             "beats": "madmom" if has("madmom") else "librosa-fallback",
             "chords": "chord-cnn-lstm" if settings.chord_cnn_lstm_dir else "chroma-template-fallback",

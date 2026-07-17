@@ -43,13 +43,16 @@ def track_beats_madmom(wav_path: str) -> tuple[list[tuple[float, int]], float | 
 
 def track_beats_librosa(wav_path: str) -> tuple[list[tuple[float, int]], float | None, str | None]:
     import librosa
+    import numpy as np
 
     y, sr = librosa.load(wav_path, sr=None, mono=True)
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, trim=False)
     times = librosa.frames_to_time(beat_frames, sr=sr)
     # no downbeat information from librosa: assume 4/4 starting on beat 1
     beats = [(float(t), (i % 4) + 1) for i, t in enumerate(times)]
-    bpm = float(tempo) if tempo else None
+    # librosa >= 0.10 returns tempo as a 1-element ndarray; float() on that is
+    # a TypeError under numpy 2, which would sink the whole MIR analysis.
+    bpm = float(np.atleast_1d(tempo)[0]) if np.size(tempo) else 0.0
     return beats, (round(bpm, 1) if bpm else None), "4/4"
 
 

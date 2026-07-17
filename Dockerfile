@@ -127,9 +127,10 @@ RUN groupadd --gid 10001 appuser \
 
 WORKDIR /app
 
-# Writable, app-owned location for the audio cache (disposable — the durable
-# store is Firestore). Cloud Run's filesystem is in-memory/ephemeral.
-RUN mkdir -p /data/audio-cache \
+# Writable, app-owned locations for the audio cache and yt-dlp's
+# player/challenge cache (both disposable — the durable store is Firestore).
+# Cloud Run's filesystem is in-memory/ephemeral.
+RUN mkdir -p /data/audio-cache /data/ytdlp-cache \
     && chown -R appuser:appuser /data /app
 
 # Songs persist in Firestore (SNOOCLE_STORE_BACKEND=firestore). Listen on all
@@ -158,6 +159,7 @@ ENV GOOGLE_CLOUD_PROJECT=gen-lang-client-0481163044 \
     SNOOCLE_MCP_TRUST_PROXY=true \
     SNOOCLE_DATA_DIR=/data \
     SNOOCLE_AUDIO_CACHE_DIR=/data/audio-cache \
+    SNOOCLE_YTDLP_CACHE_DIR=/data/ytdlp-cache \
     SNOOCLE_CHORD_CNN_LSTM_DIR=/opt/models/chord-cnn-lstm \
     SNOOCLE_HOST=0.0.0.0 \
     PORT=8080

@@ -87,3 +87,21 @@ def test_analyze_synthesized_progression(progression_wav):
     payload = analysis.to_prompt_payload()
     assert payload["chordTimeline"]
     assert payload["beatCount"] == len(analysis.beats)
+
+
+def test_analyze_fast_accuracy_samples_windows(progression_wav):
+    """Fast accuracy on a short song: one window over the musical span,
+    structure skipped, timestamps still in the original track's coordinates."""
+    analysis = analyze_audio(progression_wav, accuracy="fast")
+
+    assert analysis.duration_seconds == pytest.approx(32.0, abs=0.5)
+    assert analysis.engines["structure"].startswith("skipped")
+    assert analysis.engines["sampling"].startswith("fast:")
+    assert analysis.sections == []
+    assert analysis.beats and analysis.chords
+    # absolute time coordinates: the timeline must not exceed track length
+    assert all(0.0 <= c.start < c.end <= 32.5 for c in analysis.chords)
+    named = [c.chord for c in analysis.chords if c.chord != "N"]
+    hits = sum(1 for c in named if c in {"C", "G", "Am", "F", "Cmaj7", "Am7"})
+    assert named and hits / len(named) >= 0.5
+    assert analysis.key in ("C major", "A minor")

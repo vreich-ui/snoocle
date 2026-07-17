@@ -112,7 +112,14 @@ class Settings(BaseSettings):
     # layout). When absent, engines fall back to the librosa implementations.
     chord_cnn_lstm_dir: Path | None = None
     songformer_dir: Path | None = None
-    mir_max_analysis_seconds: int = 0  # 0 = analyze full track
+    mir_max_analysis_seconds: int = 0  # 0 = analyze full track (standard accuracy)
+    # "fast" accuracy: instead of the whole track, analyze a few short windows
+    # spread across the MUSICAL span (after the detected music onset — YouTube
+    # videos often open with talking/intros). Enough audio evidence to anchor
+    # key/bpm and arbitrate between text sources at a fraction of the CPU time;
+    # window timestamps stay in the original track's time coordinates.
+    mir_fast_window_seconds: int = 40
+    mir_fast_window_count: int = 3
 
     # --- pipeline reliability ---
     # Per-step wall-clock ceilings (seconds) for POST /v1/songs/analyze so no

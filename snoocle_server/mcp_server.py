@@ -109,6 +109,7 @@ def analyze_audio(
     title: Optional[str] = None,
     artist: Optional[str] = None,
     youtube_url_or_id: Optional[str] = None,
+    accuracy: str = "standard",
 ) -> dict:
     """MIR analysis of a recording (step 4): beats/downbeats, chord timeline,
     structural sections, bpm, key — audio-grounded, independent of any text
@@ -127,7 +128,7 @@ def analyze_audio(
         # A client-supplied path (validated) or uploaded bytes (materialized to
         # a temp file). Video containers decode fine — MIR strips video first.
         audio_path = str(_materialize_input(audio_path, input_base64, input_format))
-    analysis = _analyze_audio(audio_path)
+    analysis = _analyze_audio(audio_path, accuracy=accuracy)
     return {"audioPath": audio_path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
 
 
@@ -191,6 +192,7 @@ async def analyze_and_store_song(
     model: Optional[str] = None,
     skip_audio: bool = False,
     expected_version: Optional[str] = None,
+    accuracy: Optional[str] = None,
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
@@ -207,6 +209,7 @@ async def analyze_and_store_song(
         model=model,
         skip_audio=skip_audio,
         expected_version=expected_version,
+        accuracy=accuracy,
     )
     assert report.reconcile is not None
     return {

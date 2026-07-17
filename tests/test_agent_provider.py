@@ -150,3 +150,79 @@ def test_agent_appears_in_provider_capabilities(monkeypatch):
     assert caps["agent"]["configured"] is False
     monkeypatch.setattr(settings, "agent_mcp_url", "http://127.0.0.1:9/mcp")
     assert provider_capabilities()["agent"]["configured"] is True
+
+
+NODES = "snoocle_source_search,snoocle_source_compare,snoocle_reconciler"
+
+
+def _chain_calls(capture) -> list[dict]:
+    return [json.loads(line) for line in capture.read_text().splitlines() if line.strip()]
+
+
+def test_agent_node_chain_mode_runs_all_nodes_and_returns_song(tmp_path, monkeypatch):
+    """SNOOCLE_AGENT_MCP_NODES drives the CMS-Agent node graph: each node runs
+    via node_execute in order, outputs flow forward as dependencyOutputs, and
+    the final node's output is validated as the Song."""
+    capture = tmp_path / "captured.jsonl"
+    with _fake_agent(capture) as url:
+        monkeypatch.setattr(settings, "agent_mcp_url", url)
+        monkeypatch.setattr(settings, "agent_mcp_nodes", NODES)
+        result = reconcile(
+            "Let It Be",
+            "The Beatles",
+            candidates=[],
+            mir=_mir(),
+            provider_name="agent",
+            youtube_video_id="QDYfEBY9NM4",
+        )
+
+    assert result.provider == "agent"
+    assert result.model == "mcp:" + NODES.replace(",", "+")
+    assert result.song.id == "the-beatles--let-it-be"
+
+    calls = _chain_calls(capture)
+    assert [c["nodeId"] for c in calls] == NODES.split(",")
+    # every node receives the Snoocle request; downstream nodes receive
+    # upstream outputs as dependencyOutputs
+    assert all(c["input"]["request"]["title"] == "Let It Be" for c in calls)
+    assert calls[0]["dependencyOutputs"] is None
+    assert set(calls[1]["dependencyOutputs"]) == {"snoocle_source_search"}
+    assert set(calls[2]["dependencyOutputs"]) == {
+        "snoocle_source_search", "snoocle_source_compare",
+    }
+
+
+def test_agent_node_chain_repair_round_reruns_only_final_node(tmp_path, monkeypatch):
+    """When the final node's Song fails validation, the repair round re-runs
+    ONLY the reconciler node (with previousOutput/validationErrors) — upstream
+    evidence gathering is not repeated."""
+    capture = tmp_path / "captured.jsonl"
+    with _fake_agent(capture) as url:
+        monkeypatch.setattr(settings, "agent_mcp_url", url)
+        monkeypatch.setattr(settings, "agent_mcp_nodes", NODES)
+
+        from snoocle_server.reconcile.providers import AgentMcpProvider
+
+        provider = AgentMcpProvider()
+        provider.context = {
+            "title": "Let It Be", "artist": "The Beatles", "song_id": "the-beatles--let-it-be",
+            "youtube_video_id": None, "media_url": None, "candidates": [], "mir": None,
+            "song_schema": {},
+        }
+        turns = [{"role": "user", "text": "reconcile"}]
+        provider.complete("system", turns)
+        turns += [
+            {"role": "assistant", "text": "{\"bad\": true}"},
+            {"role": "user", "text": "validation errors: metadata is required"},
+        ]
+        provider.complete("system", turns)
+
+    calls = _chain_calls(capture)
+    # 3 first-round calls + exactly 1 repair call (the reconciler only)
+    assert [c["nodeId"] for c in calls] == NODES.split(",") + ["snoocle_reconciler"]
+    repair = calls[-1]
+    assert repair["input"]["previousOutput"] == "{\"bad\": true}"
+    assert "metadata is required" in repair["input"]["validationErrors"]
+    assert set(repair["dependencyOutputs"]) == {
+        "snoocle_source_search", "snoocle_source_compare",
+    }

@@ -77,6 +77,43 @@ def reconcile_song(
     return json.dumps(_SONG)
 
 
+@mcp.tool()
+def node_execute(
+    nodeId: str,
+    executionMode: str = "openai",
+    input: dict | None = None,
+    dependencyOutputs: dict | None = None,
+) -> dict:
+    """CMS-Agent-style generic node runner (the SNOOCLE_AGENT_MCP_NODES mode).
+
+    Appends one JSON line per call to FAKE_AGENT_CAPTURE so tests can assert
+    the chain order, forwarded dependencyOutputs, and repair-round behavior.
+    The node id containing 'reconciler' returns the Song; other nodes return
+    stage artifacts.
+    """
+    capture = os.environ.get("FAKE_AGENT_CAPTURE")
+    if capture:
+        with Path(capture).open("a") as f:
+            f.write(json.dumps({
+                "tool": "node_execute",
+                "nodeId": nodeId,
+                "input": input,
+                "dependencyOutputs": dependencyOutputs,
+            }) + "\n")
+    if "reconciler" in nodeId:
+        output: dict = _SONG
+    elif "compare" in nodeId:
+        output = {"artifact": "snoocle_reconciliation_plan.v1", "summary": "ok",
+                  "bestSourceId": "web-1", "rankedSources": [], "keyDecision": {}, "adjustments": []}
+    else:
+        output = {"artifact": "snoocle_song_sources.v1", "summary": "ok", "sources": []}
+    return {"ok": True, "data": {"execution": {
+        "status": "completed",
+        "nodes": [{"nodeId": nodeId, "status": "completed", "output": output}],
+        "errors": [],
+    }}}
+
+
 def main() -> None:
     mcp.settings.host = "127.0.0.1"
     mcp.settings.port = int(os.environ["FAKE_AGENT_PORT"])

@@ -52,6 +52,9 @@ def build_user_prompt(
     song_schema: dict,
     song_id: str,
     youtube_video_id: str | None,
+    guidance: str | None = None,
+    prior_song: dict | None = None,
+    time_align: bool = False,
 ) -> str:
     parts: list[str] = []
     parts.append(
@@ -73,6 +76,28 @@ def build_user_prompt(
         )
     else:
         parts.append("## MIR audio analysis\nUNAVAILABLE for this run — reconcile from text sources alone; omit timestamps you cannot support.")
+
+    if prior_song is not None:
+        parts.append(
+            "## Prior result the user corrected\n"
+            "A previous reconciliation was reviewed and edited by a human. Treat"
+            " their version as strong evidence — preserve their lyrics, chord"
+            " placements, and section boundaries unless the audio flatly"
+            " contradicts them.\n" + json.dumps(prior_song, indent=1)
+        )
+    if guidance:
+        parts.append(
+            "## Human correction notes (highest priority)\n"
+            "Apply these explicit instructions from the user; they override"
+            " conflicting evidence:\n" + guidance
+        )
+    if time_align:
+        parts.append(
+            "## Time alignment (thorough analysis)\n"
+            "Populate audio.syncMap: map line indexes to seconds using the MIR"
+            " section boundaries and beat grid, with at least one entry for the"
+            " first line of every section. Times must be non-decreasing."
+        )
 
     parts.append("Now output the reconciled Song JSON only.")
     return "\n\n".join(parts)

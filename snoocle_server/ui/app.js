@@ -69,6 +69,9 @@ var state = {
   loadedVersion: null,
   providers: null,
   activeTab: "edit",
+  runs: [],          // run summaries for the open song (newest first)
+  activeRunId: null, // run being viewed in the Agent tab
+  runPoll: null,     // interval handle while a run is in progress
 };
 
 function tokenModal() {
@@ -192,7 +195,7 @@ async function addSongModal() {
   var titleInput = el("input", { type: "text", placeholder: "Song title" });
   var artistInput = el("input", { type: "text", placeholder: "Artist" });
 
-  var accuracy = el("select", {}, [
+  var depth = el("select", {}, [
     optionEl("fast", "fast"),
     optionEl("standard", "standard", true),
     optionEl("thorough", "thorough"),
@@ -216,7 +219,7 @@ async function addSongModal() {
       el("div", {}, [el("label", {}, ["Artist (optional)"]), artistInput]),
     ]),
     el("div", { class: "row" }, [
-      el("div", {}, [el("label", {}, ["Accuracy"]), accuracy]),
+      el("div", {}, [el("label", {}, ["Depth"]), depth]),
       el("div", {}, [el("label", {}, ["Provider"]), providerSel]),
     ]),
     status,
@@ -237,7 +240,7 @@ async function addSongModal() {
       status.textContent = "Provide a YouTube URL/ID, or both title and artist.";
       return;
     }
-    var body = { accuracy: accuracy.value };
+    var body = { analysisDepth: depth.value };
     if (url) body.youtubeUrlOrId = url;
     if (title) body.title = title;
     if (artist) body.artist = artist;
@@ -266,7 +269,10 @@ async function addSongModal() {
     }
     backdrop.remove();
     await loadSongList();
-    if (r.body.songId) openSong(r.body.songId);
+    if (r.body.songId) {
+      await openSong(r.body.songId);
+      watchRun(r.body.runId); // jump to the Agent tab and replay this run
+    }
   }
 
   backdrop.appendChild(modal);
@@ -285,6 +291,7 @@ function optionEl(label, value, selected) {
 // ---------------------------------------------------------------------------
 
 async function openSong(id) {
+  if (id !== state.songId) { stopRunPoll(); state.activeRunId = null; state.runs = []; }
   state.songId = id;
   document.getElementById("empty").classList.add("hidden");
   document.getElementById("tabs").style.display = "flex";
@@ -309,6 +316,7 @@ async function openSong(id) {
   renderEditTab();
   renderVersionsTab(versions.ok ? versions.body.versions || [] : []);
   renderPlayTab();
+  loadRuns();
   selectTab(state.activeTab);
 }
 
@@ -317,7 +325,7 @@ function selectTab(name) {
   Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
     b.classList.toggle("active", b.getAttribute("data-tab") === name);
   });
-  ["edit", "versions", "play"].forEach(function (t) {
+  ["edit", "agent", "versions", "play"].forEach(function (t) {
     document.getElementById("tab-" + t).classList.toggle("active", t === name);
   });
 }
@@ -362,6 +370,24 @@ function renderEditTab() {
   panel.appendChild(el("label", {}, ["Lines (inline bracket format: [C]lyrics)"]));
   panel.appendChild(editRefs.lines);
 
+  // Live alignment preview: shows chords sitting over their syllables exactly
+  // as the Play tab will render them, updating as you move brackets. This is
+  // the visual aid for adjusting chord placement by hand.
+  panel.appendChild(el("label", {}, ["Alignment preview"]));
+  var preview = el("div", { class: "sheet-scroll" }, []);
+  panel.appendChild(preview);
+  function refreshPreview() {
+    clear(preview);
+    bracketTextToLines(editRefs.lines.value).forEach(function (line) {
+      var chordLine = buildChordLine(line);
+      preview.appendChild(el("pre", { class: "sheet" }, [
+        (chordLine ? chordLine + "\n" : "") + (line.lyrics || ""),
+      ]));
+    });
+  }
+  editRefs.lines.addEventListener("input", refreshPreview);
+  refreshPreview();
+
   panel.appendChild(el("label", {}, ["Sections"]));
   panel.appendChild(el("table", {}, [
     el("thead", {}, [el("tr", {}, [
@@ -376,6 +402,78 @@ function renderEditTab() {
     el("div", {}, []),
   ]));
   panel.appendChild(status);
+
+  // --- help the agent adjust it: re-run reconciliation with your corrections
+  editRefs.guidance = el("textarea", {
+    placeholder: "e.g. the bridge is Bm not D; keep my chorus lyrics; capo the audio is a half-step sharp",
+    style: "min-height:70px",
+  }, []);
+  editRefs.rerunDepth = el("select", {}, [
+    optionEl("fast", "fast"),
+    optionEl("standard", "standard", true),
+    optionEl("thorough (fills time alignment)", "thorough"),
+  ]);
+  editRefs.rerunStatus = el("div", { class: "muted" }, []);
+  panel.appendChild(el("hr", { style: "margin:22px 0 6px; border:none; border-top:1px solid var(--border)" }, []));
+  panel.appendChild(el("div", { class: "section-head" }, ["Help the agent adjust it"]));
+  panel.appendChild(el("p", { class: "muted" }, [
+    "Re-run reconciliation with your current edits as the starting point plus " +
+      "notes below. The agent honors your fixes and fills in the rest; watch it " +
+      "work on the Agent tab.",
+  ]));
+  panel.appendChild(el("label", {}, ["Correction notes (optional)"]));
+  panel.appendChild(editRefs.guidance);
+  panel.appendChild(el("div", { class: "row", style: "margin-top:10px; align-items:flex-end" }, [
+    el("div", {}, [el("label", {}, ["Depth"]), editRefs.rerunDepth]),
+    el("div", {}, [button("Re-run agent with my fixes", "", rerunWithFixes)]),
+  ]));
+  panel.appendChild(editRefs.rerunStatus);
+}
+
+async function rerunWithFixes() {
+  // Build the current edited Song (same shape saveSong sends) and hand it to
+  // the reconciler as prior human-edited evidence + free-text guidance.
+  var song = Object.assign({}, state.loadedSong);
+  song.metadata = Object.assign({}, state.loadedSong.metadata || {}, {
+    title: editRefs.title.value.trim(),
+    artist: editRefs.artist.value.trim(),
+    bpm: editRefs.bpm.value !== "" ? parseFloat(editRefs.bpm.value) : null,
+    key: editRefs.key.value.trim() || null,
+  });
+  song.lines = bracketTextToLines(editRefs.lines.value);
+  song.sections = buildSectionsFromRows();
+
+  var md = song.metadata;
+  if (!(md.title && md.artist)) {
+    editRefs.rerunStatus.className = "err";
+    editRefs.rerunStatus.textContent = "Title and artist are required to re-run.";
+    return;
+  }
+  var body = {
+    title: md.title,
+    artist: md.artist,
+    analysisDepth: editRefs.rerunDepth.value,
+    priorSong: song,
+    guidance: editRefs.guidance.value.trim() || null,
+    expectedVersion: state.loadedVersion,
+  };
+  var vid = state.loadedSong.audio && state.loadedSong.audio.youtubeVideoId;
+  if (vid) body.youtubeUrlOrId = vid;
+
+  editRefs.rerunStatus.className = "muted";
+  editRefs.rerunStatus.textContent = "Re-running — watch the Agent tab…";
+  var r = await apiJson("/v1/songs/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    editRefs.rerunStatus.className = "err";
+    editRefs.rerunStatus.textContent = (r.body && r.body.detail) ? r.body.detail : ("failed (HTTP " + r.status + ")");
+    return;
+  }
+  await openSong(state.songId);
+  watchRun(r.body.runId);
 }
 
 function addSectionRow(tbody, section) {
@@ -517,17 +615,20 @@ function renderPlayTab() {
   });
 
   var lines = song.lines || [];
+  // ONE scroll container for the whole song: a long line scrolls the sheet, not
+  // an invisible per-line box, and chord columns stay aligned across lines.
+  var scroll = el("div", { class: "sheet-scroll" }, []);
   lines.forEach(function (line) {
     if (sectionForLine[line.lineIndex] !== undefined) {
-      panel.appendChild(el("div", { class: "section-head" }, [sectionForLine[line.lineIndex]]));
+      scroll.appendChild(el("div", { class: "section-head" }, [sectionForLine[line.lineIndex]]));
     }
     var chordLine = buildChordLine(line);
-    panel.appendChild(el("pre", { class: "sheet", "data-line": line.lineIndex }, [
+    scroll.appendChild(el("pre", { class: "sheet", "data-line": line.lineIndex }, [
       (chordLine ? chordLine + "\n" : "") + (line.lyrics || ""),
     ]));
   });
-
-  if (!lines.length) panel.appendChild(el("p", { class: "muted" }, ["No lines yet."]));
+  if (lines.length) panel.appendChild(scroll);
+  else panel.appendChild(el("p", { class: "muted" }, ["No lines yet."]));
 }
 
 function buildChordLine(line) {
@@ -549,6 +650,112 @@ function buildChordLine(line) {
 // provenance/syncMap and scroll that line into view. No timer logic yet.
 function autoScrollTo(seconds) {
   void seconds;
+}
+
+// ---------------------------------------------------------------------------
+// Agent tab — replay the reconciler's step-by-step logic
+// ---------------------------------------------------------------------------
+
+function stopRunPoll() {
+  if (state.runPoll) { clearInterval(state.runPoll); state.runPoll = null; }
+}
+
+async function loadRuns() {
+  var r = await apiJson("/v1/songs/" + encodeURIComponent(state.songId) + "/runs");
+  state.runs = (r.ok && r.body.runs) ? r.body.runs : [];
+  // Default selection: the run we're already watching, else the newest.
+  if (!state.activeRunId && state.runs.length) state.activeRunId = state.runs[0].runId;
+  renderAgentTab();
+}
+
+function renderAgentTab() {
+  var panel = document.getElementById("tab-agent");
+  clear(panel);
+
+  panel.appendChild(el("p", { class: "muted" }, [
+    "Every reconciliation run's logic — what the agent read, searched, fetched, " +
+      "and decided. Pick a run; open a step to see its raw input and result.",
+  ]));
+
+  if (!state.runs.length) {
+    panel.appendChild(el("p", { class: "muted" }, ["No runs recorded for this song yet."]));
+    return;
+  }
+
+  var chips = el("div", { class: "run-list" }, []);
+  state.runs.forEach(function (run) {
+    var when = (run.startedAt || "").replace("T", " ").replace("Z", "");
+    var chip = el("div", {
+      class: "run-chip" + (run.runId === state.activeRunId ? " active" : ""),
+      "data-run": run.runId,
+    }, [ (run.depth || "?") + " · " + when ]);
+    chip.addEventListener("click", function () { openRun(run.runId); });
+    chips.appendChild(chip);
+  });
+  panel.appendChild(chips);
+
+  var body = el("div", { id: "run-body" }, [el("p", { class: "muted" }, ["Loading…"])]);
+  panel.appendChild(body);
+  if (state.activeRunId) openRun(state.activeRunId);
+}
+
+async function openRun(runId) {
+  state.activeRunId = runId;
+  // reflect selection in the chips without a full re-render
+  Array.prototype.forEach.call(document.querySelectorAll(".run-chip"), function (c) {
+    c.classList.toggle("active", c.getAttribute("data-run") === runId);
+  });
+  var r = await apiJson("/v1/runs/" + encodeURIComponent(runId));
+  if (!r.ok) return;
+  renderRunTrace(r.body);
+  // Poll while the run is still in progress (near-live view).
+  stopRunPoll();
+  if (r.body.status === "running") {
+    state.runPoll = setInterval(async function () {
+      var rr = await apiJson("/v1/runs/" + encodeURIComponent(runId));
+      if (rr.ok) {
+        renderRunTrace(rr.body);
+        if (rr.body.status !== "running") { stopRunPoll(); loadRuns(); }
+      }
+    }, 2500);
+  }
+}
+
+function renderRunTrace(run) {
+  var body = document.getElementById("run-body");
+  if (!body) return;
+  clear(body);
+
+  var badge = el("span", { class: "badge " + (run.status || "") }, [run.status || "?"]);
+  var meta = el("div", { class: "run-meta" }, [
+    badge, " ",
+    document.createTextNode(
+      "provider " + (run.provider || "?") + " · model " + (run.model || "?") +
+      " · depth " + (run.depth || "?") + " · " + (run.stepCount || 0) + " steps"),
+  ]);
+  body.appendChild(meta);
+  if (run.error) body.appendChild(el("p", { class: "err" }, [run.error]));
+
+  (run.steps || []).forEach(function (s) {
+    var summary = el("summary", {}, [
+      el("span", { class: "kind" }, [s.kind || ""]),
+      el("span", { class: "sum" }, [s.summary || ""]),
+      el("span", { class: "dur" }, [s.durationSeconds != null ? s.durationSeconds + "s" : ""]),
+    ]);
+    var pre = el("pre", { class: "detail" }, [
+      JSON.stringify(s.detail || {}, null, 2),
+    ]);
+    var det = el("details", { class: "step", "data-kind": s.kind || "" }, [summary, pre]);
+    body.appendChild(det);
+  });
+}
+
+// Called after an analyze kicks off: jump to the Agent tab and watch the run.
+function watchRun(runId) {
+  if (!runId) return;
+  state.activeRunId = runId;
+  selectTab("agent");
+  loadRuns();
 }
 
 // ---------------------------------------------------------------------------

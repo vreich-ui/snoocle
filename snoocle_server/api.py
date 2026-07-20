@@ -419,6 +419,15 @@ class PipelineRequest(BaseModel):
     # MIR effort/speed trade-off, surfaced to the app UI as an accuracy picker:
     # fast (sampled windows) | standard (default) | thorough (always full track)
     accuracy: Optional[Literal["fast", "standard", "thorough"]] = None
+    # Single analysis-depth preset (fast|standard|thorough) that bundles MIR
+    # accuracy + agent effort + tool budget + time alignment. Supersedes
+    # `accuracy` when set; the app sends this one field.
+    analysisDepth: Optional[Literal["fast", "standard", "thorough"]] = None
+    # Human-in-the-loop re-run: free-text correction notes and/or the prior
+    # human-edited Song, fed to the reconciler as high-priority evidence so a
+    # re-analysis honors the user's fixes instead of rediscovering from scratch.
+    guidance: Optional[str] = None
+    priorSong: Optional[dict] = None
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
@@ -441,6 +450,9 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             max_candidates=req.maxCandidates,
             expected_version=req.expectedVersion,
             accuracy=req.accuracy,
+            analysis_depth=req.analysisDepth,
+            guidance=req.guidance,
+            prior_song=req.priorSong,
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -455,8 +467,39 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
         "songId": report.song_id,
         "steps": report.steps,
         "storedVersion": report.stored_version,
+        "runId": report.run_id,  # fetch the step trace at /v1/runs/{runId}
         **_reconcile_response(report.reconcile),
     }
+
+
+# --- agent run traces (watch the reconciler's step-by-step logic) ------------
+
+
+@app.get("/v1/runs/{run_id}")
+def get_run(run_id: str) -> dict:
+    """The full step trace of one reconciliation run.
+
+    Reads the live in-process record first (a run still in progress on this
+    instance), then the durable run store (completed runs, any instance)."""
+    from .reconcile.trace import get_live_run
+    from .store.runs import get_run_store
+
+    live = get_live_run(run_id)
+    if live is not None:
+        return live.to_dict()
+    stored = get_run_store().get_run(run_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
+    return stored
+
+
+@app.get("/v1/songs/{song_id}/runs")
+def get_song_runs(song_id: str) -> dict:
+    """Recent reconciliation runs for a song, newest first (summaries only)."""
+    from .store.runs import get_run_store
+
+    runs = get_run_store().list_runs(song_id, limit=25)
+    return {"songId": song_id, "runs": runs}
 
 
 # --- step 7: versioned store -------------------------------------------------

@@ -36,8 +36,11 @@ from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .mir import MirAnalysis, analyze_audio
 from .reconcile import ReconcileResult, provider_preflight, reconcile
+from .reconcile.depth import resolve_depth
+from .reconcile.trace import TraceRecorder, start_run
 from .schema.song import slugify_song_id
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
+from .store.runs import get_run_store
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +86,7 @@ class PipelineReport:
     stored_version: str | None = None
     stored_timestamp: str | None = None
     error_code: str | None = None  # machine-readable cause from a failed step
+    run_id: str | None = None  # id of this run's persisted step trace
 
 
 def get_store() -> SongRepository:
@@ -117,6 +121,10 @@ def _step_reconcile(
     model: str | None,
     attach_audio: bool | None,
     audio: AcquiredAudio | None,
+    trace: TraceRecorder | None = None,
+    guidance: str | None = None,
+    prior_song: dict | None = None,
+    depth=None,
 ) -> ReconcileResult:
     return reconcile(
         title,
@@ -129,6 +137,10 @@ def _step_reconcile(
         attach_audio=attach_audio,
         youtube_video_id=audio.video_id if audio else None,
         song_id=song_id,
+        trace=trace,
+        guidance=guidance,
+        prior_song=prior_song,
+        depth=depth,
     )
 
 
@@ -193,9 +205,16 @@ async def run_pipeline_async(
     expected_version: str | None = None,
     store: SongRepository | None = None,
     accuracy: str | None = None,
+    analysis_depth: str | None = None,
+    guidance: str | None = None,
+    prior_song: dict | None = None,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
-    accuracy = accuracy or "standard"
+    # analysisDepth is the canonical control; the older `accuracy` field is
+    # honored as its source when a depth isn't given explicitly. The chosen
+    # profile drives MIR accuracy, agent effort, the tool budget, and syncMap.
+    depth = resolve_depth(analysis_depth or accuracy)
+    accuracy = depth.accuracy
     steps: dict[str, str] = {}
 
     # Provider preflight (FATAL, instant). A provider that can't serve ANY
@@ -279,27 +298,38 @@ async def run_pipeline_async(
         else:
             report.steps["mir"] = "skipped (no audio)"
 
-    # 5. reconciliation (FATAL) — uses ALL candidates + the MIR timeline
+    # 5. reconciliation (FATAL) — uses ALL candidates + the MIR timeline. The
+    # run's step trace is recorded live and persisted for later replay in the
+    # GUI (the agent's logic, tool calls, and repair rounds).
+    recorder = start_run(song_id, resolved_provider, depth.name)
+    report.run_id = recorder.trace.run_id
     try:
         report.reconcile = await _timed_step(
             "reconcile",
             lambda: _step_reconcile(
                 title, artist, song_id, report.candidates, report.mir,
                 provider, model, attach_audio, report.audio,
+                trace=recorder, guidance=guidance, prior_song=prior_song, depth=depth,
             ),
             settings.reconcile_timeout_seconds,
         )
     except asyncio.TimeoutError as e:
+        recorder.finish("error", error=f"timed out after {settings.reconcile_timeout_seconds:.0f}s")
+        _persist_trace(recorder)
         raise PipelineStepError(
             "reconcile",
             f"timed out after {settings.reconcile_timeout_seconds:.0f}s",
             steps=report.steps,
         ) from e
     except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
+        recorder.finish("error", error=str(e)[:2000])
+        _persist_trace(recorder)
         raise PipelineStepError(
             "reconcile", str(e), steps=report.steps, error_code=report.error_code
         ) from e
     result = report.reconcile
+    recorder.finish("ok", model=result.model)
+    _persist_trace(recorder)
     report.steps["reconcile"] = (
         f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"
     )
@@ -335,6 +365,15 @@ def _fail_text(exc: BaseException, timeout: float) -> str:
     return f"failed: {exc}"
 
 
+def _persist_trace(recorder: TraceRecorder) -> None:
+    """Durably store a run's trace (best-effort — never fail the pipeline over
+    an observability write)."""
+    try:
+        get_run_store().save_run(recorder.trace.to_dict())
+    except Exception as e:  # noqa: BLE001
+        log.warning("run trace persistence failed (continuing): %s", e)
+
+
 def run_pipeline(
     title: str | None,
     artist: str | None,
@@ -347,6 +386,9 @@ def run_pipeline(
     expected_version: str | None = None,
     store: SongRepository | None = None,
     accuracy: str | None = None,
+    analysis_depth: str | None = None,
+    guidance: str | None = None,
+    prior_song: dict | None = None,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -364,5 +406,8 @@ def run_pipeline(
             expected_version=expected_version,
             store=store,
             accuracy=accuracy,
+            analysis_depth=analysis_depth,
+            guidance=guidance,
+            prior_song=prior_song,
         )
     )

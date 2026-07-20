@@ -481,20 +481,13 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
 
 @app.get("/v1/runs/{run_id}")
 def get_run(run_id: str) -> dict:
-    """The full step trace of one reconciliation run.
+    """The full step trace of one reconciliation run (live record, then store)."""
+    from .store.runs import fetch_run
 
-    Reads the live in-process record first (a run still in progress on this
-    instance), then the durable run store (completed runs, any instance)."""
-    from .reconcile.trace import get_live_run
-    from .store.runs import get_run_store
-
-    live = get_live_run(run_id)
-    if live is not None:
-        return live.to_dict()
-    stored = get_run_store().get_run(run_id)
-    if stored is None:
+    run = fetch_run(run_id)
+    if run is None:
         raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
-    return stored
+    return run
 
 
 @app.get("/v1/songs/{song_id}/runs")
@@ -531,6 +524,7 @@ def _run_process_metrics(song_id: str) -> dict:
         "runId": run.get("runId"),
         "depth": run.get("depth"),
         "model": run.get("model"),
+        "configVersion": run.get("configVersion"),
         "firstPassValid": repairs == 0,
         "attempts": repairs + 1,
         "toolCalls": tool_calls,
@@ -587,29 +581,9 @@ def get_score(song_id: str, candidate: Optional[str] = None) -> dict:
 def get_scorecard() -> dict:
     """Score every gold-marked song's current version against its gold, and
     attach the latest run's process metrics. The agent's report card."""
-    from .eval import score_song
-    from .store.evals import get_eval_store
+    from .eval.scorecard import build_scorecard
 
-    store = get_store()
-    rows = []
-    for rec in get_eval_store().list_gold():
-        song_id = rec["songId"]
-        gold_version = rec.get("goldVersion")
-        try:
-            gold = store.get(song_id, version=gold_version)
-            cand = store.get(song_id)  # current
-        except StoreError:
-            continue
-        rows.append({
-            "songId": song_id,
-            "goldVersion": gold_version,
-            "currentVersion": store.current_version(song_id),
-            "metrics": score_song(cand, gold),
-            "process": _run_process_metrics(song_id),
-        })
-    rows.sort(key=lambda r: r["metrics"]["overall"])
-    aggregate = _aggregate_scores([r["metrics"] for r in rows])
-    return {"count": len(rows), "aggregate": aggregate, "songs": rows}
+    return build_scorecard(get_store(), process_metrics=_run_process_metrics)
 
 
 def _aggregate_scores(metrics: list[dict]) -> dict:
@@ -756,6 +730,80 @@ def delete_youtube_cookies() -> dict:
     _require_app_auth_configured()
     get_store().clear_youtube_cookies()
     return {"status": "cleared"}
+
+
+# --- agent programming: runtime-editable instructions / tooling --------------
+
+
+def _dt_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _effective_agent_defaults() -> dict:
+    """The built-in defaults the GUI shows as placeholders (what runs with no
+    override) — kept in one place so the Workbench never hardcodes them."""
+    from .reconcile.agent_config import KNOWN_TOOLS
+    from .reconcile.anthropic_agent import _OUTPUT_CONTRACT, _PROMPT_RECIPE, _PROMPT_THEORY
+
+    return {
+        "theoryRules": _PROMPT_THEORY,
+        "retrievalRecipe": _PROMPT_RECIPE,
+        "maxTurns": settings.anthropic_agent_max_turns,
+        "effort": settings.anthropic_agent_effort,
+        "model": settings.llm_model or settings.anthropic_agent_model,
+        "budgets": {"maxWebSearch": 2, "maxFetch": 3, "maxWindows": 2},
+        "tools": sorted(KNOWN_TOOLS),
+        "lockedOutputContract": _OUTPUT_CONTRACT,
+    }
+
+
+@app.get("/v1/config/agent")
+def get_agent_config_endpoint() -> dict:
+    from .reconcile.agent_config import AgentConfig, config_version
+    from .store.agent_config import get_agent_config_store
+
+    _require_app_auth_configured()
+    doc = get_agent_config_store().get()
+    cfg = AgentConfig.model_validate(doc) if doc else AgentConfig()
+    return {
+        "config": cfg.model_dump(),
+        "configVersion": config_version(cfg),
+        "isDefault": cfg.is_default(),
+        "defaults": _effective_agent_defaults(),
+    }
+
+
+@app.put("/v1/config/agent")
+def put_agent_config_endpoint(body: dict) -> dict:
+    from pydantic import ValidationError
+
+    from .reconcile.agent_config import AgentConfig, config_version
+    from .store.agent_config import get_agent_config_store
+
+    _require_app_auth_configured()
+    try:
+        cfg = AgentConfig.model_validate(body)
+    except ValidationError as e:
+        # drop ctx (holds a non-JSON-serializable exception) and the url noise
+        raise HTTPException(
+            status_code=422, detail=e.errors(include_url=False, include_context=False)
+        ) from e
+    doc = cfg.model_dump()
+    doc["updated_at"] = _dt_now()
+    doc["source"] = "rest"
+    get_agent_config_store().set(doc)
+    return {"status": "stored", "configVersion": config_version(cfg), "updatedAt": doc["updated_at"]}
+
+
+@app.delete("/v1/config/agent")
+def delete_agent_config_endpoint() -> dict:
+    from .store.agent_config import get_agent_config_store
+
+    _require_app_auth_configured()
+    get_agent_config_store().clear()
+    return {"status": "reset"}
 
 
 # --- deterministic audio utilities (no AI) -----------------------------------

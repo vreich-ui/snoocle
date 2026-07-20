@@ -122,3 +122,15 @@ def reset_run_store() -> None:
     global _repo
     with _lock:
         _repo = None
+
+
+def fetch_run(run_id: str) -> dict | None:
+    """A run's full trace: the live in-process record first (a run still in
+    progress on this instance), then the durable store. Shared by the REST
+    route and the MCP tool so the two surfaces can't drift."""
+    from ..reconcile.trace import get_live_run
+
+    live = get_live_run(run_id)
+    if live is not None:
+        return live.to_dict()
+    return get_run_store().get_run(run_id)

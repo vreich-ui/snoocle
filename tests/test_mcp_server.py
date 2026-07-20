@@ -40,6 +40,15 @@ EXPECTED_TOOLS = {
     "probe_audio",
     "server_status",
     "get_song_schema",
+    # agent programming & observability
+    "get_agent_config",
+    "set_agent_config",
+    "reset_agent_config",
+    "list_song_runs",
+    "get_run",
+    "get_scorecard",
+    "set_gold_version",
+    "score_song_version",
 }
 
 

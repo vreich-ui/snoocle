@@ -25,12 +25,25 @@ from ..discovery.models import CandidateSource
 from ..mir.base import MirAnalysis
 from ..schema import Song, song_json_schema
 from ..schema.song import ProvenanceEntry, slugify_song_id
+from .agent_config import AgentConfig, config_version
 from .depth import DepthProfile, resolve_depth
 from .prompt import SYSTEM_PROMPT, build_repair_prompt, build_user_prompt
 from .providers import AudioAttachment, LLMProvider, get_provider
 from .trace import RunTrace, TraceRecorder, clock
 
 log = logging.getLogger(__name__)
+
+
+def _load_agent_config() -> AgentConfig:
+    """The stored operator config, or built-in defaults if unset/unreadable."""
+    try:
+        from ..store.agent_config import get_agent_config_store
+
+        doc = get_agent_config_store().get()
+        return AgentConfig.model_validate(doc) if doc else AgentConfig()
+    except Exception as e:  # noqa: BLE001 — never fail a run over config
+        log.warning("agent config unavailable, using defaults: %s", e)
+        return AgentConfig()
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
@@ -168,6 +181,13 @@ def reconcile(
     provider = get_provider(provider_name)
     depth = depth or resolve_depth(None)
 
+    # Operator agent config (runtime-editable instructions/tooling). A store
+    # failure degrades to built-in defaults — observability config must never
+    # fail a reconciliation.
+    agent_config = _load_agent_config()
+    if trace is not None:
+        trace.trace.config_version = config_version(agent_config)
+
     # The mock provider is a deterministic offline reconciler: it can synthesize
     # a small Song from title/artist alone, so it never requires inputs. Every
     # other provider needs something concrete to reconcile.
@@ -230,6 +250,7 @@ def reconcile(
             "guidance": guidance,
             "prior_song": prior_song,
             "depth": depth,
+            "agent_config": agent_config if not agent_config.is_default() else None,
         }
     if hasattr(provider, "trace"):
         provider.trace = trace

@@ -75,6 +75,7 @@ class RunTrace:
     started_at: str = field(default_factory=_now_iso)
     finished_at: str | None = None
     error: str | None = None
+    config_version: str | None = None  # agent-config fingerprint (attribution)
     steps: list[TraceStep] = field(default_factory=list)
     # Full MIR snapshot for this run (MirAnalysis.to_run_payload()) — stored
     # UN-truncated (the payload bounds itself), unlike step details.
@@ -93,6 +94,7 @@ class RunTrace:
             "startedAt": self.started_at,
             "finishedAt": self.finished_at,
             "error": self.error,
+            "configVersion": self.config_version,
             "stepCount": len(self.steps),
             "steps": [s.to_dict() for s in self.steps],
             "mir": self.mir,

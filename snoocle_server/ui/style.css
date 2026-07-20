@@ -118,7 +118,7 @@ button.btn:disabled { opacity: 0.5; cursor: default; }
 table { width: 100%; border-collapse: collapse; margin-top: 8px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
 
-pre.sheet, pre.diff {
+pre.diff {
   font-family: var(--mono);
   background: var(--panel);
   border: 1px solid var(--border);
@@ -129,6 +129,58 @@ pre.sheet, pre.diff {
 }
 pre.diff { font-size: 12px; }
 .section-head { font-weight: 600; margin: 14px 0 4px; color: var(--accent); }
+
+/* Chord/lyric sheet: ONE horizontal scroll container wraps the whole song so
+   long lines don't clip invisibly (each line used to be its own scroll box,
+   so overflow was unreachable). white-space:pre keeps chords column-aligned
+   over syllables; the wrapper owns the scrollbar and the border. */
+.sheet-scroll {
+  overflow-x: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+pre.sheet {
+  font-family: var(--mono);
+  white-space: pre;
+  margin: 0 0 2px;
+  width: max-content;
+  min-width: 100%;
+}
+
+/* --- agent trace --- */
+.run-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.run-chip {
+  border: 1px solid var(--border); border-radius: 14px; padding: 4px 10px;
+  cursor: pointer; font-size: 12px; font-family: var(--mono); background: var(--panel);
+}
+.run-chip.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.run-meta { font-size: 12px; margin-bottom: 10px; }
+.badge { border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; }
+.badge.ok { background: rgba(30,138,76,0.18); color: var(--ok); }
+.badge.error { background: rgba(192,57,43,0.18); color: var(--danger); }
+.badge.running { background: rgba(47,111,235,0.18); color: var(--accent); }
+.step { border: 1px solid var(--border); border-radius: 8px; margin: 6px 0; overflow: hidden; }
+.step > summary {
+  cursor: pointer; padding: 8px 12px; list-style: none; display: flex;
+  gap: 10px; align-items: baseline;
+}
+.step > summary::-webkit-details-marker { display: none; }
+.step .kind {
+  font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+  color: var(--muted); min-width: 54px;
+}
+.step .sum { flex: 1; }
+.step .dur { color: var(--muted); font-size: 12px; }
+.step[data-kind="tool"] { border-left: 3px solid var(--accent); }
+.step[data-kind="final"] { border-left: 3px solid var(--ok); }
+.step[data-kind="repair"], .step[data-kind="error"] { border-left: 3px solid var(--danger); }
+.step pre.detail {
+  margin: 0; padding: 10px 12px; border-top: 1px solid var(--border);
+  background: var(--panel); font-family: var(--mono); font-size: 12px;
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+}
 
 /* --- modal --- */
 .modal-backdrop {
@@ -150,3 +202,18 @@ pre.diff { font-size: 12px; }
 .hidden { display: none !important; }
 .building { padding: 16px; border: 1px dashed var(--border); border-radius: 8px; margin-top: 14px; }
 iframe.yt { width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: 8px; margin-bottom: 14px; }
+
+/* --- narrow screens (phones): stack sidebar above content so #main gets the
+   full width instead of ~130px, which is what made every sheet line overflow.
+   The song list becomes a short, scrollable strip. --- */
+@media (max-width: 700px) {
+  #app { flex-direction: column; height: auto; min-height: 100vh; }
+  #sidebar {
+    width: auto; min-width: 0; border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  #song-list { max-height: 30vh; }
+  #main { padding: 14px; }
+  .row { flex-direction: column; }
+  #tabs { overflow-x: auto; }
+}

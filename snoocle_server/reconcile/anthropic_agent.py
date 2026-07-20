@@ -22,6 +22,7 @@ from ..discovery.fetch import extract_sheet_text, fetch_page
 from ..discovery.service import candidate_from_text
 from ..mir.pipeline import analyze_window
 from .providers import LLMProvider, LLMResponse, ProviderError
+from .trace import TraceRecorder
 
 log = logging.getLogger(__name__)
 
@@ -81,23 +82,51 @@ SYSTEM_BLOCKS = [
     {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
 ]
 
-TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
-    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
-    {
-        "name": "fetch_chord_sheet",
-        "description": "Fetch a URL and parse it as a chord sheet. Returns a structured candidate (lines with chord placements at sounding pitch, declared key/capo, confidence) or an error if the page has no usable transcription. Call this for chord/tab pages found via web_search; prefer it over web_fetch for chord sites because it parses and capo-normalizes.",
-        "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"], "additionalProperties": False},
-    },
-    {
-        "name": "analyze_audio_window",
-        "description": "Run audio chord/beat analysis on a specific window of the actual recording. Returns a chord timeline with ABSOLUTE timestamps (seconds in the video), bpm and beats for that window. Use when text sources disagree about a passage and the provided MIR timeline does not cover it. Windows are capped at 60 seconds.",
-        "input_schema": {"type": "object", "properties": {"start_seconds": {"type": "number"}, "end_seconds": {"type": "number"}}, "required": ["start_seconds", "end_seconds"], "additionalProperties": False},
-    },
-]
+_FETCH_TOOL = {
+    "name": "fetch_chord_sheet",
+    "description": "Fetch a URL and parse it as a chord sheet. Returns a structured candidate (lines with chord placements at sounding pitch, declared key/capo, confidence) or an error if the page has no usable transcription. Call this for chord/tab pages found via web_search; prefer it over web_fetch for chord sites because it parses and capo-normalizes.",
+    "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"], "additionalProperties": False},
+}
+_WINDOW_TOOL = {
+    "name": "analyze_audio_window",
+    "description": "Run audio chord/beat analysis on a specific window of the actual recording. Returns a chord timeline with ABSOLUTE timestamps (seconds in the video), bpm and beats for that window. Use when text sources disagree about a passage and the provided MIR timeline does not cover it. Windows are capped at 60 seconds.",
+    "input_schema": {"type": "object", "properties": {"start_seconds": {"type": "number"}, "end_seconds": {"type": "number"}}, "required": ["start_seconds", "end_seconds"], "additionalProperties": False},
+}
+
+
+def _build_tools(max_web_search: int, max_fetch: int) -> list[dict]:
+    """Tools with the server-tool budget set by the analysis-depth profile."""
+    return [
+        {"type": "web_search_20260209", "name": "web_search", "max_uses": max_web_search},
+        {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": max_fetch},
+        _FETCH_TOOL,
+        _WINDOW_TOOL,
+    ]
+
+
+# Default budget (used when no depth profile is injected) mirrors "standard".
+TOOLS = _build_tools(2, 3)
 
 # Cap for windowed on-demand analysis (seconds) — see the tool description.
 _MAX_WINDOW_SECONDS = 60.0
+
+
+def _tool_summary(name: str, tool_input: dict, result: dict, is_error: bool) -> str:
+    """One human-readable line describing a tool call and its outcome."""
+    if is_error:
+        return f"{name} failed: {result.get('error')}"
+    if name == "fetch_chord_sheet":
+        lines = result.get("lines")
+        n = len(lines) if isinstance(lines, list) else "?"
+        key = result.get("declaredKey") or result.get("key") or "?"
+        return f"fetched {tool_input.get('url', '?')} → {n} lines, key={key}"
+    if name == "analyze_audio_window":
+        chords = result.get("chords") or []
+        return (
+            f"analyzed {tool_input.get('start_seconds')}–{tool_input.get('end_seconds')}s "
+            f"→ {len(chords)} chord segment(s), bpm={result.get('bpm')}"
+        )
+    return f"{name} ok"
 
 
 def fetch_chord_sheet(url: str, source_id: str = "agent-1") -> dict:
@@ -155,6 +184,9 @@ class AnthropicAgentProvider(LLMProvider):
 
     # engine.py injects the structured inputs (incl. audio_path) here before complete()
     context: dict | None = None
+    # engine.py injects the run's trace recorder here so each model turn and
+    # tool call lands in the same timeline as the engine's inputs/repair steps.
+    trace: TraceRecorder | None = None
 
     def __init__(self) -> None:
         # The real Anthropic-format conversation, including tool_use/tool_result
@@ -172,6 +204,7 @@ class AnthropicAgentProvider(LLMProvider):
     def _build_first_user_message(self) -> dict:
         ctx = self.context or {}
         mir = ctx.get("mir")
+        depth = ctx.get("depth")
         payload = {
             "songId": ctx.get("song_id"),
             "title": ctx.get("title"),
@@ -182,6 +215,22 @@ class AnthropicAgentProvider(LLMProvider):
             "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
             "songSchema": ctx.get("song_schema"),
         }
+        if depth is not None:
+            payload["toolBudget"] = {
+                "webSearch": depth.max_web_search,
+                "pageFetch": depth.max_fetch,
+                "audioWindow": depth.max_windows,
+            }
+            if depth.time_align:
+                payload["fillSyncMap"] = (
+                    "Thorough analysis: also populate audio.syncMap (lineIndex -> "
+                    "seconds) from the MIR section boundaries and beat grid, at "
+                    "least one entry per section. Times must be non-decreasing."
+                )
+        if ctx.get("prior_song") is not None:
+            payload["priorHumanEditedSong"] = ctx["prior_song"]
+        if ctx.get("guidance"):
+            payload["humanCorrectionNotes"] = ctx["guidance"]
         return {"role": "user", "content": json.dumps(payload)}
 
     def _run_tool(self, block) -> dict:
@@ -200,6 +249,12 @@ class AnthropicAgentProvider(LLMProvider):
         else:
             result = {"error": f"unknown tool {name!r}"}
         is_error = isinstance(result, dict) and "error" in result
+        if self.trace is not None:
+            self.trace.step(
+                "tool", f"tool:{name}",
+                _tool_summary(name, tool_input, result, is_error),
+                detail={"tool": name, "input": tool_input, "result": result},
+            )
         tool_result: dict = {
             "type": "tool_result",
             "tool_use_id": block.id,
@@ -217,6 +272,14 @@ class AnthropicAgentProvider(LLMProvider):
 
         # explicit model arg -> SNOOCLE_LLM_MODEL -> SNOOCLE_ANTHROPIC_AGENT_MODEL
         resolved_model = model or settings.llm_model or settings.anthropic_agent_model
+
+        # Depth profile (injected by the engine) sets effort + the tool budget;
+        # fall back to the server defaults when absent.
+        depth = (self.context or {}).get("depth")
+        effort = depth.effort if depth is not None else settings.anthropic_agent_effort
+        tools = (
+            _build_tools(depth.max_web_search, depth.max_fetch) if depth is not None else TOOLS
+        )
 
         if len(turns) == 1:
             # First attempt: build a fresh conversation from the injected context.
@@ -237,14 +300,14 @@ class AnthropicAgentProvider(LLMProvider):
                 model=resolved_model,
                 max_tokens=16000,
                 thinking={"type": "adaptive"},
-                # medium effort keeps tool use consolidated — the dominant
-                # wall-clock lever for this loop (see config).
-                output_config={"effort": settings.anthropic_agent_effort},
+                # effort is the dominant wall-clock lever for this loop; the
+                # analysis-depth profile sets it (see reconcile/depth.py).
+                output_config={"effort": effort},
                 # auto-cache the latest prefix so each turn reuses the whole
                 # prior conversation (system block carries its own breakpoint).
                 cache_control={"type": "ephemeral"},
                 system=SYSTEM_BLOCKS,
-                tools=TOOLS,
+                tools=tools,
                 # no temperature/top_p/top_k: sampling params are rejected here
                 messages=self._messages,
             )
@@ -253,13 +316,36 @@ class AnthropicAgentProvider(LLMProvider):
                 usage["input_tokens"] = usage.get("input_tokens", 0) + (getattr(u, "input_tokens", 0) or 0)
                 usage["output_tokens"] = usage.get("output_tokens", 0) + (getattr(u, "output_tokens", 0) or 0)
             tool_names = [b.name for b in response.content if getattr(b, "type", "") == "tool_use"]
+            turn_dur = time.monotonic() - turn_start
             log.info(
                 "anthropic-agent turn=%d stop=%s tools=%s dur=%.1fs in=%s out=%s cached=%s",
                 turn, response.stop_reason, ",".join(tool_names) or "-",
-                time.monotonic() - turn_start,
+                turn_dur,
                 getattr(u, "input_tokens", "?"), getattr(u, "output_tokens", "?"),
                 getattr(u, "cache_read_input_tokens", "?"),
             )
+            if self.trace is not None:
+                thinking = "".join(
+                    getattr(b, "thinking", "") for b in response.content
+                    if getattr(b, "type", "") == "thinking"
+                )
+                self.trace.step(
+                    "model", f"turn-{turn}",
+                    (
+                        f"thinking + requested {', '.join(tool_names)}"
+                        if tool_names else f"stop={response.stop_reason}"
+                    ),
+                    detail={
+                        "turn": turn,
+                        "stopReason": response.stop_reason,
+                        "toolsRequested": tool_names,
+                        "reasoning": thinking[:2000] or None,
+                        "inputTokens": getattr(u, "input_tokens", None),
+                        "outputTokens": getattr(u, "output_tokens", None),
+                        "cachedInputTokens": getattr(u, "cache_read_input_tokens", None),
+                    },
+                    duration_seconds=turn_dur,
+                )
             if response.stop_reason == "refusal":
                 raise ProviderError("anthropic-agent: model refused the request")
             if response.stop_reason == "pause_turn":

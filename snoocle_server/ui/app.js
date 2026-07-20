@@ -911,7 +911,9 @@ function renderRunTrace(run) {
     badge, " ",
     document.createTextNode(
       "provider " + (run.provider || "?") + " · model " + (run.model || "?") +
-      " · depth " + (run.depth || "?") + " · " + (run.stepCount || 0) + " steps"),
+      " · depth " + (run.depth || "?") +
+      (run.configVersion ? " · config " + run.configVersion : "") +
+      " · " + (run.stepCount || 0) + " steps"),
   ]);
   body.appendChild(meta);
   if (run.error) body.appendChild(el("p", { class: "err" }, [run.error]));
@@ -1010,6 +1012,147 @@ async function scorecardModal() {
 }
 
 // ---------------------------------------------------------------------------
+// Workbench — program the reconciliation agent (instructions, tools, budgets)
+// ---------------------------------------------------------------------------
+
+async function workbenchModal() {
+  var backdrop = el("div", { class: "modal-backdrop" });
+  var bodyEl = el("div", {}, [el("p", { class: "muted" }, ["Loading…"])]);
+  var modal = el("div", { class: "modal", style: "width:640px" }, [
+    el("h2", {}, ["Agent workbench"]),
+    bodyEl,
+  ]);
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+
+  var r = await apiJson("/v1/config/agent");
+  clear(bodyEl);
+  if (r.status === 409) {
+    bodyEl.appendChild(el("p", { class: "err" }, [
+      "Editing the agent requires the server to have SNOOCLE_API_TOKEN set. " +
+        "It's off, so this is read-only.",
+    ]));
+    bodyEl.appendChild(el("div", { class: "actions" }, [
+      button("Close", "secondary", function () { backdrop.remove(); }),
+    ]));
+    return;
+  }
+  if (!r.ok) { bodyEl.textContent = "Failed to load config."; return; }
+
+  var cfg = r.body.config || {};
+  var def = r.body.defaults || {};
+
+  function ta(value, ph) {
+    return el("textarea", { placeholder: ph || "", style: "min-height:64px" }, [value || ""]);
+  }
+  var extra = ta(cfg.instructions_extra, "Extra rules appended to the prompt, e.g. 'Prefer open-position chords.'");
+  var theory = ta(cfg.theory_rules, def.theoryRules || "");
+  var recipe = ta(cfg.retrieval_recipe, def.retrievalRecipe || "");
+  var override = ta(cfg.instructions_override, "");
+
+  var effort = el("select", {}, ["", "low", "medium", "high"].map(function (e) {
+    return optionEl(e || "(default " + def.effort + ")", e, cfg.effort === e);
+  }));
+  var model = el("input", { type: "text", value: cfg.model || "", placeholder: def.model || "" });
+  var maxTurns = el("input", { type: "number", min: "1", max: "30", value: cfg.max_turns != null ? cfg.max_turns : "", placeholder: String(def.maxTurns) });
+  var budgets = def.budgets || {};
+  var web = el("input", { type: "number", min: "0", max: "10", value: cfg.max_web_search != null ? cfg.max_web_search : "", placeholder: String(budgets.maxWebSearch) });
+  var fetch_ = el("input", { type: "number", min: "0", max: "10", value: cfg.max_fetch != null ? cfg.max_fetch : "", placeholder: String(budgets.maxFetch) });
+  var windows = el("input", { type: "number", min: "0", max: "10", value: cfg.max_windows != null ? cfg.max_windows : "", placeholder: String(budgets.maxWindows) });
+
+  var disabled = cfg.disabled_tools || [];
+  var toolBoxes = (def.tools || []).map(function (name) {
+    var cb = el("input", { type: "checkbox" });
+    cb.checked = disabled.indexOf(name) === -1; // checked = enabled
+    return { name: name, cb: cb };
+  });
+
+  var status = el("div", { class: "muted", style: "margin-top:8px" }, [
+    "Version " + (r.body.configVersion || "?") + (r.body.isDefault ? " (built-in defaults)" : ""),
+  ]);
+
+  bodyEl.appendChild(el("p", { class: "muted" }, [
+    "Reshape how the agent works, then re-run a song from its Edit tab and " +
+      "watch the Agent tab. The output contract (strict Song schema, sounding-" +
+      "pitch chords, capo 0) is locked and always enforced.",
+  ]));
+  bodyEl.appendChild(el("label", {}, ["Extra instructions (appended)"]));
+  bodyEl.appendChild(extra);
+  bodyEl.appendChild(el("label", {}, ["Music-theory rules (replaces the default section)"]));
+  bodyEl.appendChild(theory);
+  bodyEl.appendChild(el("label", {}, ["Retrieval recipe (replaces the default section)"]));
+  bodyEl.appendChild(recipe);
+
+  bodyEl.appendChild(el("div", { class: "row" }, [
+    el("div", {}, [el("label", {}, ["Effort"]), effort]),
+    el("div", {}, [el("label", {}, ["Model"]), model]),
+    el("div", {}, [el("label", {}, ["Max turns"]), maxTurns]),
+  ]));
+  bodyEl.appendChild(el("div", { class: "row" }, [
+    el("div", {}, [el("label", {}, ["web_search budget"]), web]),
+    el("div", {}, [el("label", {}, ["fetch budget"]), fetch_]),
+    el("div", {}, [el("label", {}, ["audio-window budget"]), windows]),
+  ]));
+
+  bodyEl.appendChild(el("label", {}, ["Enabled tools"]));
+  var toolRow = el("div", { class: "row" }, toolBoxes.map(function (t) {
+    return el("label", { style: "display:flex;gap:6px;align-items:center" }, [t.cb, t.name]);
+  }));
+  bodyEl.appendChild(toolRow);
+
+  // Danger zone: full override + the locked contract, shown read-only
+  var dangerBody = el("div", {}, [
+    el("label", {}, ["Full prompt override (replaces everything except the locked contract)"]),
+    override,
+    el("label", {}, ["Locked output contract (always enforced — not editable)"]),
+    el("pre", { class: "detail", style: "white-space:pre-wrap" }, [def.lockedOutputContract || ""]),
+  ]);
+  var danger = el("details", { class: "step" }, [
+    el("summary", {}, [el("span", { class: "sum" }, ["⚠ Danger: full prompt override"])]),
+    dangerBody,
+  ]);
+  bodyEl.appendChild(danger);
+  bodyEl.appendChild(el("p", { class: "muted" }, [
+    "Note: the first run after saving re-pays the prompt cache (slightly more expensive).",
+  ]));
+  bodyEl.appendChild(status);
+
+  async function save() {
+    var payload = {
+      instructions_extra: extra.value.trim(),
+      theory_rules: theory.value.trim(),
+      retrieval_recipe: recipe.value.trim(),
+      instructions_override: override.value.trim(),
+      effort: effort.value || null,
+      model: model.value.trim() || null,
+      max_turns: maxTurns.value !== "" ? parseInt(maxTurns.value, 10) : null,
+      max_web_search: web.value !== "" ? parseInt(web.value, 10) : null,
+      max_fetch: fetch_.value !== "" ? parseInt(fetch_.value, 10) : null,
+      max_windows: windows.value !== "" ? parseInt(windows.value, 10) : null,
+      disabled_tools: toolBoxes.filter(function (t) { return !t.cb.checked; }).map(function (t) { return t.name; }),
+    };
+    var res = await apiJson("/v1/config/agent", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    if (res.ok) { status.className = "ok"; status.textContent = "Saved — version " + res.body.configVersion; }
+    else {
+      status.className = "err";
+      status.textContent = res.body && res.body.detail ? JSON.stringify(res.body.detail) : "Save failed";
+    }
+  }
+  async function reset() {
+    var res = await apiJson("/v1/config/agent", { method: "DELETE" });
+    if (res.ok) { backdrop.remove(); workbenchModal(); }
+  }
+
+  bodyEl.appendChild(el("div", { class: "actions" }, [
+    button("Reset to defaults", "secondary", reset),
+    button("Cancel", "secondary", function () { backdrop.remove(); }),
+    button("Save", "", save),
+  ]));
+}
+
+// ---------------------------------------------------------------------------
 // Wire up
 // ---------------------------------------------------------------------------
 
@@ -1017,6 +1160,7 @@ function init() {
   document.getElementById("add-song-btn").addEventListener("click", addSongModal);
   document.getElementById("refresh-btn").addEventListener("click", loadSongList);
   document.getElementById("scorecard-btn").addEventListener("click", scorecardModal);
+  document.getElementById("workbench-btn").addEventListener("click", workbenchModal);
   Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
     b.addEventListener("click", function () { selectTab(b.getAttribute("data-tab")); });
   });

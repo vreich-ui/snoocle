@@ -27,10 +27,16 @@ from .trace import TraceRecorder
 log = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """\
-You are an expert music transcriber. Your job is to produce one Snoocle Song \
-JSON object that faithfully captures a song's chords, lyrics, and sections.
+# The system prompt is assembled from named sections so an operator's AgentConfig
+# can swap the theory-rules / retrieval-recipe sections, append extra rules, or
+# (dangerously) replace the whole base — while _OUTPUT_CONTRACT is ALWAYS
+# appended and never editable (schema validation is the real guardrail).
 
+_PROMPT_ROLE = """\
+You are an expert music transcriber. Your job is to produce one Snoocle Song \
+JSON object that faithfully captures a song's chords, lyrics, and sections."""
+
+_PROMPT_EVIDENCE = """\
 Evidence rules:
 - The MIR chord timeline (derived from the ACTUAL audio recording) is the \
 primary evidence for each chord's ROOT and its major/minor QUALITY.
@@ -38,19 +44,22 @@ primary evidence for each chord's ROOT and its major/minor QUALITY.
 lyrics, section structure, and chord EXTENSIONS (7ths, 9ths, sus, add).
 - A source that declares a capo is written N semitones BELOW sounding pitch. \
 Transpose it up N semitones before comparing it to the audio or to other \
-sources.
+sources."""
 
+_PROMPT_THEORY = """\
 Music theory:
 - Prefer chord readings that are diatonic to the established key, or that are \
 classically explainable (secondary dominants, borrowed iv or bVII, the \
 relative major/minor). When the audio is ambiguous, let theory break the tie.
-- Spell enharmonics according to the key signature: F#m in A major, never Gbm.
+- Spell enharmonics according to the key signature: F#m in A major, never Gbm."""
 
+_PROMPT_CHORD_RULE = """\
 Hard chord rule:
 - Every chord symbol you emit is the SOUNDING harmony. NEVER write fretboard \
 shapes or tab fingerings, and NEVER bake a capo into the chord names. \
-displayPreferences.capo MUST be 0.
+displayPreferences.capo MUST be 0."""
 
+_PROMPT_RECIPE = """\
 Retrieval recipe (follow it; do not improvise a research plan):
 1. Read the provided candidates and MIR timeline FIRST. If two or more \
 candidates agree with each other and with the MIR timeline on the key and \
@@ -61,26 +70,46 @@ on each (never web_fetch a chord page — fetch_chord_sheet parses and \
 capo-normalizes in one step).
 3. At most ONE more web_search, only if the lyrics are still incomplete.
 4. Call `analyze_audio_window` only when text sources disagree about a \
-specific passage AND the provided MIR timeline does not cover it.
+specific passage AND the provided MIR timeline does not cover it."""
 
+_PROMPT_BUDGET = """\
 Hard budget: at most 2 web_search calls, 4 page fetches, and 2 \
 analyze_audio_window calls per song. Disagreements are settled by the MIR \
 timeline and music theory — NOT by more searching. When you have enough \
 information to act, act: produce the Song instead of continuing to verify. \
-Two agreeing sources plus the provided MIR is always enough.
+Two agreeing sources plus the provided MIR is always enough."""
 
+# NON-EDITABLE. Always the last section of the system prompt.
+_OUTPUT_CONTRACT = """\
 Output contract:
 - Your FINAL message must be EXACTLY ONE JSON object — the Song — that \
 validates against the provided songSchema. No markdown fences, no commentary, \
 no prose before or after. The schema is strict: only its keys are allowed. \
-Set id, title, artist, and youtubeVideoId from the request.
-"""
+Set id, title, artist, and youtubeVideoId from the request."""
 
-# The system block is stable across loop turns and repair rounds; caching it
-# lets every subsequent request reuse the prefix.
-SYSTEM_BLOCKS = [
-    {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
-]
+
+def build_system_blocks(cfg=None) -> list[dict]:
+    """Assemble the cached system block from the default sections plus any
+    operator overrides in ``cfg`` (an AgentConfig). ``_OUTPUT_CONTRACT`` is
+    always appended last, regardless of overrides."""
+    if cfg is not None and cfg.instructions_override:
+        base = cfg.instructions_override
+    else:
+        theory = (cfg.theory_rules if cfg and cfg.theory_rules else _PROMPT_THEORY)
+        recipe = (cfg.retrieval_recipe if cfg and cfg.retrieval_recipe else _PROMPT_RECIPE)
+        base = "\n\n".join(
+            [_PROMPT_ROLE, _PROMPT_EVIDENCE, theory, _PROMPT_CHORD_RULE, recipe, _PROMPT_BUDGET]
+        )
+    parts = [base]
+    if cfg is not None and cfg.instructions_extra:
+        parts.append(cfg.instructions_extra)
+    parts.append(_OUTPUT_CONTRACT)  # always, never editable
+    return [{"type": "text", "text": "\n\n".join(parts), "cache_control": {"type": "ephemeral"}}]
+
+
+# Backward-compatible defaults (no config): the original prompt + block.
+SYSTEM_BLOCKS = build_system_blocks(None)
+SYSTEM_PROMPT = SYSTEM_BLOCKS[0]["text"]
 
 _FETCH_TOOL = {
     "name": "fetch_chord_sheet",
@@ -94,14 +123,17 @@ _WINDOW_TOOL = {
 }
 
 
-def _build_tools(max_web_search: int, max_fetch: int) -> list[dict]:
-    """Tools with the server-tool budget set by the analysis-depth profile."""
-    return [
+def _build_tools(max_web_search: int, max_fetch: int, disabled=frozenset()) -> list[dict]:
+    """Tools with the server-tool budget set by the analysis-depth profile;
+    any tool named in ``disabled`` (an operator AgentConfig) is omitted — an
+    undeclared tool simply cannot be called."""
+    candidates = [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": max_web_search},
         {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": max_fetch},
         _FETCH_TOOL,
         _WINDOW_TOOL,
     ]
+    return [t for t in candidates if t["name"] not in disabled]
 
 
 # Default budget (used when no depth profile is injected) mirrors "standard".
@@ -221,18 +253,14 @@ class AnthropicAgentProvider(LLMProvider):
             "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
             "songSchema": ctx.get("song_schema"),
         }
-        if depth is not None:
-            payload["toolBudget"] = {
-                "webSearch": depth.max_web_search,
-                "pageFetch": depth.max_fetch,
-                "audioWindow": depth.max_windows,
-            }
-            if depth.time_align:
-                payload["fillSyncMap"] = (
-                    "Thorough analysis: also populate audio.syncMap (lineIndex -> "
-                    "seconds) from the MIR section boundaries and beat grid, at "
-                    "least one entry per section. Times must be non-decreasing."
-                )
+        if getattr(self, "_effective_budget", None):
+            payload["toolBudget"] = self._effective_budget
+        if depth is not None and depth.time_align:
+            payload["fillSyncMap"] = (
+                "Thorough analysis: also populate audio.syncMap (lineIndex -> "
+                "seconds) from the MIR section boundaries and beat grid, at "
+                "least one entry per section. Times must be non-decreasing."
+            )
         if ctx.get("prior_song") is not None:
             payload["priorHumanEditedSong"] = ctx["prior_song"]
         if ctx.get("guidance"):
@@ -287,16 +315,35 @@ class AnthropicAgentProvider(LLMProvider):
         if not self.context:
             raise ProviderError("anthropic-agent provider requires engine-injected context")
 
-        # explicit model arg -> SNOOCLE_LLM_MODEL -> SNOOCLE_ANTHROPIC_AGENT_MODEL
-        resolved_model = model or settings.llm_model or settings.anthropic_agent_model
-
-        # Depth profile (injected by the engine) sets effort + the tool budget;
-        # fall back to the server defaults when absent.
+        # Precedence for every knob: explicit request > operator AgentConfig >
+        # analysis-depth profile > server default.
+        cfg = (self.context or {}).get("agent_config")
         depth = (self.context or {}).get("depth")
-        effort = depth.effort if depth is not None else settings.anthropic_agent_effort
-        tools = (
-            _build_tools(depth.max_web_search, depth.max_fetch) if depth is not None else TOOLS
+
+        def _pick(cfg_val, depth_attr, default):
+            if cfg_val is not None:
+                return cfg_val
+            if depth is not None:
+                return getattr(depth, depth_attr)
+            return default
+
+        resolved_model = (
+            model or (cfg.model if cfg else None)
+            or settings.llm_model or settings.anthropic_agent_model
         )
+        effort = (
+            (cfg.effort if cfg else None) or (depth.effort if depth is not None else None)
+            or settings.anthropic_agent_effort
+        )
+        max_turns = (cfg.max_turns if cfg else None) or settings.anthropic_agent_max_turns
+        web = _pick(cfg.max_web_search if cfg else None, "max_web_search", 2)
+        fetch = _pick(cfg.max_fetch if cfg else None, "max_fetch", 3)
+        windows = _pick(cfg.max_windows if cfg else None, "max_windows", 2)
+        disabled = frozenset(cfg.disabled_tools) if cfg else frozenset()
+        tools = _build_tools(web, fetch, disabled)
+        system_blocks = build_system_blocks(cfg)
+        # Budget the first user message advertises to the model (see _build...).
+        self._effective_budget = {"webSearch": web, "pageFetch": fetch, "audioWindow": windows}
 
         if len(turns) == 1:
             # First attempt: build a fresh conversation from the injected context.
@@ -311,7 +358,7 @@ class AnthropicAgentProvider(LLMProvider):
         client = self._create_client()
         usage: dict = {}
         response = None
-        for turn in range(1, settings.anthropic_agent_max_turns + 1):
+        for turn in range(1, max_turns + 1):
             turn_start = time.monotonic()
             response = client.messages.create(
                 model=resolved_model,
@@ -323,7 +370,7 @@ class AnthropicAgentProvider(LLMProvider):
                 # auto-cache the latest prefix so each turn reuses the whole
                 # prior conversation (system block carries its own breakpoint).
                 cache_control={"type": "ephemeral"},
-                system=SYSTEM_BLOCKS,
+                system=system_blocks,
                 tools=tools,
                 # no temperature/top_p/top_k: sampling params are rejected here
                 messages=self._messages,

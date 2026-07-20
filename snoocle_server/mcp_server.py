@@ -42,6 +42,12 @@ from .reconcile import provider_capabilities, reconcile as _reconcile
 from .schema import Song, song_json_schema
 from .store import backend_label as _store_backend_label
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 mcp = FastMCP(
     "snoocle",
     instructions=(
@@ -368,6 +374,125 @@ def get_song_schema() -> dict:
     """The Song JSON schema every produced document conforms to (iOS SongStore
     compatible), including the sounding-harmony chord rule."""
     return song_json_schema()
+
+
+# --- agent programming & observability ---------------------------------------
+# Program the in-process reconciliation agent and inspect its work. Config
+# writes are gated by the SAME SNOOCLE_API_TOKEN as everything else (see
+# authz.require_admin_token_configured) — a write on an unauthenticated service
+# is refused. The Song OUTPUT CONTRACT (strict schema, sounding-pitch chords,
+# capo=0) is NOT programmable: it is always enforced by the reconcile engine.
+
+
+@mcp.tool()
+def get_agent_config() -> dict:
+    """Read the runtime-editable agent config (instructions, tool budgets,
+    effort, model) plus the built-in defaults it overrides. Empty config means
+    the agent runs with its built-in behavior."""
+    from .reconcile.agent_config import AgentConfig, config_version
+    from .store.agent_config import get_agent_config_store
+
+    doc = get_agent_config_store().get()
+    cfg = AgentConfig.model_validate(doc) if doc else AgentConfig()
+    return {"config": cfg.model_dump(), "configVersion": config_version(cfg),
+            "isDefault": cfg.is_default()}
+
+
+@mcp.tool()
+def set_agent_config(config_json: str) -> dict:
+    """Program the agent: set instructions_extra / theory_rules /
+    retrieval_recipe / instructions_override (all optional), max_turns, effort,
+    max_web_search / max_fetch / max_windows, disabled_tools, model. The output
+    contract and schema enforcement are NOT editable. Requires SNOOCLE_API_TOKEN
+    to be configured on the server."""
+    import json as _json
+
+    from .authz import require_admin_token_configured
+    from .reconcile.agent_config import AgentConfig, config_version
+    from .store.agent_config import get_agent_config_store
+
+    require_admin_token_configured()
+    cfg = AgentConfig.model_validate(_json.loads(config_json))
+    doc = cfg.model_dump()
+    doc["updated_at"] = _now_iso()
+    doc["source"] = "mcp"
+    get_agent_config_store().set(doc)
+    return {"status": "stored", "configVersion": config_version(cfg), "updatedAt": doc["updated_at"]}
+
+
+@mcp.tool()
+def reset_agent_config() -> dict:
+    """Clear the agent config back to built-in defaults. Requires
+    SNOOCLE_API_TOKEN."""
+    from .authz import require_admin_token_configured
+    from .store.agent_config import get_agent_config_store
+
+    require_admin_token_configured()
+    get_agent_config_store().clear()
+    return {"status": "reset"}
+
+
+@mcp.tool()
+def list_song_runs(song_id: str, limit: int = 20) -> dict:
+    """Recent reconciliation runs for a song, newest first (summaries only —
+    fetch a run's steps/MIR with get_run)."""
+    from .store.runs import get_run_store
+
+    return {"songId": song_id, "runs": get_run_store().list_runs(song_id, limit=limit)}
+
+
+@mcp.tool()
+def get_run(run_id: str) -> dict:
+    """One reconciliation run's full step trace + MIR — the agent's reasoning,
+    tool calls, and repair rounds."""
+    from .store.runs import fetch_run
+
+    run = fetch_run(run_id)
+    if run is None:
+        return {"error": f"no such run: {run_id}"}
+    return run
+
+
+@mcp.tool()
+def get_scorecard() -> dict:
+    """Score every gold-marked song's current version against its gold — the
+    agent's report card (content metrics + aggregate)."""
+    from .eval.scorecard import build_scorecard
+
+    return build_scorecard(get_store())
+
+
+@mcp.tool()
+def set_gold_version(song_id: str, version: str) -> dict:
+    """Mark one of a song's stored versions as the ground-truth 'gold' the agent
+    is scored against."""
+    from .store.evals import get_eval_store
+
+    try:
+        get_store().get(song_id, version=version)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+    get_eval_store().set_gold(song_id, version)
+    return {"songId": song_id, "goldVersion": version}
+
+
+@mcp.tool()
+def score_song_version(song_id: str, candidate_version: str | None = None) -> dict:
+    """Score a candidate version (default: current) against the song's gold."""
+    from .eval import score_song
+    from .store.evals import get_eval_store
+
+    gold_version = get_eval_store().get_gold(song_id)
+    if not gold_version:
+        return {"error": f"no gold version set for {song_id}"}
+    try:
+        gold = get_store().get(song_id, version=gold_version)
+        cand = get_store().get(song_id, version=candidate_version)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+    return {"songId": song_id, "goldVersion": gold_version,
+            "candidateVersion": candidate_version or get_store().current_version(song_id),
+            "metrics": score_song(cand, gold)}
 
 
 _LOCALHOST_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]

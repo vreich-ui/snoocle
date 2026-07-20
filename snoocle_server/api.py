@@ -502,6 +502,123 @@ def get_song_runs(song_id: str) -> dict:
     return {"songId": song_id, "runs": runs}
 
 
+# --- evaluation: score the agent against human-approved gold versions --------
+
+
+class GoldRequest(BaseModel):
+    version: str
+
+
+def _run_process_metrics(song_id: str) -> dict:
+    """Process metrics (cost/effort/latency) from the song's latest run trace."""
+    from .store.runs import get_run_store
+
+    store = get_run_store()
+    summaries = store.list_runs(song_id, limit=1)
+    if not summaries:
+        return {}
+    run = store.get_run(summaries[0]["runId"]) or {}
+    steps = run.get("steps") or []
+    repairs = sum(1 for s in steps if s.get("kind") == "repair")
+    tool_calls = sum(1 for s in steps if s.get("kind") == "tool")
+    final = next((s for s in steps if s.get("kind") == "final"), {})
+    usage = (final.get("detail") or {}).get("usage") or {}
+    return {
+        "runId": run.get("runId"),
+        "depth": run.get("depth"),
+        "model": run.get("model"),
+        "firstPassValid": repairs == 0,
+        "attempts": repairs + 1,
+        "toolCalls": tool_calls,
+        "inputTokens": usage.get("input_tokens"),
+        "outputTokens": usage.get("output_tokens"),
+    }
+
+
+@app.put("/v1/songs/{song_id}/gold")
+def put_gold(song_id: str, req: GoldRequest) -> dict:
+    """Mark one of a song's versions as the ground-truth 'gold' for eval."""
+    from .store.evals import get_eval_store
+
+    # the version must exist for this song
+    try:
+        get_store().get(song_id, version=req.version)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    get_eval_store().set_gold(song_id, req.version)
+    return {"songId": song_id, "goldVersion": req.version}
+
+
+@app.get("/v1/songs/{song_id}/gold")
+def get_gold(song_id: str) -> dict:
+    from .store.evals import get_eval_store
+
+    return {"songId": song_id, "goldVersion": get_eval_store().get_gold(song_id)}
+
+
+@app.get("/v1/songs/{song_id}/score")
+def get_score(song_id: str, candidate: Optional[str] = None) -> dict:
+    """Score a candidate version (default: current) against the song's gold."""
+    from .eval import score_song
+    from .store.evals import get_eval_store
+
+    gold_version = get_eval_store().get_gold(song_id)
+    if not gold_version:
+        raise HTTPException(status_code=400, detail=f"no gold version set for {song_id}")
+    store = get_store()
+    try:
+        gold = store.get(song_id, version=gold_version)
+        cand = store.get(song_id, version=candidate)  # None -> current
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return {
+        "songId": song_id,
+        "goldVersion": gold_version,
+        "candidateVersion": candidate or store.current_version(song_id),
+        "metrics": score_song(cand, gold),
+    }
+
+
+@app.get("/v1/eval/scorecard")
+def get_scorecard() -> dict:
+    """Score every gold-marked song's current version against its gold, and
+    attach the latest run's process metrics. The agent's report card."""
+    from .eval import score_song
+    from .store.evals import get_eval_store
+
+    store = get_store()
+    rows = []
+    for rec in get_eval_store().list_gold():
+        song_id = rec["songId"]
+        gold_version = rec.get("goldVersion")
+        try:
+            gold = store.get(song_id, version=gold_version)
+            cand = store.get(song_id)  # current
+        except StoreError:
+            continue
+        rows.append({
+            "songId": song_id,
+            "goldVersion": gold_version,
+            "currentVersion": store.current_version(song_id),
+            "metrics": score_song(cand, gold),
+            "process": _run_process_metrics(song_id),
+        })
+    rows.sort(key=lambda r: r["metrics"]["overall"])
+    aggregate = _aggregate_scores([r["metrics"] for r in rows])
+    return {"count": len(rows), "aggregate": aggregate, "songs": rows}
+
+
+def _aggregate_scores(metrics: list[dict]) -> dict:
+    if not metrics:
+        return {}
+    keys = ["chordSimilarity", "chordRootSimilarity", "lyricSimilarity",
+            "sectionSimilarity", "overall"]
+    out = {k: round(sum(m[k] for m in metrics) / len(metrics), 4) for k in keys}
+    timings = [m["timingMAE"] for m in metrics if m.get("timingMAE") is not None]
+    out["timingMAE"] = round(sum(timings) / len(timings), 3) if timings else None
+    return out
+
+
 # --- step 7: versioned store -------------------------------------------------
 
 

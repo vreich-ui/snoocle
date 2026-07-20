@@ -549,12 +549,17 @@ async function saveSong() {
 // Versions tab
 // ---------------------------------------------------------------------------
 
-function renderVersionsTab(versions) {
+async function renderVersionsTab(versions) {
   var panel = document.getElementById("tab-versions");
   clear(panel);
   var selected = [];
 
   var diffPre = el("pre", { class: "diff" }, ["Select two versions to diff."]);
+
+  // current gold pointer for this song (drives the ★ marker + score readout)
+  var goldRes = await apiJson("/v1/songs/" + encodeURIComponent(state.songId) + "/gold");
+  var goldVersion = (goldRes.ok && goldRes.body.goldVersion) || null;
+  var scoreLine = el("div", { class: "muted", style: "margin:8px 0" }, []);
 
   var tbody = el("tbody", {}, []);
   versions.forEach(function (v) {
@@ -564,22 +569,55 @@ function renderVersionsTab(versions) {
       else selected = selected.filter(function (x) { return x !== v.version; });
       if (selected.length === 2) showDiff(selected[0], selected[1], diffPre);
     });
+    var isGold = v.version === goldVersion;
+    var goldBtn = button(isGold ? "★ gold" : "set gold", "secondary", function () {
+      setGold(v.version);
+    });
     tbody.appendChild(el("tr", {}, [
       el("td", {}, [cb]),
-      el("td", { class: "mono" }, [v.version]),
+      el("td", { class: "mono" }, [(isGold ? "★ " : "") + v.version]),
       el("td", {}, [v.timestamp || ""]),
       el("td", {}, [v.message || ""]),
+      el("td", {}, [goldBtn]),
     ]));
   });
 
-  panel.appendChild(el("p", { class: "muted" }, ["Tick two versions to see their diff."]));
+  panel.appendChild(el("p", { class: "muted" }, [
+    "Tick two versions to diff. Mark a human-approved version as ★ gold to " +
+      "score the agent against it.",
+  ]));
+  panel.appendChild(scoreLine);
   panel.appendChild(el("table", {}, [
     el("thead", {}, [el("tr", {}, [
-      el("th", {}, [""]), el("th", {}, ["Version"]), el("th", {}, ["When"]), el("th", {}, ["Message"]),
+      el("th", {}, [""]), el("th", {}, ["Version"]), el("th", {}, ["When"]),
+      el("th", {}, ["Message"]), el("th", {}, ["Gold"]),
     ])]),
     tbody,
   ]));
   panel.appendChild(diffPre);
+
+  // if gold is set, show how the current version scores against it
+  if (goldVersion) {
+    var sc = await apiJson("/v1/songs/" + encodeURIComponent(state.songId) + "/score");
+    if (sc.ok) {
+      var m = sc.body.metrics;
+      scoreLine.textContent =
+        "Current vs gold — overall " + m.overall +
+        " · chords " + m.chordSimilarity +
+        " · lyrics " + m.lyricSimilarity +
+        " · sections " + m.sectionSimilarity +
+        (m.timingMAE != null ? " · timing ±" + m.timingMAE + "s" : "");
+    }
+  }
+}
+
+async function setGold(version) {
+  var r = await apiJson("/v1/songs/" + encodeURIComponent(state.songId) + "/gold", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version: version }),
+  });
+  if (r.ok) openSong(state.songId); // re-render versions with the new gold marker
 }
 
 async function showDiff(a, b, pre) {
@@ -759,12 +797,73 @@ function watchRun(runId) {
 }
 
 // ---------------------------------------------------------------------------
+// Scorecard — how the agent scores across every gold-marked song
+// ---------------------------------------------------------------------------
+
+async function scorecardModal() {
+  var backdrop = el("div", { class: "modal-backdrop" });
+  var bodyEl = el("div", {}, [el("p", { class: "muted" }, ["Scoring…"])]);
+  var modal = el("div", { class: "modal", style: "width:720px" }, [
+    el("h2", {}, ["Agent scorecard"]),
+    el("p", { class: "muted" }, [
+      "Every song with a ★ gold version, scored: the current version against " +
+        "its gold. Lower overall = more room to teach the agent.",
+    ]),
+    bodyEl,
+    el("div", { class: "actions" }, [button("Close", "secondary", function () { backdrop.remove(); })]),
+  ]);
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+
+  var r = await apiJson("/v1/eval/scorecard");
+  clear(bodyEl);
+  if (!r.ok || !r.body.count) {
+    bodyEl.appendChild(el("p", { class: "muted" }, [
+      "No gold versions marked yet. Open a song → Versions → 'set gold' on a " +
+        "human-approved version.",
+    ]));
+    return;
+  }
+  var agg = r.body.aggregate || {};
+  bodyEl.appendChild(el("p", {}, [
+    el("strong", {}, ["Aggregate (" + r.body.count + " songs): "]),
+    "overall " + agg.overall + " · chords " + agg.chordSimilarity +
+      " · lyrics " + agg.lyricSimilarity + " · sections " + agg.sectionSimilarity +
+      (agg.timingMAE != null ? " · timing ±" + agg.timingMAE + "s" : ""),
+  ]));
+  var tbody = el("tbody", {}, []);
+  r.body.songs.forEach(function (row) {
+    var m = row.metrics, p = row.process || {};
+    var open = button("open", "secondary", function () { backdrop.remove(); openSong(row.songId); });
+    tbody.appendChild(el("tr", {}, [
+      el("td", { class: "mono" }, [row.songId]),
+      el("td", {}, [String(m.overall)]),
+      el("td", {}, [String(m.chordSimilarity)]),
+      el("td", {}, [String(m.lyricSimilarity)]),
+      el("td", {}, [String(m.sectionSimilarity)]),
+      el("td", {}, [p.firstPassValid == null ? "" : (p.firstPassValid ? "1st-pass" : (p.attempts + " tries"))]),
+      el("td", {}, [p.toolCalls != null ? (p.toolCalls + " tools") : ""]),
+      el("td", {}, [open]),
+    ]));
+  });
+  bodyEl.appendChild(el("table", {}, [
+    el("thead", {}, [el("tr", {}, [
+      el("th", {}, ["Song"]), el("th", {}, ["Overall"]), el("th", {}, ["Chords"]),
+      el("th", {}, ["Lyrics"]), el("th", {}, ["Sections"]), el("th", {}, ["Validity"]),
+      el("th", {}, ["Effort"]), el("th", {}, [""]),
+    ])]),
+    tbody,
+  ]));
+}
+
+// ---------------------------------------------------------------------------
 // Wire up
 // ---------------------------------------------------------------------------
 
 function init() {
   document.getElementById("add-song-btn").addEventListener("click", addSongModal);
   document.getElementById("refresh-btn").addEventListener("click", loadSongList);
+  document.getElementById("scorecard-btn").addEventListener("click", scorecardModal);
   Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
     b.addEventListener("click", function () { selectTab(b.getAttribute("data-tab")); });
   });

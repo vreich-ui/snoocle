@@ -142,6 +142,25 @@ def test_youtube_auth_failure_gets_error_code_and_reason(monkeypatch):
     assert "[steps:" in body["detail"]
 
 
+def test_content_filter_failure_gets_error_code_and_reason(monkeypatch):
+    """A provider content-filter block surfaces as a clean errorCode + reason,
+    not a raw API 400."""
+    from snoocle_server.reconcile.providers import ContentFilterError
+
+    def fail(*a, **k):  # noqa: ANN001
+        raise ContentFilterError("anthropic-agent: output blocked by content-filtering policy")
+
+    monkeypatch.setattr(pipeline_mod, "reconcile", fail)
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "Get Back", "artist": "Corey Heuvel", "provider": "mock", "skipAudio": True},
+    )
+    assert r.status_code == 502
+    body = r.json()
+    assert body["errorCode"] == "content_filtered"
+    assert "content-filtering" in body["reason"] or "content filter" in body["reason"].lower()
+
+
 def test_non_auth_failures_have_no_error_code(monkeypatch):
     def fail(*a, **k):  # noqa: ANN001
         raise ReconcileError("provider exploded")

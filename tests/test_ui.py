@@ -42,6 +42,13 @@ def test_ui_static_assets_served():
     assert client.get("/ui/style.css").status_code == 200
 
 
+def test_ui_assets_revalidate_so_deploys_are_not_stale():
+    # no-cache => the browser revalidates each load (cheap 304 when unchanged),
+    # so a deploy shipping new app.js is never masked by a cached old one.
+    for path in ("/ui/", "/ui/app.js", "/ui/style.css"):
+        assert client.get(path).headers.get("cache-control") == "no-cache", path
+
+
 # --- auth: shell exempt, API gated -----------------------------------------
 
 

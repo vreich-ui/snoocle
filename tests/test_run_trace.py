@@ -122,6 +122,87 @@ def test_agent_trace_captures_turns_and_tool_calls(monkeypatch):
     assert tool_step.detail["tool"] == "analyze_audio_window"
 
 
+# --- MIR persistence: full timeline on the run, un-truncated ----------------
+
+
+def test_attach_mir_survives_truncation_but_step_details_do_not():
+    """A 200-segment chord timeline must persist whole on run.mir, while a
+    same-size list inside a step detail still hits the 50-item cap."""
+    from snoocle_server.mir.base import AnalyzedWindow, ChordSegment, MirAnalysis
+
+    chords = [ChordSegment(start=float(i), end=float(i + 1), chord="C") for i in range(200)]
+    mir = MirAnalysis(
+        engines={"chords": "chord-cnn-lstm"}, duration_seconds=200.0, key="C major",
+        chords=chords, analyzed_windows=[AnalyzedWindow(start=0.0, end=200.0)],
+    )
+    recorder = start_run("s--x", "anthropic-agent", "standard")
+    recorder.attach_mir(mir.to_run_payload())
+    recorder.step("inputs", "x", "y", detail={"chords": [{"chord": "C"} for _ in range(200)]})
+
+    d = recorder.trace.to_dict()
+    assert len(d["mir"]["chordTimeline"]) == 200          # full, un-truncated
+    assert d["mir"]["analyzedWindows"] == [{"start": 0.0, "end": 200.0}]
+    assert len(d["steps"][0]["detail"]["chords"]) == 50   # step detail still capped
+
+
+def test_agent_run_records_mir_window_with_clamped_span(monkeypatch):
+    """An analyze_audio_window probe lands on run.mirWindows. With no real audio
+    the tool errors, so patch it to return a window+chords like a real run."""
+    def _fake_window(audio_path, start_seconds, end_seconds):
+        return {"window": {"start": 5.0, "end": 15.0},
+                "chords": [{"start": 5.0, "end": 15.0, "chord": "G"}],
+                "beats": 20, "bpm": 100.0}
+
+    monkeypatch.setattr(agent_mod, "analyze_audio_window", _fake_window)
+    queue = [
+        _response("tool_use", [_tool_use("t1", "analyze_audio_window",
+                                         {"start_seconds": 5, "end_seconds": 15})]),
+        _response("end_turn", [_text(json.dumps(_SONG))]),
+    ]
+
+    class _Fake:
+        def __init__(self): self.messages = self
+        def create(self, **kwargs): return queue.pop(0)
+
+    monkeypatch.setattr(AnthropicAgentProvider, "_create_client", lambda self: _Fake())
+    recorder = start_run("the-beatles--let-it-be", "anthropic-agent", "standard")
+    reconcile(
+        "Let It Be", "The Beatles", candidates=[],
+        mir=MirAnalysis(engines={"chords": "t"}, duration_seconds=200.0, key="C major"),
+        provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4",
+        audio_path="/tmp/whatever.wav", trace=recorder,
+    )
+    windows = recorder.trace.mir_windows
+    assert len(windows) == 1
+    assert windows[0]["window"] == {"start": 5.0, "end": 15.0}
+    assert windows[0]["chords"][0]["chord"] == "G"
+
+
+def test_to_run_payload_caps_and_flags_truncation():
+    from snoocle_server.mir.base import ChordSegment, MirAnalysis
+
+    mir = MirAnalysis(
+        engines={"chords": "c"}, duration_seconds=300.0,
+        chords=[ChordSegment(start=float(i), end=float(i) + 1, chord="C") for i in range(5000)],
+    )
+    payload = mir.to_run_payload(max_chords=3000)
+    assert len(payload["chordTimeline"]) <= 3000
+    assert payload["truncated"] is True
+    # a normal-size song is untouched
+    small = MirAnalysis(engines={}, duration_seconds=200.0,
+                        chords=[ChordSegment(start=0.0, end=1.0, chord="C")])
+    assert small.to_run_payload()["truncated"] is False
+
+
+def test_run_summary_strips_mir_payloads():
+    from snoocle_server.store.runs import _summary
+
+    slim = _summary({"runId": "r", "songId": "s", "steps": [1], "mir": {"big": 1},
+                     "mirWindows": [1, 2], "status": "ok"})
+    assert "steps" not in slim and "mir" not in slim and "mirWindows" not in slim
+    assert slim["status"] == "ok"
+
+
 # --- run store round-trips --------------------------------------------------
 
 

@@ -111,9 +111,13 @@ chordrec falls back to beat-synchronous chroma templates.
 - **Anthropic default model** is `claude-opus-4-8` (current API docs);
   sampling params intentionally not sent (rejected on Opus 4.7+).
 - **Heavy MIR models:** madmom installed from git master and is the live
-  beat engine. Chord-CNN-LSTM and SongFormer need multi-GB checkpoints
-  (git-lfs) + torch; integrated via a documented external-runner contract
-  with honest librosa fallbacks, so the pipeline is always audio-grounded.
+  beat engine. Chord-CNN-LSTM ships its ~28 MB checkpoints in the upstream
+  repo — a plain `git clone` via `scripts/setup_chord_model.sh` is the
+  complete install (no git-lfs), plus CPU torch (`.[chordmodel]`); the
+  Docker image bakes it in and presets `SNOOCLE_CHORD_CNN_LSTM_DIR`.
+  SongFormer is the one needing multi-GB checkpoints (git-lfs) + torch.
+  Both are integrated via a documented external-runner contract with honest
+  librosa fallbacks, so the pipeline is always audio-grounded.
 
 ## Running
 

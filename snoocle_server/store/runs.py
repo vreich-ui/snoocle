@@ -87,9 +87,12 @@ class FirestoreRunRepository(RunRepository):
         return [_summary(r) for r in runs[:limit]]
 
 
+_LARGE_FIELDS = {"steps", "mir", "mirWindows"}
+
+
 def _summary(run: dict) -> dict:
-    """A run without its (potentially large) step list — for list views."""
-    return {k: v for k, v in run.items() if k != "steps"}
+    """A run without its large payloads (steps, MIR data) — for list views."""
+    return {k: v for k, v in run.items() if k not in _LARGE_FIELDS}
 
 
 _repo: RunRepository | None = None

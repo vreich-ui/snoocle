@@ -178,6 +178,12 @@ def reconcile(
         media_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
 
     if trace is not None:
+        # The FULL MIR snapshot rides on the run itself (un-truncated; the GUI
+        # timeline renders from it). The inputs step keeps only a compact
+        # summary — putting the whole timeline in a step detail would silently
+        # hit the 50-item truncation cap.
+        if mir is not None:
+            trace.attach_mir(mir.to_run_payload())
         trace.step(
             "inputs", "read-inputs",
             f"{len(candidates)} text source(s), "
@@ -187,7 +193,21 @@ def reconcile(
                 "provider": provider.name,
                 "depth": depth.name,
                 "candidateSources": [c.url or c.sourceId for c in candidates],
-                "mir": mir.to_prompt_payload() if mir is not None else None,
+                "mir": (
+                    {
+                        "engines": mir.engines,
+                        "estimatedKey": mir.key,
+                        "bpm": mir.bpm,
+                        "durationSeconds": mir.duration_seconds,
+                        "chordSegments": len(mir.chords),
+                        "beatCount": len(mir.beats),
+                        "analyzedWindows": [
+                            {"start": w.start, "end": w.end} for w in mir.analyzed_windows
+                        ],
+                    }
+                    if mir is not None
+                    else None
+                ),
                 "guidance": guidance,
             },
         )

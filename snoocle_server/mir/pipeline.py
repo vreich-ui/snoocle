@@ -10,7 +10,7 @@ from pathlib import Path
 from ..audio.utils import probe, to_analysis_wav, trim
 from ..chords import PITCH_CLASSES_SHARP, ChordParseError, parse_chord
 from ..config import settings
-from .base import Beat, ChordSegment, MirAnalysis
+from .base import AnalyzedWindow, Beat, ChordSegment, MirAnalysis
 from .beats import track_beats
 from .chordrec import recognize_chords
 from .structure import segment_structure
@@ -143,6 +143,7 @@ def _analyze_windows(
         beats=[Beat(time=t, position=p) for t, p in all_beats],
         chords=all_chords,
         sections=[],
+        analyzed_windows=[AnalyzedWindow(start=s, end=e) for s, e in windows],
     )
 
 
@@ -209,4 +210,7 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         beats=[Beat(time=t, position=p) for t, p in beats],
         chords=chord_segments,
         sections=sections,
+        # duration was already reduced to the cap when the clip was trimmed, so
+        # this honestly reports the analyzed span either way
+        analyzed_windows=[AnalyzedWindow(start=0.0, end=duration)],
     )

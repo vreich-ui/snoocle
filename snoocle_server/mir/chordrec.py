@@ -79,6 +79,29 @@ def _runner_path() -> Path | None:
     return None
 
 
+def chord_engine_id() -> str:
+    """The chord engine that will ACTUALLY run — checks the runner exists, not
+    just that the setting is set (a configured-but-empty dir silently falls
+    back, and health reporting must not claim otherwise)."""
+    return "chord-cnn-lstm" if _runner_path() is not None else "chroma-template-fallback"
+
+
+def chord_model_status() -> dict:
+    """Diagnosable health detail for the heavy chord model mount."""
+    d = settings.chord_cnn_lstm_dir
+    try:
+        import torch  # noqa: F401
+
+        torch_ok = True
+    except Exception:  # noqa: BLE001
+        torch_ok = False
+    return {
+        "dirConfigured": bool(d),
+        "runnerPresent": _runner_path() is not None,
+        "torchImportable": torch_ok,
+    }
+
+
 def recognize_chords_cnn_lstm(wav_path: str) -> list[ChordSegment]:
     runner = _runner_path()
     assert runner is not None

@@ -324,8 +324,11 @@ async def run_pipeline_async(
     except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
         recorder.finish("error", error=str(e)[:2000])
         _persist_trace(recorder)
+        # A classified provider error (e.g. content_filtered) carries its own
+        # code; otherwise fall back to any code an upstream step recorded.
+        code = getattr(e, "error_code", None) or report.error_code
         raise PipelineStepError(
-            "reconcile", str(e), steps=report.steps, error_code=report.error_code
+            "reconcile", str(e), steps=report.steps, error_code=code
         ) from e
     result = report.reconcile
     recorder.finish("ok", model=result.model)

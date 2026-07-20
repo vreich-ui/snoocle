@@ -28,7 +28,16 @@ log = logging.getLogger(__name__)
 
 
 class ProviderError(RuntimeError):
-    pass
+    # Optional machine-readable classification the pipeline surfaces to clients.
+    error_code: str | None = None
+
+
+class ContentFilterError(ProviderError):
+    """The model provider blocked the OUTPUT under its content-filtering policy
+    (e.g. a 400 from Anthropic). Distinct so the app can show an actionable
+    message rather than a raw API error."""
+
+    error_code = "content_filtered"
 
 
 @dataclass

@@ -21,7 +21,7 @@ from ..config import settings
 from ..discovery.fetch import extract_sheet_text, fetch_page
 from ..discovery.service import candidate_from_text
 from ..mir.pipeline import analyze_window
-from .providers import LLMProvider, LLMResponse, ProviderError
+from .providers import ContentFilterError, LLMProvider, LLMResponse, ProviderError
 from .trace import TraceRecorder
 
 log = logging.getLogger(__name__)
@@ -141,6 +141,25 @@ TOOLS = _build_tools(2, 3)
 
 # Cap for windowed on-demand analysis (seconds) — see the tool description.
 _MAX_WINDOW_SECONDS = 60.0
+
+
+def _classify_api_error(e: Exception) -> ProviderError:
+    """Turn a raw Anthropic SDK error into a clean, actionable ProviderError.
+
+    The content-filtering block (a 400 whose message names the policy) is the
+    common one for songs with no text sources — surface it as its own class so
+    the app can show a real message instead of a JSON dump."""
+    msg = str(e)
+    lowered = msg.lower()
+    if "content filtering" in lowered or "content_filter" in lowered:
+        return ContentFilterError(
+            "anthropic-agent: the reconciled output was blocked by Anthropic's "
+            "content-filtering policy for this song. This is most likely when no "
+            "chord/lyric sources were found and the model reproduces long verbatim "
+            "lyrics. Try re-running (the filter is not always deterministic), a "
+            "different source/upload, or a lower analysis depth."
+        )
+    return ProviderError(f"anthropic-agent: model API error: {msg}")
 
 
 def _tool_summary(name: str, tool_input: dict, result: dict, is_error: bool) -> str:
@@ -360,21 +379,24 @@ class AnthropicAgentProvider(LLMProvider):
         response = None
         for turn in range(1, max_turns + 1):
             turn_start = time.monotonic()
-            response = client.messages.create(
-                model=resolved_model,
-                max_tokens=16000,
-                thinking={"type": "adaptive"},
-                # effort is the dominant wall-clock lever for this loop; the
-                # analysis-depth profile sets it (see reconcile/depth.py).
-                output_config={"effort": effort},
-                # auto-cache the latest prefix so each turn reuses the whole
-                # prior conversation (system block carries its own breakpoint).
-                cache_control={"type": "ephemeral"},
-                system=system_blocks,
-                tools=tools,
-                # no temperature/top_p/top_k: sampling params are rejected here
-                messages=self._messages,
-            )
+            try:
+                response = client.messages.create(
+                    model=resolved_model,
+                    max_tokens=16000,
+                    thinking={"type": "adaptive"},
+                    # effort is the dominant wall-clock lever for this loop; the
+                    # analysis-depth profile sets it (see reconcile/depth.py).
+                    output_config={"effort": effort},
+                    # auto-cache the latest prefix so each turn reuses the whole
+                    # prior conversation (system block carries its own breakpoint).
+                    cache_control={"type": "ephemeral"},
+                    system=system_blocks,
+                    tools=tools,
+                    # no temperature/top_p/top_k: sampling params are rejected here
+                    messages=self._messages,
+                )
+            except Exception as e:  # noqa: BLE001 — classify API errors cleanly
+                raise _classify_api_error(e) from e
             u = getattr(response, "usage", None)
             if u is not None:
                 usage["input_tokens"] = usage.get("input_tokens", 0) + (getattr(u, "input_tokens", 0) or 0)

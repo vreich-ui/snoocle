@@ -260,6 +260,11 @@ _ERROR_REASONS = {
         "The server's reconciliation provider is misconfigured — retrying "
         "cannot succeed until the server settings are fixed (see detail)."
     ),
+    "content_filtered": (
+        "The model blocked its output under its content-filtering policy for "
+        "this song. Try again (it isn't always deterministic), a different "
+        "source/upload, or a lower analysis depth."
+    ),
 }
 
 
@@ -875,9 +880,24 @@ def root_redirect() -> RedirectResponse:
     return RedirectResponse("/ui/")
 
 
+class _RevalidatingStatic(StaticFiles):
+    """Serve the GUI shell with ``Cache-Control: no-cache`` so the browser
+    always revalidates against the ETag. Default StaticFiles sends no
+    Cache-Control, letting browsers heuristically cache app.js/style.css — which
+    means a deploy that ships new JS keeps running the OLD cached JS against the
+    new index.html (new buttons/tabs with no handlers) until a hard refresh.
+    ``no-cache`` makes each load a cheap 304 when unchanged and picks up fresh
+    assets immediately after a deploy."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app.mount(
     "/ui",
-    StaticFiles(directory=str(Path(__file__).parent / "ui"), html=True),
+    _RevalidatingStatic(directory=str(Path(__file__).parent / "ui"), html=True),
     name="ui",
 )
 

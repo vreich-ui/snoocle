@@ -162,7 +162,13 @@ def analyze_audio_window(audio_path: str | None, start_seconds: float, end_secon
             return {"error": "end_seconds must be greater than start_seconds"}
         end = min(end, start + _MAX_WINDOW_SECONDS)  # analyze_window clamps to track duration
         analysis = analyze_window(audio_path, start, end)
+        # Report the span that was ACTUALLY analyzed (post-clamp) so both the
+        # model and the run trace see the real coverage, not the request.
+        if analysis.analyzed_windows:
+            start = analysis.analyzed_windows[0].start
+            end = analysis.analyzed_windows[-1].end
         return {
+            "window": {"start": round(start, 2), "end": round(end, 2)},
             "chords": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}
                 for c in analysis.chords
@@ -255,6 +261,17 @@ class AnthropicAgentProvider(LLMProvider):
                 _tool_summary(name, tool_input, result, is_error),
                 detail={"tool": name, "input": tool_input, "result": result},
             )
+            if name == "analyze_audio_window" and not is_error:
+                # The probe also lands on the run's MIR record (un-truncated)
+                # so the GUI timeline can shade exactly what the agent examined.
+                self.trace.add_mir_window(
+                    {
+                        "window": result.get("window"),
+                        "chords": result.get("chords"),
+                        "bpm": result.get("bpm"),
+                        "beats": result.get("beats"),
+                    }
+                )
         tool_result: dict = {
             "type": "tool_result",
             "tool_use_id": block.id,

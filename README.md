@@ -56,7 +56,11 @@ Output must conform to the `Song` schema used by the Snoocle iOS app — `metada
 - Python 3.10
 - `ffmpeg` for audio format conversion/cropping
 - Docker recommended for `madmom` (native build quirks outside containerized environments)
-- Git LFS for model checkpoints
+- Git LFS only for SongFormer checkpoints (optional). Chord-CNN-LSTM needs no
+  LFS: `scripts/setup_chord_model.sh` clones its ~28 MB checkpoints, then
+  `pip install -e '.[chordmodel]' --extra-index-url https://download.pytorch.org/whl/cpu`
+  and `export SNOOCLE_CHORD_CNN_LSTM_DIR=$PWD/models/chord-cnn-lstm`
+  (the Docker image already bakes all of this in)
 - `.env` for API keys: Anthropic, OpenAI, Google (Gemini), and a YouTube-related key/tooling as needed — never commit this file
 
 ## Quickstart

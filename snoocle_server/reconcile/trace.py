@@ -76,6 +76,11 @@ class RunTrace:
     finished_at: str | None = None
     error: str | None = None
     steps: list[TraceStep] = field(default_factory=list)
+    # Full MIR snapshot for this run (MirAnalysis.to_run_payload()) — stored
+    # UN-truncated (the payload bounds itself), unlike step details.
+    mir: dict | None = None
+    # Every analyze_audio_window probe the agent made: {window, chords, bpm, beats}.
+    mir_windows: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +95,8 @@ class RunTrace:
             "error": self.error,
             "stepCount": len(self.steps),
             "steps": [s.to_dict() for s in self.steps],
+            "mir": self.mir,
+            "mirWindows": self.mir_windows,
         }
 
 
@@ -120,6 +127,18 @@ class TraceRecorder:
             self.trace.steps.append(step)
         _publish(self.trace)
         return step
+
+    def attach_mir(self, payload: dict) -> None:
+        """Attach the run's full MIR snapshot (already bounded — no truncation)."""
+        with self._lock:
+            self.trace.mir = payload
+        _publish(self.trace)
+
+    def add_mir_window(self, window: dict) -> None:
+        """Record one agent analyze_audio_window probe (window + its results)."""
+        with self._lock:
+            self.trace.mir_windows.append(window)
+        _publish(self.trace)
 
     def finish(self, status: str, model: str = "", error: str | None = None) -> None:
         with self._lock:

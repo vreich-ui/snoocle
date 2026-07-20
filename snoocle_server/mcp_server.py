@@ -347,14 +347,17 @@ def server_status() -> dict:
         except Exception:  # noqa: BLE001
             return False
 
+    from .mir.chordrec import chord_engine_id, chord_model_status
+
     return {
         "version": __version__,
         "ffmpeg": shutil.which(settings.ffmpeg_bin) is not None,
         "mirEngines": {
             "beats": "madmom" if has("madmom") else "librosa-fallback",
-            "chords": "chord-cnn-lstm" if settings.chord_cnn_lstm_dir else "chroma-template-fallback",
+            "chords": chord_engine_id(),
             "structure": "songformer" if settings.songformer_dir else "librosa-agglomerative-fallback",
         },
+        "chordModel": chord_model_status(),
         "llmProviders": provider_capabilities(),
         "store": _store_backend_label(),
     }

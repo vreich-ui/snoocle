@@ -32,6 +32,7 @@ from .discovery.search import SearchError
 from .mcp_server import mcp as _mcp
 from .mcp_server import resolve_http_transport as _resolve_mcp_security
 from .mir import MirAnalysis, analyze_audio
+from .mir.chordrec import chord_engine_id, chord_model_status
 from .pipeline import PipelineStepError, get_store, run_pipeline_async
 from .reconcile import (
     ReconcileResult,
@@ -193,9 +194,12 @@ def healthz() -> dict:
         },
         "mirEngines": {
             "beats": "madmom" if has("madmom") else "librosa-fallback",
-            "chords": "chord-cnn-lstm" if settings.chord_cnn_lstm_dir else "chroma-template-fallback",
+            "chords": chord_engine_id(),
             "structure": "songformer" if settings.songformer_dir else "librosa-agglomerative-fallback",
         },
+        # Why the chords engine is (or isn't) the heavy model — a configured
+        # dir with a missing runner shows up here instead of lying above.
+        "chordModel": chord_model_status(),
         "llmProviders": provider_capabilities(),
         # The provider a bare /v1/songs/analyze (no explicit "provider") will
         # use, and whether it can actually serve a request. `ready=false` means

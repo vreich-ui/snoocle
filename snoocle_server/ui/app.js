@@ -292,6 +292,7 @@ function optionEl(label, value, selected) {
 
 async function openSong(id) {
   if (id !== state.songId) { stopRunPoll(); state.activeRunId = null; state.runs = []; }
+  state.playMir = null; // always refetch — a re-run may have produced fresher MIR
   state.songId = id;
   document.getElementById("empty").classList.add("hidden");
   document.getElementById("tabs").style.display = "flex";
@@ -647,6 +648,12 @@ function renderPlayTab() {
     }, []));
   }
 
+  // MIR chord timeline from the latest successful analysis run — shows what
+  // the audio said and which spans were analyzed, alongside the video.
+  var mirSlot = el("div", {}, []);
+  panel.appendChild(mirSlot);
+  attachPlayMirTimeline(mirSlot);
+
   var sectionForLine = {};
   (song.sections || []).forEach(function (s) {
     if (s.startLineIndex != null) sectionForLine[s.startLineIndex] = s.name || s.kind || "";
@@ -669,6 +676,30 @@ function renderPlayTab() {
   else panel.appendChild(el("p", { class: "muted" }, ["No lines yet."]));
 }
 
+async function attachPlayMirTimeline(slot) {
+  var songId = state.songId;
+  // cache per song so tab switches don't refetch
+  if (state.playMir && state.playMir.songId === songId) {
+    renderPlayMir(slot, state.playMir.run);
+    return;
+  }
+  var list = await apiJson("/v1/songs/" + encodeURIComponent(songId) + "/runs");
+  if (!list.ok || state.songId !== songId) return;
+  var ok = (list.body.runs || []).filter(function (r) { return r.status === "ok"; });
+  if (!ok.length) return;
+  var run = await apiJson("/v1/runs/" + encodeURIComponent(ok[0].runId));
+  if (!run.ok || state.songId !== songId) return;
+  state.playMir = { songId: songId, run: run.body };
+  renderPlayMir(slot, run.body);
+}
+
+function renderPlayMir(slot, run) {
+  if (!run || !run.mir) return;
+  var when = (run.startedAt || "").slice(0, 16).replace("T", " ");
+  var tl = renderMirTimeline(run.mir, run.mirWindows, "From analysis run " + when);
+  if (tl) { clear(slot); slot.appendChild(tl); }
+}
+
 function buildChordLine(line) {
   // Position each chord above its charIndex by padding with spaces (monospace).
   var chordLine = "";
@@ -688,6 +719,117 @@ function buildChordLine(line) {
 // provenance/syncMap and scroll that line into view. No timer logic yet.
 function autoScrollTo(seconds) {
   void seconds;
+}
+
+// ---------------------------------------------------------------------------
+// MIR timeline — what the audio said, and which spans were examined
+// ---------------------------------------------------------------------------
+
+// Deterministic chord colors: root pitch class -> hue; minor darker; N gray.
+var _PC = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+
+function chordHue(chord) {
+  if (!chord || chord === "N") return "hsl(0, 0%, 55%)";
+  var m = /^([A-G])([#b]?)/.exec(chord);
+  if (!m) return "hsl(0, 0%, 55%)";
+  var pc = _PC[m[1]] + (m[2] === "#" ? 1 : m[2] === "b" ? -1 : 0);
+  pc = ((pc % 12) + 12) % 12;
+  var minor = /^[A-G][#b]?m(?![a-z])/.test(chord);
+  return "hsl(" + pc * 30 + ", " + (minor ? 45 : 65) + "%, " + (minor ? 34 : 44) + "%)";
+}
+
+function _fmtTime(s) {
+  var m = Math.floor(s / 60);
+  var sec = Math.round(s % 60);
+  return m + ":" + (sec < 10 ? "0" : "") + sec;
+}
+
+// Renders chords + coverage between t0..t1 (seconds). `mirWindows` are the
+// agent's analyze_audio_window probes; `analyzedWindows` is MIR-run coverage.
+function _timelineTrack(chords, analyzedWindows, mirWindows, t0, t1) {
+  var span = Math.max(t1 - t0, 0.001);
+  var track = el("div", { class: "mir-timeline" }, []);
+  (analyzedWindows || []).forEach(function (w) {
+    var left = Math.max(w.start, t0), right = Math.min(w.end, t1);
+    if (right <= left) return;
+    track.appendChild(el("div", {
+      class: "mir-cover",
+      style: "left:" + ((left - t0) / span) * 100 + "%;width:" + ((right - left) / span) * 100 + "%",
+      title: "analyzed " + _fmtTime(left) + "–" + _fmtTime(right),
+    }, []));
+  });
+  (chords || []).forEach(function (c) {
+    var left = Math.max(c.start, t0), right = Math.min(c.end, t1);
+    if (right <= left) return;
+    var wpct = ((right - left) / span) * 100;
+    var seg = el("div", {
+      class: "mir-chord",
+      style: "left:" + ((left - t0) / span) * 100 + "%;width:" + wpct + "%;background:" + chordHue(c.chord),
+      title: c.chord + "  " + _fmtTime(c.start) + "–" + _fmtTime(c.end),
+    }, [wpct >= 3.5 ? c.chord : ""]);
+    track.appendChild(seg);
+  });
+  (mirWindows || []).forEach(function (w) {
+    var win = w.window || {};
+    var left = Math.max(win.start || 0, t0), right = Math.min(win.end || 0, t1);
+    if (right <= left) return;
+    track.appendChild(el("div", {
+      class: "mir-probe",
+      style: "left:" + ((left - t0) / span) * 100 + "%;width:" + ((right - left) / span) * 100 + "%",
+      title: "agent probed " + _fmtTime(left) + "–" + _fmtTime(right) +
+        (w.bpm ? " (bpm " + w.bpm + ")" : ""),
+    }, []));
+  });
+  return track;
+}
+
+function _timelineRuler(t0, t1) {
+  var span = t1 - t0;
+  var step = span > 360 ? 60 : 30;
+  var ruler = el("div", { class: "mir-ruler" }, []);
+  for (var t = Math.ceil(t0 / step) * step; t <= t1; t += step) {
+    ruler.appendChild(el("span", {
+      class: "mir-tick",
+      style: "left:" + ((t - t0) / span) * 100 + "%",
+    }, [_fmtTime(t)]));
+  }
+  return ruler;
+}
+
+// The full-run MIR view: colored chord timeline + analyzed-coverage shading +
+// agent-probe overlays + ruler + readout (key/bpm/engines).
+function renderMirTimeline(mir, mirWindows, label) {
+  var dur = mir.durationSeconds || 0;
+  if (!dur || !(mir.chordTimeline || []).length) return null;
+  var wrap = el("div", { class: "mir-box" }, []);
+  if (label) wrap.appendChild(el("div", { class: "muted", style: "margin-bottom:4px" }, [label]));
+  wrap.appendChild(_timelineTrack(mir.chordTimeline, mir.analyzedWindows, mirWindows, 0, dur));
+  wrap.appendChild(_timelineRuler(0, dur));
+  var readout = "key " + (mir.estimatedKey || "?") + " · bpm " + (mir.bpm || "?") +
+    (mir.timeSignature ? " · " + mir.timeSignature : "") +
+    " · chords: " + ((mir.engines || {}).chords || "?") +
+    " · beats: " + ((mir.engines || {}).beats || "?") +
+    " · " + _fmtTime(dur);
+  if (mir.truncated) readout += " · (timeline sampled)";
+  wrap.appendChild(el("div", { class: "mir-readout" }, [readout]));
+  return wrap;
+}
+
+// A tool-call-scoped view: just the probed window and the chords it returned.
+function renderWindowMiniTimeline(detail) {
+  var result = (detail || {}).result || {};
+  var win = result.window ||
+    { start: (detail.input || {}).start_seconds, end: (detail.input || {}).end_seconds };
+  if (win.start == null || win.end == null || !(result.chords || []).length) return null;
+  var wrap = el("div", { class: "mir-box mir-mini" }, []);
+  wrap.appendChild(_timelineTrack(result.chords, [], [], win.start, win.end));
+  wrap.appendChild(_timelineRuler(win.start, win.end));
+  wrap.appendChild(el("div", { class: "mir-readout" }, [
+    "window " + _fmtTime(win.start) + "–" + _fmtTime(win.end) +
+      " · " + result.chords.length + " segment(s)" +
+      (result.bpm ? " · bpm " + result.bpm : ""),
+  ]));
+  return wrap;
 }
 
 // ---------------------------------------------------------------------------
@@ -774,16 +916,27 @@ function renderRunTrace(run) {
   body.appendChild(meta);
   if (run.error) body.appendChild(el("p", { class: "err" }, [run.error]));
 
+  // The audio ground truth for this run: full chord timeline, what was
+  // analyzed (shaded), and every window the agent probed (accented).
+  if (run.mir) {
+    var tl = renderMirTimeline(run.mir, run.mirWindows, "MIR — what the audio said");
+    if (tl) body.appendChild(tl);
+  }
+
   (run.steps || []).forEach(function (s) {
     var summary = el("summary", {}, [
       el("span", { class: "kind" }, [s.kind || ""]),
       el("span", { class: "sum" }, [s.summary || ""]),
       el("span", { class: "dur" }, [s.durationSeconds != null ? s.durationSeconds + "s" : ""]),
     ]);
-    var pre = el("pre", { class: "detail" }, [
-      JSON.stringify(s.detail || {}, null, 2),
-    ]);
-    var det = el("details", { class: "step", "data-kind": s.kind || "" }, [summary, pre]);
+    var children = [summary];
+    // analyze_audio_window steps get their window drawn, not just JSON
+    if (s.kind === "tool" && (s.detail || {}).tool === "analyze_audio_window") {
+      var mini = renderWindowMiniTimeline(s.detail);
+      if (mini) children.push(mini);
+    }
+    children.push(el("pre", { class: "detail" }, [JSON.stringify(s.detail || {}, null, 2)]));
+    var det = el("details", { class: "step", "data-kind": s.kind || "" }, children);
     body.appendChild(det);
   });
 }

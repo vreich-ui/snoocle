@@ -11,3 +11,6 @@ models/
 *.mp3
 *.m4a
 *.flac
+build/
+dist/
+*.whl

@@ -414,10 +414,21 @@ async function queueModal() {
       dash.appendChild(el("p", { class: "err" }, ["Could not read the queue."]));
       return;
     }
-    if (!r.body.workerAlive) {
-      dash.appendChild(el("p", { class: "err" }, [
-        "The queue worker is not running. On Cloud Run this means the instance " +
-          "scaled to zero — deploy with --min-instances=1.",
+    // Worker presence is reported from actual heartbeats, not a flag — see
+    // store/jobs.py. If nothing has checked in, say so plainly rather than
+    // letting queued jobs look like they are progressing.
+    var queued = (r.body.counts || {}).queued || 0;
+    if (!r.body.workerSeenRecently) {
+      dash.appendChild(el("p", { class: queued ? "err" : "muted" }, [
+        queued
+          ? "No worker has checked in recently — " + queued + " job(s) are " +
+            "waiting. Start the Snoocle worker on your Mac and they will run."
+          : "No worker connected. Songs you queue will wait until one is.",
+      ]));
+    } else {
+      dash.appendChild(el("p", { class: "muted" }, [
+        "Worker: " + (r.body.lastWorker || "connected") +
+          " · last seen " + relativeTime(r.body.lastHeartbeatAt),
       ]));
     }
     var jobs = r.body.jobs || [];
@@ -441,11 +452,21 @@ async function queueModal() {
   queuePoll = setInterval(refresh, 3000);
 }
 
+/** "3 minutes ago" — a timestamp is not what a human is asking when they look
+ *  at a worker's last heartbeat. */
+function relativeTime(iso) {
+  if (!iso) return "never";
+  var seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (seconds < 60) return Math.round(seconds) + "s ago";
+  if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+  return Math.round(seconds / 3600) + "h ago";
+}
+
 function queueCard(job, refresh) {
   var badgeClass =
     job.status === "done" ? "ok" :
     job.status === "error" ? "error" :
-    job.status === "running" ? "running" : "warn";
+    job.status === "leased" ? "running" : "warn";
 
   var actions = [];
   if (job.status === "done" && job.songId) {
@@ -471,6 +492,11 @@ function queueCard(job, refresh) {
     el("div", { class: "grow" }, [
       el("div", {}, [job.label]),
       job.error ? el("div", { class: "err", style: "font-size:12px" }, [job.error]) : null,
+      job.status === "leased" && job.worker
+        ? el("div", { class: "muted" }, [
+            "running on " + job.worker + " · " + relativeTime(job.heartbeatAt),
+          ])
+        : null,
       job.attempts > 1
         ? el("div", { class: "muted" }, ["attempt " + job.attempts])
         : null,
@@ -547,6 +573,7 @@ window.SnoocleAdminD = {
   renderReviewTab: renderReviewTab,
   queueModal: queueModal,
   changeChips: changeChips,
+  relativeTime: relativeTime,
   renderChangeChips: renderChangeChips,
   loadVersionChips: loadVersionChips,
 };

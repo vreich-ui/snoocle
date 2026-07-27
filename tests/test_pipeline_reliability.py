@@ -34,6 +34,12 @@ def isolated_store(monkeypatch):
     # provider preflight a credential so it doesn't short-circuit them. Tests
     # that assert the misconfigured-provider path set their own empty value.
     monkeypatch.setattr(settings, "anthropic_api_key", "test-key")
+    # No test in this file should make a real network call to lrclib.net —
+    # the mock-provider path already skips it (see pipeline.py), but a
+    # non-mock provider that reaches the LRC step (e.g. a monkeypatched
+    # reconcile) otherwise would. Tests that specifically want to exercise
+    # the LRC merge override this back with their own monkeypatch.
+    monkeypatch.setattr(pipeline_mod, "fetch_lrc", lambda *a, **k: None)
     return store
 
 

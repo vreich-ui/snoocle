@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from snoocle_server import api as api_mod
 from snoocle_server.api import app
+from snoocle_server.audio.acquire import AcquisitionError
 from snoocle_server.config import settings
 from snoocle_server.discovery.search import SearchHit
 from snoocle_server.store.memory import InMemorySongRepository
@@ -323,3 +324,181 @@ def test_analyze_upload_rejects_streamless_video(silent_video_bytes):
     )
     assert r.status_code == 422
     assert "audio stream" in r.json()["detail"]
+
+
+# --- cross-video offset alignment (POST /v1/songs/{id}/video-offset) -------
+# Master plan B3: cross-correlate a song's already-analyzed reference audio
+# against a DIFFERENT video's audio to find the seconds-to-add correction
+# stored in audio.videoOffsets. `acquire` is monkeypatched throughout so
+# these never touch the network — the real estimation math is exercised
+# against synthetic wav fixtures (calibration itself lives in
+# test_offset.py).
+
+_ANALYZED_VIDEO_ID = "dQw4w9WgXcQ"
+_OTHER_VIDEO_ID = "aBcDeFgHiJk"
+
+
+class _FakeAcquired:
+    def __init__(self, path):
+        self.path = path
+        self.video_id = "unused"
+
+
+def _save_song_with_analyzed_video(song_id, analyzed_video_id=_ANALYZED_VIDEO_ID):
+    song = {
+        "id": song_id,
+        "metadata": {"title": "Video Offset", "artist": "Test"},
+        "audio": {"analyzedVideoId": analyzed_video_id},
+        "lines": [{"lineIndex": 0, "lyrics": "la", "chordPlacements": []}],
+        "provenance": [{"timestamp": "2026-07-09T00:00:00Z", "actor": "test", "action": "created"}],
+    }
+    r = client.post(f"/v1/songs/{song_id}", json={"song": song, "message": "seed"})
+    assert r.status_code == 200, r.text
+    return song_id
+
+
+@pytest.fixture(scope="module")
+def video_offset_wavs(tmp_path_factory):
+    """A synthetic 'reference song', a copy of it padded with 3.2s of leading
+    silence (stand-in for a re-upload with a longer intro), and unrelated
+    noise — same generator + parameters validated in test_offset.py."""
+    np = pytest.importorskip("numpy")
+    sf = pytest.importorskip("soundfile")
+    pytest.importorskip("librosa")
+    sr = 22050
+    duration = 20.0
+
+    def make_song(seed):
+        rng = np.random.default_rng(seed)
+        n = int(duration * sr)
+        y = np.zeros(n, dtype=np.float64)
+        click = np.exp(-np.linspace(0, 1, int(0.03 * sr)) * 30)
+        t = 0.0
+        while t < duration:
+            idx = int(t * sr)
+            end = min(n, idx + len(click))
+            y[idx:end] += click[: end - idx] * rng.uniform(0.6, 1.0)
+            t += rng.uniform(0.35, 0.65)
+        y += 0.05 * np.sin(2 * np.pi * 220 * np.arange(n) / sr) + rng.normal(0, 0.02, n)
+        return y.astype(np.float32)
+
+    d = tmp_path_factory.mktemp("video-offset-audio")
+    ref = make_song(7)
+    pad = np.zeros(int(3.2 * sr), dtype=np.float32)
+    aligned_other = np.concatenate([pad, ref])[: len(ref) + len(pad)]
+    noise = np.random.default_rng(50).normal(0, 1, int(duration * sr)).astype(np.float32)
+
+    paths = {}
+    for name, y in [("ref", ref), ("aligned_other", aligned_other), ("noise", noise)]:
+        p = d / f"{name}.wav"
+        sf.write(p, y, sr, subtype="PCM_16")
+        paths[name] = str(p)
+    return paths
+
+
+@pytestmark_audio
+def test_video_offset_404_when_song_missing():
+    r = client.post("/v1/songs/nope--nothing/video-offset", json={"videoId": _OTHER_VIDEO_ID})
+    assert r.status_code == 404
+
+
+@pytestmark_audio
+def test_video_offset_409_when_no_analyzed_video_id():
+    song_id = "no-ref--song"
+    song = {
+        "id": song_id,
+        "metadata": {"title": "No Ref", "artist": "Test"},
+        "provenance": [{"timestamp": "2026-07-09T00:00:00Z", "actor": "test", "action": "created"}],
+    }
+    client.post(f"/v1/songs/{song_id}", json={"song": song, "message": "seed"})
+    r = client.post(f"/v1/songs/{song_id}/video-offset", json={"videoId": _OTHER_VIDEO_ID})
+    assert r.status_code == 409
+    assert "analyzedVideoId" in r.json()["detail"]
+
+
+@pytestmark_audio
+def test_video_offset_manual_override_skips_estimation(monkeypatch):
+    song_id = _save_song_with_analyzed_video("manual-override--song")
+
+    def boom(*a, **k):
+        raise AssertionError("manual override must not call acquire")
+
+    monkeypatch.setattr(api_mod, "acquire", boom)
+
+    r = client.post(
+        f"/v1/songs/{song_id}/video-offset",
+        json={"videoId": _OTHER_VIDEO_ID, "offsetSeconds": 4.5},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["videoId"] == _OTHER_VIDEO_ID
+    assert body["offsetSeconds"] == 4.5
+    assert body["confidence"] == 1.0
+
+    got = client.get(f"/v1/songs/{song_id}").json()
+    assert got["audio"]["videoOffsets"] == {_OTHER_VIDEO_ID: 4.5}
+    assert got["provenance"][-1]["action"] == "video-offset"
+    assert got["provenance"][-1]["confidence"] == 1.0
+
+
+@pytestmark_audio
+def test_video_offset_estimates_and_stores_when_confident(monkeypatch, video_offset_wavs):
+    song_id = _save_song_with_analyzed_video("confident--song")
+    paths = {
+        _ANALYZED_VIDEO_ID: video_offset_wavs["ref"],
+        _OTHER_VIDEO_ID: video_offset_wavs["aligned_other"],
+    }
+    monkeypatch.setattr(api_mod, "acquire", lambda video_url_or_id: _FakeAcquired(paths[video_url_or_id]))
+
+    r = client.post(f"/v1/songs/{song_id}/video-offset", json={"videoId": _OTHER_VIDEO_ID})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["offsetSeconds"] == pytest.approx(3.2, abs=0.2)
+    assert body["confidence"] > settings.offset_min_confidence
+
+    got = client.get(f"/v1/songs/{song_id}").json()
+    assert got["audio"]["videoOffsets"][_OTHER_VIDEO_ID] == pytest.approx(3.2, abs=0.2)
+    assert got["provenance"][-1]["action"] == "video-offset"
+    assert got["provenance"][-1]["sources"] == [_OTHER_VIDEO_ID]
+
+
+@pytestmark_audio
+def test_video_offset_409_when_confidence_too_low(monkeypatch, video_offset_wavs):
+    song_id = _save_song_with_analyzed_video("unconfident--song")
+    paths = {
+        _ANALYZED_VIDEO_ID: video_offset_wavs["ref"],
+        _OTHER_VIDEO_ID: video_offset_wavs["noise"],
+    }
+    monkeypatch.setattr(api_mod, "acquire", lambda video_url_or_id: _FakeAcquired(paths[video_url_or_id]))
+
+    r = client.post(f"/v1/songs/{song_id}/video-offset", json={"videoId": _OTHER_VIDEO_ID})
+    assert r.status_code == 409
+    assert "confidence" in r.json()["detail"]
+
+    got = client.get(f"/v1/songs/{song_id}").json()
+    assert got["audio"]["videoOffsets"] == {}  # nothing stored on refusal
+
+
+def test_video_offset_acquisition_error_maps_to_502():
+    song_id = _save_song_with_analyzed_video("acquire-fails--song")
+
+    def boom(video_url_or_id):
+        raise AcquisitionError("network is down")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(api_mod, "acquire", boom)
+        r = client.post(f"/v1/songs/{song_id}/video-offset", json={"videoId": _OTHER_VIDEO_ID})
+    assert r.status_code == 502
+
+
+def test_video_offset_version_conflict_returns_409():
+    song_id = _save_song_with_analyzed_video("conflict--song")
+    r = client.post(
+        f"/v1/songs/{song_id}/video-offset",
+        json={
+            "videoId": _OTHER_VIDEO_ID,
+            "offsetSeconds": 1.0,
+            "expectedVersion": "deadbeef0000",
+        },
+    )
+    assert r.status_code == 409

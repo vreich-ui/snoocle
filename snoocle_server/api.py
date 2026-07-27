@@ -12,6 +12,7 @@ import os
 import secrets
 import tempfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -42,7 +43,9 @@ from .reconcile import (
 )
 from .reconcile.engine import ReconcileError
 from .reconcile.providers import ProviderError
-from .schema import Song, song_json_schema
+from .export import to_chordpro, to_txt
+from .schema import ProvenanceEntry, Song, song_json_schema
+from .timing.offset import estimate_offset
 from .store import (
     StoreError,
     StoreUnavailableError,
@@ -635,6 +638,41 @@ def get_song_diff(song_id: str, a: str, b: str) -> str:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
 
+# --- export (master plan B6) ------------------------------------------------
+# Deterministic serializers (export.py) — no LLM, no re-reconciliation. The
+# chordpro/txt formats share the inline-bracket layout the generic
+# chord-sheet parser (discovery/chordsheet.py) already understands, so
+# exporting and re-pasting a song is a round trip, not a one-way dump.
+
+_EXPORT_MEDIA_TYPES = {
+    "chordpro": "text/plain; charset=utf-8",
+    "txt": "text/plain; charset=utf-8",
+    "json": "application/json",
+}
+_EXPORT_EXTENSIONS = {"chordpro": "cho", "txt": "txt", "json": "json"}
+
+
+@app.get("/v1/songs/{song_id}/export")
+def get_song_export(song_id: str, format: Literal["chordpro", "txt", "json"] = "chordpro"):
+    try:
+        song = get_store().get(song_id)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    if format == "json":
+        body: Any = song.model_dump()
+    elif format == "txt":
+        body = to_txt(song)
+    else:
+        body = to_chordpro(song)
+
+    ext = _EXPORT_EXTENSIONS[format]
+    headers = {"Content-Disposition": f'attachment; filename="{song_id}.{ext}"'}
+    if format == "json":
+        return JSONResponse(body, headers=headers)
+    return PlainTextResponse(body, media_type=_EXPORT_MEDIA_TYPES[format], headers=headers)
+
+
 class SaveSongRequest(BaseModel):
     song: Song
     message: str = "Manual save"
@@ -652,6 +690,109 @@ def post_song(song_id: str, req: SaveSongRequest) -> dict:
     except StoreError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"version": saved.version, "timestamp": saved.timestamp, "message": saved.message}
+
+
+# --- cross-video offset alignment (Phase B / master plan B3) ---------------
+# A song's chord/line/beat times are all measured against ONE analyzed
+# upload (audio.analyzedVideoId). Playing a DIFFERENT upload of the same
+# song (a re-upload, a live version, a lyric video with different intro
+# padding) needs a constant seconds-to-add correction rather than a whole
+# re-analysis -- this estimates that correction via audio cross-correlation
+# (timing/offset.py) and stores it in audio.videoOffsets[videoId].
+
+
+class VideoOffsetRequest(BaseModel):
+    videoId: str
+    expectedVersion: Optional[str] = None
+    # Skip estimation and trust the caller's value directly (e.g. a human
+    # eyeballed it against the player) -- stored at confidence 1.0, and the
+    # offset_min_confidence gate never applies.
+    offsetSeconds: Optional[float] = None
+
+
+@app.post("/v1/songs/{song_id}/video-offset")
+async def post_video_offset(song_id: str, req: VideoOffsetRequest) -> dict:
+    try:
+        song = get_store().get(song_id)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    if req.offsetSeconds is not None:
+        offset_seconds = req.offsetSeconds
+        confidence = 1.0
+        note = "manual override (caller-supplied offsetSeconds)"
+    else:
+        ref_video_id = song.audio.analyzedVideoId
+        if not ref_video_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"song {song_id!r} has no audio.analyzedVideoId -- it hasn't "
+                    "been through a full analyze pass yet, so there is no reference "
+                    f"audio to compare {req.videoId!r} against. Analyze it first, or "
+                    "pass offsetSeconds directly to set the offset manually."
+                ),
+            )
+        try:
+            ref_acquired, other_acquired = await run_in_threadpool(
+                lambda: (
+                    acquire(video_url_or_id=ref_video_id),
+                    acquire(video_url_or_id=req.videoId),
+                )
+            )
+        except AcquisitionError as e:
+            return _acquisition_error_response(e)
+        estimate = await run_in_threadpool(
+            estimate_offset,
+            ref_acquired.path,
+            other_acquired.path,
+            settings.offset_max_search_seconds,
+        )
+        offset_seconds = estimate.offset_seconds
+        confidence = estimate.confidence
+        if confidence < settings.offset_min_confidence:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"video-offset estimate too unreliable to store: confidence "
+                    f"{confidence:.2f} < required {settings.offset_min_confidence:.2f} "
+                    f"(estimated offsetSeconds={offset_seconds:.2f}). The two videos "
+                    "may not be the same song/performance, or the audio has too "
+                    "little rhythmic content to align reliably; pass offsetSeconds "
+                    "directly to override."
+                ),
+            )
+        note = f"cross-correlation estimate vs analyzed video {ref_video_id}"
+
+    new_offsets = dict(song.audio.videoOffsets)
+    new_offsets[req.videoId] = offset_seconds
+    updated_audio = song.audio.model_copy(update={"videoOffsets": new_offsets})
+    entry = ProvenanceEntry(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        actor="snoocle-server/timing",
+        action="video-offset",
+        sources=[req.videoId],
+        confidence=confidence,
+        notes=note,
+    )
+    updated = song.model_copy(
+        update={"audio": updated_audio, "provenance": list(song.provenance) + [entry]}
+    )
+    updated = Song.model_validate(updated.model_dump())
+
+    try:
+        saved = get_store().save(
+            updated, f"video-offset: {req.videoId}", expected_version=req.expectedVersion
+        )
+    except VersionConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    return {
+        "videoId": req.videoId,
+        "offsetSeconds": offset_seconds,
+        "confidence": confidence,
+        "version": saved.version,
+    }
 
 
 # --- YouTube acquisition cookies (in-app sign-in / manual upload) -------------

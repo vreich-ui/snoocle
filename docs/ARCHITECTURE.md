@@ -95,6 +95,68 @@ client-side (see the iOS dev plan, task F1) in favor of rendering a gap
 glyph when a timed instrumental hole exceeds the scroll model's
 `maxGlideSeconds`. Do not reintroduce N.C. as a storable chord identity.
 
+## Cross-video offset alignment (master plan B3)
+
+`timing/offset.py`'s `estimate_offset(ref, other)` cross-correlates onset-
+strength envelopes (librosa, hop 512) over a bounded lag search (default
++/-30s) to find the constant number of seconds to add to a song's stored
+(ref-video-based) times so they land correctly on a DIFFERENT video of the
+same song — e.g. a re-upload with a longer intro, or a live version.
+`POST /v1/songs/{id}/video-offset` acquires both videos' audio (reusing the
+existing yt-dlp cache), runs the estimate, and writes
+`AudioInfo.videoOffsets[videoId]` plus a `video-offset` provenance entry.
+
+The peak Normalized Cross-Correlation doubles as the confidence. This is a
+**documented heuristic, not a statistical guarantee** — empirically, a
+genuinely aligned pair scores roughly 0.6-0.97 depending on how rhythmically
+distinctive the audio is, while unrelated audio clusters below ~0.3-0.46
+(see `tests/test_offset.py`, which pins this calibration). The populations
+sit closer together than a naive "just check it's high" read would suggest,
+which is exactly why the confidence is always returned to the caller instead
+of being collapsed into a silent accept/reject: below
+`Settings.offset_min_confidence` (default 0.5) the endpoint refuses with 409
+rather than store a guess, and a human can always override by POSTing an
+explicit `offsetSeconds` directly (stored at confidence 1.0, gate bypassed).
+If real-world usage shows the threshold needs retuning, re-run the
+calibration sweep described in `timing/offset.py`'s module docstring before
+changing the number.
+
+## Export (master plan B6)
+
+`GET /v1/songs/{id}/export?format=chordpro|txt|json` — deterministic, no LLM.
+`export.py`'s `to_chordpro`/`to_txt` share one inline-bracket layout
+(`[Chord]` spliced into lyrics at charIndex, `[Section Name]` on its own
+line) that the EXISTING generic chord-sheet parser
+(`discovery/chordsheet.py`) already understands — so export and re-paste is
+a round trip, not a one-way dump (see `tests/test_export.py`). `chordpro`
+additionally prefixes ChordPro metadata directives (`{title: ...}` etc.) for
+interop with other ChordPro tools; those aren't parsed back by our own
+parser (only the sheet body needs to round-trip, not the metadata banner).
+
+## Ultimate Guitar discovery source (master plan B5)
+
+`discovery/sources/ultimate_guitar.py` — OFF by default (`SNOOCLE_SOURCE_UG=1`
+to enable). UG has no documented public API; this reads the same JSON its
+own React frontend hydrates from, embedded in a `<div class="js-store"
+data-content="...">` attribute on both the search-results page and every
+tab page. Because that shape is undocumented and known to drift, every field
+lookup tries several candidate key paths (see `_JSON_PATHS`-style constants
+at the top of the file) rather than betting the source on one exact
+contract, and — matching every other discovery source's contract — ANY
+failure (network, HTTP status, missing keys, unparseable content) returns
+`[]`/`None` and logs, never raises into the pipeline. `discover_sources`
+merges its output in additively alongside the generic web search (not as a
+fallback tried only when the web search is empty). UG's own `[ch]C[/ch]`
+inline-chord markup is converted to the `[C]` bracket convention the
+existing generic chord-sheet parser already understands, and `[tab]...[/tab]`
+fret-diagram blocks are stripped entirely before parsing. UG's declared capo
+(from its separate metadata field, since it isn't always written into the
+sheet text itself) is transposed away at ingestion exactly like every other
+source's declared capo, and rating/votes feed a confidence prior
+(`min(0.95, 0.5 + 0.1*log10(votes+1) + 0.05*rating)`) — real evidence a
+well-vetted community tab deserves a higher starting confidence than an
+arbitrary, unvoted web hit.
+
 ## Chord recognition engine
 
 `scripts/setup_chord_model.sh` vendors the real Chord-CNN-LSTM (ISMIR2019)

@@ -42,6 +42,7 @@ from .schema.song import slugify_song_id
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
 from .timing.confidence import build_review_queue, score_song
+from .timing.lrc import apply_lrc, fetch_lrc, match_lrc_to_lines
 from .timing.snap import snap_chords
 
 log = logging.getLogger(__name__)
@@ -359,10 +360,41 @@ async def run_pipeline_async(
         report.steps["timing"] = f"failed: {e}"
         log.warning("pipeline.step error step=timing err=%s", e)
 
-    # 5c. per-chord agreement scoring (best-effort). Must run AFTER 5b: the
-    # MIR-agreement signal reads placement.timeSeconds, which 5b is what
-    # populates. Refines confidence when both a source and MIR signal exist,
-    # and records a compact "check these first" queue on the run trace.
+    # 5c. LRCLIB synced-lyrics overlay (best-effort, network-dependent). LRC
+    # is better LINE-timing evidence than MIR chord matching, so when it
+    # matches it WINS — this must run BEFORE confidence scoring (5d), which
+    # reads whatever timeSeconds ends up final, not 5b's provisional guess.
+    # Skipped for provider=mock like discover — mock is the fully-offline
+    # deterministic path and must make ZERO external calls of any kind.
+    if resolved_provider == "mock":
+        report.steps["lrc"] = "skipped (mock: offline deterministic reconciler)"
+    else:
+        try:
+            duration = (
+                (report.mir.duration_seconds if report.mir else None)
+                or (report.audio.duration_seconds if report.audio else None)
+            )
+            lrc = fetch_lrc(title, artist, duration)
+            if lrc:
+                matches = match_lrc_to_lines(lrc, result.song)
+                if matches:
+                    result.song = apply_lrc(result.song, report.mir, matches)
+                    report.steps["lrc"] = f"ok: {len(matches)}/{len(result.song.lines)} line(s) matched"
+                else:
+                    report.steps["lrc"] = "ok: no line matched closely enough"
+            else:
+                report.steps["lrc"] = (
+                    "skipped (no LRCLIB match)" if settings.lrclib_enabled else "skipped (disabled)"
+                )
+        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+            report.steps["lrc"] = f"failed: {e}"
+            log.warning("pipeline.step error step=lrc err=%s", e)
+
+    # 5d. per-chord agreement scoring (best-effort). Must run LAST of this
+    # group: the MIR-agreement signal reads placement.timeSeconds, which 5b
+    # (or 5c, if LRC overrode it) is what populates. Refines confidence when
+    # both a source and MIR signal exist, and records a compact "check these
+    # first" queue on the run trace.
     try:
         scored_song, scores = score_song(result.song, report.candidates, report.mir)
         result.song = scored_song
@@ -372,10 +404,10 @@ async def run_pipeline_async(
         report.steps["confidence"] = f"failed: {e}"
         log.warning("pipeline.step error step=confidence err=%s", e)
 
-    # Persist the trace now that timing/confidence (5b/5c) have had their
-    # chance to attach a review queue -- persisting right after `finish()`
-    # (as the fatal-path branches above still correctly do, since those
-    # never reach 5b/5c) would durably store a run missing that data.
+    # Persist the trace now that timing/lrc/confidence (5b/5c/5d) have had
+    # their chance to attach a review queue -- persisting right after
+    # `finish()` (as the fatal-path branches above still correctly do, since
+    # those never reach this group) would durably store a run missing it.
     _persist_trace(recorder)
 
     # 6-7. version-controlled persistence (FATAL, except a 409 conflict which

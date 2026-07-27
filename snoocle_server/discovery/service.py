@@ -22,6 +22,7 @@ from .chordsheet import parse_chord_sheet
 from .fetch import extract_sheet_text, fetch_page
 from .models import CandidateSource, SectionStart
 from .search import SearchError, SearchHit, web_search
+from .sources.ultimate_guitar import discover_ultimate_guitar
 from ..audio.acquire import parse_dash_title, parse_quoted_track
 from ..config import settings
 
@@ -88,7 +89,10 @@ def discover_sources(
     search_fn: SearchFn | None = None,
     fetch_fn: FetchFn | None = None,
 ) -> list[CandidateSource]:
-    """General web search -> fetch -> parse -> ranked candidate sources."""
+    """General web search -> fetch -> parse -> ranked candidate sources,
+    plus Ultimate Guitar (a separate, site-specific channel — see
+    discovery/sources/ultimate_guitar.py — additive, not a fallback for the
+    generic web search; it's a no-op unless SNOOCLE_SOURCE_UG=1)."""
     max_candidates = max_candidates or settings.search_max_candidates
     search_fn = search_fn or (lambda q, n: web_search(q, n))
     fetch_fn = fetch_fn or fetch_page
@@ -119,8 +123,17 @@ def discover_sources(
                 )
             except SearchError:
                 pass  # fall through to the primary outcome below
-        if not candidates and primary_error is not None:
-            raise primary_error
+
+    # Ultimate Guitar is best-effort and never raises (see its own module
+    # docstring) — merge whatever it finds in regardless of whether the
+    # generic web search above succeeded or failed.
+    ug_candidates = discover_ultimate_guitar(
+        title, artist, max_candidates=settings.source_ug_max_candidates
+    )
+    candidates = candidates + ug_candidates
+
+    if not candidates and primary_error is not None:
+        raise primary_error
 
     candidates.sort(key=lambda c: c.confidence, reverse=True)
     return candidates

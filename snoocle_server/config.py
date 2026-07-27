@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     serpapi_api_key: str = ""
     search_max_candidates: int = 8  # gather generously; reconciliation uses all of them
     fetch_timeout_seconds: float = 20.0
+    # Ultimate Guitar discovery source (master plan B5) -- OFF by default.
+    # Scrapes UG's undocumented js-store JSON (see
+    # discovery/sources/ultimate_guitar.py); personal-use, one flag to
+    # disable instantly if the endpoint breaks or changes shape.
+    source_ug_enabled: bool = False
+    source_ug_max_candidates: int = 3
 
     # --- YouTube acquisition (yt-dlp) ---
     # YouTube blocks datacenter IPs (Cloud Run) with a "confirm you're not a
@@ -149,6 +155,32 @@ class Settings(BaseSettings):
     # window timestamps stay in the original track's time coordinates.
     mir_fast_window_seconds: int = 40
     mir_fast_window_count: int = 3
+
+    # --- deterministic timing enrichment (Phase B) ---
+    # LRCLIB (https://lrclib.net) is a free, no-key community synced-lyrics
+    # database — the first, most reliable layer for LINE timing (see
+    # timing/lrc.py). Best-effort and network-dependent; set to false for a
+    # fully offline/hermetic deployment or to skip it deliberately.
+    lrclib_enabled: bool = True
+
+    # --- cross-video offset alignment (Phase B) ---
+    # POST /v1/songs/{id}/video-offset cross-correlates onset-strength
+    # envelopes between a song's already-analyzed reference audio and a
+    # DIFFERENT video's audio to find the constant number of seconds to add
+    # to every stored time when that OTHER video is playing
+    # (AudioInfo.videoOffsets) -- see timing/offset.py.
+    # The confidence is a documented heuristic (peak Normalized
+    # Cross-Correlation over a bounded lag search), calibrated against
+    # synthetic aligned/unrelated fixtures in tests/test_offset.py -- not a
+    # statistical guarantee. Below this threshold the endpoint refuses (409)
+    # rather than store a guess; raise it for stricter gating, or the caller
+    # can always override by supplying offsetSeconds directly.
+    offset_min_confidence: float = 0.5
+    # How far (seconds, either direction) to search for the best-aligning
+    # lag. Offsets between two uploads of the same song are essentially
+    # always small; keeping this bounded also avoids spurious far-lag
+    # matches (see timing/offset.py's module docstring).
+    offset_max_search_seconds: float = 30.0
 
     # --- pipeline reliability ---
     # Per-step wall-clock ceilings (seconds) for POST /v1/songs/analyze so no

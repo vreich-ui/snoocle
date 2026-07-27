@@ -61,8 +61,14 @@ include = ["snoocle_server*"]
 
 # Ship the static GUI files in the wheel — the Docker image runs the installed
 # package, not the source tree, so the ui/ assets must be package data.
+#
+# The `**` matters: a plain `ui/*` does NOT cross directory separators, so it
+# silently ships the admin and drops the whole player (ui/play/, its icons, and
+# ui/vendor/) — a deploy that 404s /ui/play/ while every test passes against the
+# source tree. tests/test_packaging.py fails the build if a ui/ file stops being
+# matched.
 [tool.setuptools.package-data]
-snoocle_server = ["ui/*"]
+snoocle_server = ["ui/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -72,106 +72,67 @@ var state = {
   runs: [],          // run summaries for the open song (newest first)
   activeRunId: null, // run being viewed in the Agent tab
   runPoll: null,     // interval handle while a run is in progress
+  heat: false,       // D4: tint chords by confidence in the Play sheet
 };
 
-function tokenModal() {
-  // Resolves to the entered token string, or null if cancelled.
-  return new Promise(function (resolve) {
-    var backdrop = el("div", { class: "modal-backdrop" });
-    var input = el("input", { type: "password", placeholder: "Bearer token" });
-    var modal = el("div", { class: "modal" }, [
-      el("h2", {}, ["Authorization required"]),
-      el("p", { class: "muted" }, [
-        "This server requires a bearer token (SNOOCLE_API_TOKEN). It is stored " +
-          "only in this browser.",
-      ]),
-      input,
-      el("div", { class: "actions" }, [
-        button("Cancel", "secondary", function () { close(null); }),
-        button("Save", "", function () { close(input.value.trim() || null); }),
-      ]),
-    ]);
-    function close(v) { backdrop.remove(); resolve(v); }
-    backdrop.appendChild(modal);
-    document.body.appendChild(backdrop);
-    input.focus();
-    input.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") close(input.value.trim() || null);
-    });
-  });
-}
-
-async function api(path, options) {
-  options = options || {};
-  var opts = Object.assign({}, options);
-  opts.headers = Object.assign({}, options.headers || {});
-  var token = localStorage.getItem("snoocleToken");
-  if (token) opts.headers["Authorization"] = "Bearer " + token;
-
-  var res = await fetch(path, opts);
-  if (res.status === 401) {
-    var entered = await tokenModal();
-    if (entered) {
-      localStorage.setItem("snoocleToken", entered);
-      opts.headers["Authorization"] = "Bearer " + entered;
-      res = await fetch(path, opts); // retry once
-    }
-  }
-  return res;
-}
-
-async function apiJson(path, options) {
-  var res = await api(path, options);
-  var body = null;
-  try { body = await res.json(); } catch (e) { body = null; }
-  return { ok: res.ok, status: res.status, body: body };
-}
-
-// ---------------------------------------------------------------------------
-// Tiny DOM helpers
-// ---------------------------------------------------------------------------
-
-function el(tag, attrs, children) {
-  var node = document.createElement(tag);
-  attrs = attrs || {};
-  Object.keys(attrs).forEach(function (k) {
-    if (k === "class") node.className = attrs[k];
-    else if (k === "html") node.innerHTML = attrs[k];
-    else node.setAttribute(k, attrs[k]);
-  });
-  (children || []).forEach(function (c) {
-    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  });
-  return node;
-}
-
-function button(label, cls, onClick) {
-  var b = el("button", { class: "btn " + (cls || "") }, [label]);
-  b.addEventListener("click", onClick);
-  return b;
-}
-
-function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+// `api`, `apiJson`, `el`, `button`, `clear` and the 401 token prompt now live
+// in common.js (loaded before this file) so the play-along player at
+// /ui/play/ can share exactly the same request and DOM plumbing.
 
 // ---------------------------------------------------------------------------
 // Song list
+//
+// Rows read "Title — Artist" (§3.5: the slug is a machine detail, and it
+// stays as the row's tooltip). `GET /v1/songs` returns objects with the
+// denormalized title/artist; the plain-id shape older servers returned is
+// still accepted so a stale cached app.js against a new server, or the
+// reverse, degrades to the slug instead of breaking.
 // ---------------------------------------------------------------------------
 
+function songListEntry(raw) {
+  if (typeof raw === "string") return { id: raw, title: "", artist: "" };
+  return {
+    id: raw.id,
+    title: raw.title || "",
+    artist: raw.artist || "",
+    hasTiming: !!raw.hasTiming,
+  };
+}
+
+function songListLabel(entry) {
+  if (entry.title && entry.artist) return entry.title + " — " + entry.artist;
+  return entry.title || entry.id;
+}
+
 async function loadSongList() {
-  var r = await apiJson("/v1/songs");
   var list = document.getElementById("song-list");
+  clear(list);
+  for (var i = 0; i < 3; i++) {
+    list.appendChild(el("li", { class: "skeleton" }, [" "]));
+  }
+
+  var r = await apiJson("/v1/songs");
   clear(list);
   if (!r.ok) {
     list.appendChild(el("li", { class: "muted" }, ["(failed to load songs)"]));
     return;
   }
-  (r.body.songs || []).forEach(function (id) {
-    var li = el("li", { "data-id": id }, [id]);
-    if (id === state.songId) li.className = "active";
-    li.addEventListener("click", function () { openSong(id); });
+  // `items` is the rich Phase C shape; `songs` (plain ids) is the older
+  // contract and the fallback when talking to a server that predates it.
+  var raw = r.body.items || r.body.songs || [];
+  var entries = raw.map(songListEntry);
+  entries.forEach(function (entry) {
+    var li = el("li", { "data-id": entry.id, title: entry.id, tabindex: "0" }, [
+      songListLabel(entry),
+    ]);
+    if (entry.id === state.songId) li.className = "active";
+    li.addEventListener("click", function () { openSong(entry.id); });
+    li.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSong(entry.id); }
+    });
     list.appendChild(li);
   });
-  if (!(r.body.songs || []).length) {
+  if (!entries.length) {
     list.appendChild(el("li", { class: "muted" }, ["(no songs yet)"]));
   }
 }
@@ -319,17 +280,41 @@ async function openSong(id) {
   renderPlayTab();
   loadRuns();
   selectTab(state.activeTab);
+  closeSidebar();
 }
 
+var TAB_IDS = ["edit", "review", "agent", "versions", "play"];
+
 function selectTab(name) {
+  if (TAB_IDS.indexOf(name) === -1) name = "edit";
   state.activeTab = name;
   Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
     b.classList.toggle("active", b.getAttribute("data-tab") === name);
   });
-  ["edit", "agent", "versions", "play"].forEach(function (t) {
+  TAB_IDS.forEach(function (t) {
     document.getElementById("tab-" + t).classList.toggle("active", t === name);
   });
+  if (name === "review" && window.SnoocleAdminD) window.SnoocleAdminD.renderReviewTab();
 }
+
+// --- narrow-screen sidebar slide-over --------------------------------------
+// Purely presentational: on wide screens the CSS ignores the class entirely.
+
+function setSidebar(open) {
+  document.getElementById("app").classList.toggle("sidebar-open", open);
+  var queueBtn = document.getElementById("queue-btn");
+  if (queueBtn) {
+    queueBtn.addEventListener("click", function () {
+      if (window.SnoocleAdminD) window.SnoocleAdminD.queueModal();
+    });
+  }
+  var toggle = document.getElementById("sidebar-toggle");
+  if (toggle) toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  var scrim = document.getElementById("sidebar-scrim");
+  if (scrim) scrim.hidden = !open;
+}
+
+function closeSidebar() { setSidebar(false); }
 
 // ---------------------------------------------------------------------------
 // Edit tab
@@ -579,6 +564,10 @@ async function renderVersionsTab(versions) {
       el("td", { class: "mono" }, [(isGold ? "★ " : "") + v.version]),
       el("td", {}, [v.timestamp || ""]),
       el("td", {}, [v.message || ""]),
+      // D5: filled in per row by loadVersionChips() from the diff endpoint.
+      el("td", { class: "review-reasons", "data-changes": v.version }, [
+        el("span", { class: "chip skeleton" }, ["…"]),
+      ]),
       el("td", {}, [goldBtn]),
     ]));
   });
@@ -591,11 +580,12 @@ async function renderVersionsTab(versions) {
   panel.appendChild(el("table", {}, [
     el("thead", {}, [el("tr", {}, [
       el("th", {}, [""]), el("th", {}, ["Version"]), el("th", {}, ["When"]),
-      el("th", {}, ["Message"]), el("th", {}, ["Gold"]),
+      el("th", {}, ["Message"]), el("th", {}, ["What changed"]), el("th", {}, ["Gold"]),
     ])]),
     tbody,
   ]));
   panel.appendChild(diffPre);
+  if (window.SnoocleAdminD) window.SnoocleAdminD.loadVersionChips(versions);
 
   // if gold is set, show how the current version scores against it
   if (goldVersion) {
@@ -663,15 +653,36 @@ function renderPlayTab() {
   // ONE scroll container for the whole song: a long line scrolls the sheet, not
   // an invisible per-line box, and chord columns stay aligned across lines.
   var scroll = el("div", { class: "sheet-scroll" }, []);
-  lines.forEach(function (line) {
-    if (sectionForLine[line.lineIndex] !== undefined) {
-      scroll.appendChild(el("div", { class: "section-head" }, [sectionForLine[line.lineIndex]]));
-    }
-    var chordLine = buildChordLine(line);
-    scroll.appendChild(el("pre", { class: "sheet", "data-line": line.lineIndex }, [
-      (chordLine ? chordLine + "\n" : "") + (line.lyrics || ""),
-    ]));
-  });
+
+  function paintSheet() {
+    clear(scroll);
+    lines.forEach(function (line) {
+      if (sectionForLine[line.lineIndex] !== undefined) {
+        scroll.appendChild(el("div", { class: "section-head" }, [sectionForLine[line.lineIndex]]));
+      }
+      var chordNodes = buildChordLineNodes(line, state.heat);
+      var pre = el("pre", { class: "sheet", "data-line": line.lineIndex }, []);
+      if (chordNodes.length) {
+        chordNodes.forEach(function (n) { pre.appendChild(n); });
+        pre.appendChild(document.createTextNode("\n"));
+      }
+      pre.appendChild(document.createTextNode(line.lyrics || ""));
+      scroll.appendChild(pre);
+    });
+  }
+
+  // D4: confidence heat. Hidden entirely when nothing carries a confidence.
+  if (songHasConfidences(song)) {
+    var heatBtn = button(state.heat ? "Confidence heat: on" : "Confidence heat: off",
+      "secondary small", function () {
+        state.heat = !state.heat;
+        heatBtn.textContent = state.heat ? "Confidence heat: on" : "Confidence heat: off";
+        paintSheet();
+      });
+    panel.appendChild(el("div", { style: "margin:8px 0" }, [heatBtn]));
+  }
+
+  paintSheet();
   if (lines.length) panel.appendChild(scroll);
   else panel.appendChild(el("p", { class: "muted" }, ["No lines yet."]));
 }
@@ -698,6 +709,45 @@ function renderPlayMir(slot, run) {
   var when = (run.startedAt || "").slice(0, 16).replace("T", " ");
   var tl = renderMirTimeline(run.mir, run.mirWindows, "From analysis run " + when);
   if (tl) { clear(slot); slot.appendChild(tl); }
+}
+
+/** The chord row as DOM nodes rather than one string, so each chord can carry
+ *  its own confidence class (D4). Spacing is identical to buildChordLine — the
+ *  padding is plain text either way, so column alignment is unchanged. */
+function buildChordLineNodes(line, heat) {
+  var nodes = [];
+  var col = 0;
+  (line.chordPlacements || [])
+    .slice()
+    .sort(function (a, b) { return a.charIndex - b.charIndex; })
+    .forEach(function (p) {
+      if (col < p.charIndex) {
+        nodes.push(document.createTextNode(" ".repeat(p.charIndex - col)));
+        col = p.charIndex;
+      }
+      var cls = "";
+      if (heat && typeof p.confidence === "number") {
+        cls = p.confidence < 0.5 ? "heat-low" : p.confidence < 0.75 ? "heat-mid" : "";
+      }
+      var span = el("span", cls ? { class: cls } : {}, [p.chord]);
+      if (typeof p.confidence === "number") {
+        span.setAttribute("title", "confidence " + p.confidence);
+      }
+      nodes.push(span);
+      nodes.push(document.createTextNode(" "));
+      col += p.chord.length + 1;
+    });
+  return nodes;
+}
+
+/** True when ANY placement carries a confidence — the D4 toggle stays hidden
+ *  otherwise rather than offering a control that would do nothing. */
+function songHasConfidences(song) {
+  return (song.lines || []).some(function (line) {
+    return (line.chordPlacements || []).some(function (p) {
+      return typeof p.confidence === "number";
+    });
+  });
 }
 
 function buildChordLine(line) {
@@ -1161,6 +1211,23 @@ function init() {
   document.getElementById("refresh-btn").addEventListener("click", loadSongList);
   document.getElementById("scorecard-btn").addEventListener("click", scorecardModal);
   document.getElementById("workbench-btn").addEventListener("click", workbenchModal);
+  var queueBtn = document.getElementById("queue-btn");
+  if (queueBtn) {
+    queueBtn.addEventListener("click", function () {
+      if (window.SnoocleAdminD) window.SnoocleAdminD.queueModal();
+    });
+  }
+  var toggle = document.getElementById("sidebar-toggle");
+  if (toggle) {
+    toggle.addEventListener("click", function () {
+      setSidebar(!document.getElementById("app").classList.contains("sidebar-open"));
+    });
+  }
+  var scrim = document.getElementById("sidebar-scrim");
+  if (scrim) scrim.addEventListener("click", closeSidebar);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") closeSidebar();
+  });
   Array.prototype.forEach.call(document.querySelectorAll("#tabs button"), function (b) {
     b.addEventListener("click", function () { selectTab(b.getAttribute("data-tab")); });
   });

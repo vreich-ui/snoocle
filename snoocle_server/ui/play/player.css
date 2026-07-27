@@ -1,0 +1,329 @@
+/* Snoocle play-along player (/ui/play/) — the user-facing surface.
+ *
+ * Consumes tokens.css only; §3.5 is binding, so nothing here invents a
+ * colour, a radius or a size. Two layouts, chosen by width:
+ *   compact  (<900px) — video pinned top, collapses to a mini-bar; sheet
+ *                       fills the rest; transport bar at the bottom, and
+ *                       once playing that bar is the only chrome.
+ *   regular  (>=900px) — sheet 62% left, rail (video + sections + controls)
+ *                        right, draggable divider.
+ */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg0);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+
+.view { height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
+.view[hidden] { display: none; }
+
+.muted { color: var(--text-dim); font-size: var(--fs-small); }
+
+button.btn, a.btn {
+  background: var(--accent);
+  color: var(--accent-text);
+  border: none;
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: var(--s2) var(--s4);
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-size: var(--fs-body);
+  font-family: inherit;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s2);
+  transition: filter var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+button.btn.secondary, a.btn.secondary {
+  background: var(--bg2); color: var(--text);
+  border: var(--hairline) solid var(--stroke);
+}
+button.btn.on { background: var(--accent); color: var(--accent-text); }
+button.btn:disabled { opacity: 0.45; cursor: default; }
+.icon-btn { padding: var(--s2); font-size: 18px; }
+
+input, select {
+  min-height: var(--touch);
+  padding: var(--s2) var(--s3);
+  border: var(--hairline) solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg1);
+  color: var(--text);
+  font-size: var(--fs-body);
+  font-family: inherit;
+}
+
+.offline-banner {
+  background: var(--tint-warn); color: var(--warn);
+  padding: var(--s2) var(--s4); font-size: var(--fs-small); text-align: center;
+}
+
+/* --- library -------------------------------------------------------------- */
+
+.library-head {
+  display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap;
+  padding: var(--s4) var(--s5) var(--s3);
+  position: sticky; top: 0; z-index: 2; background: var(--bg0);
+  border-bottom: var(--hairline) solid var(--stroke);
+}
+.library-head h1 { font-size: var(--fs-title); font-weight: 600; margin: 0; flex: 0 0 auto; }
+.library-tools { display: flex; gap: var(--s2); flex: 1; justify-content: flex-end; flex-wrap: wrap; }
+#library-search { flex: 1; min-width: 160px; max-width: 360px; }
+
+.library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: var(--s4);
+  padding: var(--s4) var(--s5) var(--s6);
+  overflow-y: auto;
+  flex: 1;
+  align-content: start;
+}
+
+.song-card {
+  display: flex; flex-direction: column; gap: var(--s2);
+  background: var(--bg1);
+  border: var(--hairline) solid var(--stroke);
+  border-radius: var(--r-card);
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+  padding: 0 0 var(--s3);
+  color: inherit;
+  font: inherit;
+  transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.song-card:hover { border-color: var(--accent); }
+.song-card .art {
+  width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
+  background: var(--bg2); display: block;
+}
+.song-card .card-title {
+  padding: 0 var(--s3);
+  font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.song-card .card-artist {
+  padding: 0 var(--s3); color: var(--text-dim); font-size: var(--fs-small);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.badge-row { display: flex; gap: var(--s1); flex-wrap: wrap; padding: 0 var(--s3); }
+.badge {
+  font-size: 11px; border-radius: 999px; padding: 1px 8px;
+  background: var(--bg2); color: var(--text-dim);
+  border: var(--hairline) solid var(--stroke);
+}
+.badge.timing { background: var(--tint-ok); color: var(--ok); border-color: transparent; }
+.song-card.skeleton { height: 220px; border-color: transparent; }
+
+.empty-state { text-align: center; padding: var(--s6) var(--s5); margin: auto; max-width: 420px; }
+.empty-art { font-size: 56px; color: var(--text-dim); }
+.empty-state h2 { font-size: var(--fs-title); margin: var(--s3) 0 var(--s2); }
+.empty-state .btn { margin-top: var(--s4); }
+
+/* --- song layout ---------------------------------------------------------- */
+
+.song-layout { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+
+.media-pane { position: relative; }
+.player-frame {
+  width: 100%; aspect-ratio: 16 / 9; background: #000;
+  border-bottom: var(--hairline) solid var(--stroke);
+}
+.player-frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+#back-btn { position: absolute; top: var(--s2); left: var(--s2); z-index: 3; opacity: 0.9; }
+
+.mini-bar {
+  display: flex; align-items: center; gap: var(--s3);
+  height: 64px; padding: 0 var(--s3);
+  background: var(--bg2); border-bottom: var(--hairline) solid var(--stroke);
+}
+.mini-bar img { width: 64px; height: 36px; object-fit: cover; border-radius: 6px; background: var(--bg1); }
+.mini-meta { min-width: 0; }
+.mini-meta > div:first-child {
+  font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.sheet-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+
+.song-head {
+  padding: var(--s3) var(--s4) var(--s2);
+  display: flex; flex-direction: column; gap: var(--s2);
+}
+.song-head h2 { margin: 0; font-size: var(--fs-title); font-weight: 600; }
+.palette { display: flex; gap: var(--s1); flex-wrap: wrap; }
+
+.section-chips {
+  display: flex; gap: var(--s2); overflow-x: auto; padding: 0 var(--s4) var(--s2);
+  scrollbar-width: none;
+}
+.section-chips::-webkit-scrollbar { display: none; }
+.section-chip {
+  flex: 0 0 auto; min-height: 36px; padding: var(--s1) var(--s3);
+  border-radius: var(--r-card); background: var(--bg1); color: var(--text);
+  border: var(--hairline) solid var(--stroke);
+  font-size: var(--fs-small); cursor: pointer; white-space: nowrap;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.section-chip.active { background: var(--tint-accent); border-color: var(--accent); color: var(--text); }
+
+/* --- the sheet ------------------------------------------------------------ */
+
+.sheet-scroll {
+  flex: 1; overflow-y: auto; overflow-x: auto;
+  padding: var(--s3) var(--s4) 40vh; /* tail padding so the last line can park */
+  scroll-behavior: auto;
+}
+.sheet { font-family: var(--font-mono); width: max-content; min-width: 100%; }
+
+.sheet-section {
+  font-size: var(--fs-section); text-transform: uppercase;
+  letter-spacing: var(--tracking-section); color: var(--text-dim);
+  margin: var(--s4) 0 var(--s2); font-family: var(--font-ui); font-weight: 600;
+}
+.sheet-line { margin-bottom: var(--s2); }
+.sheet-line.active .lyric-row { color: var(--text); }
+.lyric-row {
+  font-size: calc(var(--fs-sheet-lyric) * var(--sheet-scale));
+  line-height: var(--lh-sheet);
+  white-space: pre;
+  color: var(--text);
+  transition: color var(--dur) var(--ease);
+}
+.sheet-line:not(.active) .lyric-row { color: var(--text-dim); }
+/* An untimed song never dims: without timing there is no "current" line, and
+   dimming every line would just make the whole sheet look disabled. */
+.sheet.untimed .sheet-line .lyric-row { color: var(--text); }
+
+/* Chord row: positioned, not flowed. Pills are placed at
+   charIndex * (measured character width of the LYRIC font), so the chord
+   font-size can differ from the lyric font-size (§3.5 wants 15 vs 17) without
+   the columns drifting apart. */
+.chord-row {
+  position: relative;
+  height: calc(var(--fs-sheet-chord) * var(--sheet-scale) * 1.5);
+}
+.chord-pill {
+  position: absolute; top: 0;
+  font-family: var(--font-mono);
+  font-size: calc(var(--fs-sheet-chord) * var(--sheet-scale));
+  font-weight: 600;
+  color: var(--chord);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  padding: 2px 6px;
+  margin-left: -6px; /* keep the glyph itself on the charIndex column */
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+/* The 44px touch target is a pseudo-element so it never disturbs layout. */
+.chord-pill::after {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: var(--touch); height: var(--touch);
+  transform: translate(-50%, -50%);
+}
+.chord-pill.active {
+  color: var(--chord-active);
+  background: var(--tint-chord);
+  box-shadow: var(--glow-chord);
+}
+/* Confidence heat (D4) — off unless the sheet carries the class. */
+.sheet.heat .chord-pill.conf-low { background: var(--tint-danger); }
+.sheet.heat .chord-pill.conf-mid { background: var(--tint-warn); }
+
+/* --- transport ------------------------------------------------------------ */
+
+.transport {
+  display: flex; align-items: center; gap: var(--s2);
+  padding: var(--s2) var(--s3);
+  padding-bottom: calc(var(--s2) + env(safe-area-inset-bottom));
+  background: var(--bg2);
+  border-top: var(--hairline) solid var(--stroke);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.transport::-webkit-scrollbar { display: none; }
+.transport .spacer { flex: 1; }
+.play-btn { width: 56px; height: 56px; border-radius: 50%; font-size: 20px; padding: 0; }
+.ab-badge {
+  font-size: 10px; border-radius: 999px; padding: 0 5px;
+  background: var(--tint-accent); color: var(--accent);
+}
+
+/* --- popovers ------------------------------------------------------------- */
+
+.popover-backdrop {
+  position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, 0.5);
+  display: flex; align-items: center; justify-content: center; padding: var(--s4);
+}
+.popover {
+  background: var(--bg2);
+  border: var(--hairline) solid var(--stroke);
+  border-radius: var(--r-sheet);
+  box-shadow: var(--shadow-popover);
+  padding: var(--s4);
+  max-width: 340px; width: 100%;
+  max-height: 86vh; overflow-y: auto;
+}
+.popover h3 { margin: 0 0 var(--s1); font-size: var(--fs-body); }
+.popover .caption { color: var(--text-dim); font-size: var(--fs-small); margin-bottom: var(--s3); }
+.diagram-stage { display: flex; justify-content: center; min-height: 200px; }
+.diagram-stage svg { width: 180px; height: auto; }
+.voicing-dots { display: flex; gap: var(--s2); justify-content: center; margin-top: var(--s3); }
+.voicing-dot {
+  width: 10px; height: 10px; border-radius: 50%; padding: 0; min-width: 0; min-height: 0;
+  background: var(--stroke); border: 0; cursor: pointer;
+}
+.voicing-dot.active { background: var(--accent); }
+.voicing-pager { display: flex; align-items: center; justify-content: center; gap: var(--s3); margin-top: var(--s2); }
+.approx { background: var(--tint-warn); color: var(--warn); border-color: transparent; }
+.popover .actions { display: flex; gap: var(--s2); justify-content: flex-end; margin-top: var(--s4); }
+.control-row { display: flex; align-items: center; gap: var(--s3); margin-bottom: var(--s3); }
+.control-row label { flex: 1; margin: 0; color: var(--text-dim); font-size: var(--fs-small); }
+
+/* --- stage mode ----------------------------------------------------------- */
+
+body.stage .media-pane,
+body.stage .song-head,
+body.stage .transport.hidden-in-stage { display: none; }
+body.stage .sheet-scroll { padding-top: var(--s5); }
+.stage-zone {
+  position: fixed; top: 0; bottom: 0; width: 22vw; z-index: 5;
+  background: transparent; border: 0; cursor: pointer;
+}
+.stage-zone.left { left: 0; }
+.stage-zone.right { right: 0; }
+
+/* --- regular width -------------------------------------------------------- */
+
+@media (min-width: 900px) {
+  .song-layout { flex-direction: row-reverse; }
+  .media-pane {
+    flex: 0 0 38%;
+    display: flex; flex-direction: column; min-width: 280px;
+    border-left: var(--hairline) solid var(--stroke);
+    overflow-y: auto;
+  }
+  .sheet-pane { flex: 1; }
+  #back-btn { position: static; margin: var(--s2); align-self: flex-start; }
+  .rail { padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2); }
+}
+
+@media (max-width: 899px) {
+  .rail { display: none; }
+  .library-grid { padding: var(--s3) var(--s3) var(--s6); }
+  .library-head { padding: var(--s3); }
+}

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Snoocle</title>
+  <meta name="theme-color" content="#0E1116" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
+  <link rel="stylesheet" href="../tokens.css" />
+  <link rel="stylesheet" href="player.css" />
+</head>
+<body>
+  <div id="offline-banner" class="offline-banner" hidden>
+    Offline — cached sheets only, no video.
+  </div>
+
+  <!-- Library (hash route #/) -->
+  <section id="view-library" class="view">
+    <header class="library-head">
+      <h1>Snoocle</h1>
+      <div class="library-tools">
+        <input id="library-search" type="search" placeholder="Search songs"
+          autocomplete="off" aria-label="Search songs" />
+        <select id="library-sort" aria-label="Sort songs">
+          <option value="recent">Recent</option>
+          <option value="title">Title</option>
+          <option value="artist">Artist</option>
+        </select>
+        <a class="btn secondary" href="../" title="Open the admin">Admin</a>
+      </div>
+    </header>
+    <div id="library-grid" class="library-grid"></div>
+    <div id="library-empty" class="empty-state" hidden>
+      <div class="empty-art" aria-hidden="true">&#9834;</div>
+      <h2>Add your first song</h2>
+      <p class="muted">Songs analyzed in the admin appear here, ready to play along with.</p>
+      <a class="btn" href="../">Open the admin</a>
+    </div>
+  </section>
+
+  <!-- Song (hash route #/song/{id}) -->
+  <section id="view-song" class="view" hidden>
+    <div id="song-layout" class="song-layout">
+      <div id="media-pane" class="media-pane">
+        <button id="back-btn" class="btn secondary icon-btn" title="Back to library"
+          aria-label="Back to library">&#8592;</button>
+        <div id="player-frame" class="player-frame"><div id="yt-player"></div></div>
+        <div id="mini-bar" class="mini-bar" hidden>
+          <img id="mini-art" alt="" />
+          <div class="mini-meta">
+            <div id="mini-title"></div>
+            <div id="mini-time" class="muted"></div>
+          </div>
+        </div>
+        <div id="rail" class="rail"></div>
+      </div>
+
+      <div id="sheet-pane" class="sheet-pane">
+        <header id="song-head" class="song-head"></header>
+        <div id="section-chips" class="section-chips"></div>
+        <div id="sheet-scroll" class="sheet-scroll" tabindex="0">
+          <div id="sheet" class="sheet"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="transport" class="transport"></div>
+  </section>
+
+  <div id="popover-root"></div>
+
+  <!-- Vanilla, no build step. Vendored third-party libs are committed under
+       ui/vendor/ (see vendor/README.md); the only runtime external is
+       YouTube's IFrame Player API, which C2 requires by name. -->
+  <script src="../common.js"></script>
+  <script src="chordbox.js"></script>
+  <script src="timedscroll.js"></script>
+  <script src="theory.js"></script>
+  <script src="diagrams.js"></script>
+  <script src="controls.js"></script>
+  <script src="player.js"></script>
+</body>
+</html>

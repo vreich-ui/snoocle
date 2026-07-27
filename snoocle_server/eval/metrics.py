@@ -9,8 +9,18 @@ Metrics (all similarities are 0..1, higher = better):
 - chordRootSimilarity  same, roots only (forgives extension disagreements)
 - lyricSimilarity      1 - word error rate over the concatenated lyrics
 - sectionSimilarity    ordered section-kind/name sequence agreement
-- timingMAE            mean abs error of syncMap line times (seconds) or None
+- timingMAE            mean abs error of line times (seconds) or None
 - overall              weighted mean of the available similarities
+
+Timing-coverage metrics (master plan D3) describe the CANDIDATE alone — they
+answer "did Phase A's deterministic timing actually populate this song?", which
+is a different question from "does it agree with gold":
+- chordTimeCoverage    fraction of chord placements carrying a timeSeconds
+- lineTimeCoverage     fraction of lines carrying a timeSeconds
+- confidentLineShare   fraction of lines with confidence >= 0.75
+
+A song with no timing at all reports None for each, never 0.0 — "not measured"
+and "measured as zero" must not look the same on a scorecard.
 """
 
 from __future__ import annotations
@@ -79,10 +89,54 @@ def _word_error_rate(pred: list[str], gold: list[str]) -> float:
 
 
 def _sync_map(song: dict) -> dict[int, float]:
-    return {
+    """Line times, preferring the schema-v2 field and falling back to the v1
+    syncMap so a gold song recorded before Phase A still compares."""
+    times = {
         p["lineIndex"]: p["time"]
         for p in ((song.get("audio") or {}).get("syncMap") or [])
         if "lineIndex" in p and "time" in p
+    }
+    for line in song.get("lines") or []:
+        t = line.get("timeSeconds")
+        if t is not None:
+            times[line.get("lineIndex")] = t
+    return times
+
+
+CONFIDENT_LINE_THRESHOLD = 0.75
+
+
+def timing_coverage(song) -> dict:
+    """How much timing the candidate actually carries (D3).
+
+    Each value is None when the denominator is zero — a song with no chord
+    placements has no chord-time coverage to report, and reporting 0.0 would
+    read as "the engine failed" rather than "there was nothing to time".
+    """
+    song = _as_dict(song)
+    lines = song.get("lines") or []
+
+    total_chords = timed_chords = 0
+    for line in lines:
+        for p in line.get("chordPlacements") or []:
+            total_chords += 1
+            if p.get("timeSeconds") is not None:
+                timed_chords += 1
+
+    line_times = _sync_map(song)
+    timed_lines = sum(1 for line in lines if line.get("lineIndex") in line_times)
+    confident = sum(
+        1 for line in lines
+        if (line.get("confidence") or 0) >= CONFIDENT_LINE_THRESHOLD
+    )
+
+    def ratio(num: int, den: int) -> float | None:
+        return round(num / den, 4) if den else None
+
+    return {
+        "chordTimeCoverage": ratio(timed_chords, total_chords),
+        "lineTimeCoverage": ratio(timed_lines, len(lines)),
+        "confidentLineShare": ratio(confident, len(lines)),
     }
 
 
@@ -124,6 +178,7 @@ def score_song(candidate, gold) -> dict:
         "lyricWER": round(wer, 4),
         "sectionSimilarity": round(section_sim, 4),
         "timingMAE": round(timing_mae, 3) if timing_mae is not None else None,
+        **timing_coverage(cand),
         "overall": round(overall, 4),
         "counts": {
             "candLines": len(cand.get("lines") or []),

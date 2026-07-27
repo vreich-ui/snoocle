@@ -201,6 +201,9 @@ def test_store_unavailable_maps_to_503(monkeypatch):
         def list_songs(self):
             raise StoreUnavailableError("the database (default) does not exist")
 
+        def list_song_summaries(self):
+            raise StoreUnavailableError("the database (default) does not exist")
+
         def get(self, song_id, version=None):
             raise StoreUnavailableError("the database (default) does not exist")
 

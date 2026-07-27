@@ -77,6 +77,24 @@ Provider is a runtime choice (`provider` request param or
   direct LLM response.
 - `mock` is the deterministic offline reconciler used by tests.
 
+## Schema v2 (chord/line timing) and the N.C. policy
+
+`schema/song.py` v2 adds OPTIONAL `ChordPlacement.timeSeconds/confidence/beat/
+voicingHint`, `Line.timeSeconds/confidence`, and `AudioInfo.analyzedVideoId/
+videoOffsets/beats`. All v1 documents keep decoding unchanged. `voicingHint`
+is a display hint (e.g. a fret-diagram string) and is deliberately NEVER
+chord-parsed — it carries no harmony identity and is exempt from the
+sounding-harmony rule.
+
+**N.C. ("no chord") policy:** the server schema rejects `N.C.` (and other
+no-chord tokens — see `chords.is_no_chord`) as a stored `chord` value; an
+instrumental gap is represented by the ABSENCE of a placement over that span,
+not a placement whose chord is "no chord". The iOS app's older model treated
+`"N.C."` as a renderable marker chord; that special case is being removed
+client-side (see the iOS dev plan, task F1) in favor of rendering a gap
+glyph when a timed instrumental hole exceeds the scroll model's
+`maxGlideSeconds`. Do not reintroduce N.C. as a storable chord identity.
+
 ## Chord recognition engine
 
 `scripts/setup_chord_model.sh` vendors the real Chord-CNN-LSTM (ISMIR2019)

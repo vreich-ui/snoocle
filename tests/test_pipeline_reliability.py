@@ -78,6 +78,17 @@ def test_mock_analyze_is_fully_offline_and_persists(monkeypatch):
     assert client.get(f"/v1/songs/{sid}").status_code == 200
     assert client.get(f"/v1/songs/{sid}/versions").json()["versions"]
 
+    # plan A5 acceptance: even the fully-offline mock path produces a run
+    # record with a reviewQueue -- no candidates and no MIR means every
+    # chord the mock reconciler invented has zero independent evidence, so
+    # all of them land in the queue at the neutral default confidence.
+    run = client.get(f"/v1/runs/{body['runId']}").json()
+    assert isinstance(run.get("reviewQueue"), list)
+    assert len(run["reviewQueue"]) == 4  # mock song: C, G, Am, F
+    assert all(e["confidence"] == 0.5 for e in run["reviewQueue"])
+    assert all(e["confidence"] <= run["reviewQueue"][i + 1]["confidence"]
+               for i, e in enumerate(run["reviewQueue"][:-1]))
+
 
 def test_fatal_reconcile_failure_returns_502_naming_step(monkeypatch):
     def fail(*a, **k):  # noqa: ANN001
@@ -249,3 +260,70 @@ def test_best_effort_discover_failure_does_not_sink_request(monkeypatch):
     assert steps["discover"].startswith("failed")
     assert steps["reconcile"].startswith("ok")
     assert r.json()["storedVersion"]
+
+
+def test_timing_snap_populates_chord_times_end_to_end(monkeypatch, isolated_store):
+    """After a successful reconcile+MIR, the stored song gains chord/line
+    times and a regenerated syncMap -- the plan-A2 deterministic pass wired
+    into the pipeline, not just unit-tested in isolation."""
+    from snoocle_server.audio.acquire import AcquiredAudio
+    from snoocle_server.mir.base import ChordSegment, MirAnalysis
+
+    def fake_song(song_id="anon--x") -> Song:
+        return Song.model_validate(
+            {
+                "id": song_id,
+                "metadata": {"title": "X", "artist": "Anon"},
+                "lines": [
+                    {
+                        "lineIndex": 0,
+                        "lyrics": "la la",
+                        "chordPlacements": [{"charIndex": 0, "chord": "C"}],
+                    }
+                ],
+                "provenance": [
+                    {"timestamp": "2026-07-09T00:00:00Z", "actor": "reconcile:test/fake", "action": "reconciled"}
+                ],
+            }
+        )
+
+    monkeypatch.setattr(pipeline_mod, "discover_sources", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pipeline_mod,
+        "acquire",
+        lambda *a, **k: AcquiredAudio(
+            video_id="dQw4w9WgXcQ", video_title="X", path="/tmp/fake.wav", duration_seconds=3.0
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "analyze_audio",
+        lambda *a, **k: MirAnalysis(
+            engines={"chords": "chord-cnn-lstm"},
+            chords=[ChordSegment(start=1.5, end=3.0, chord="C")],
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_mod, "reconcile", lambda *a, **k: _fake_result_from(fake_song("anon--x"))
+    )
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "X", "artist": "Anon", "provider": "anthropic"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["steps"]["timing"].startswith("ok")
+
+    stored = isolated_store.get("anon--x")
+    assert stored.lines[0].chordPlacements[0].timeSeconds == 1.5
+    assert stored.lines[0].timeSeconds == 1.5
+    assert [(sp.lineIndex, sp.time) for sp in stored.audio.syncMap] == [(0, 1.5)]
+    assert stored.audio.analyzedVideoId == "dQw4w9WgXcQ"
+    assert any(p.action == "timing-snap" for p in stored.provenance)
+
+
+def _fake_result_from(song: Song) -> ReconcileResult:
+    return ReconcileResult(
+        song=song, provider="anthropic", model="fake", attempts=1, audio_attached=False, usage={}
+    )

@@ -82,6 +82,11 @@ class RunTrace:
     mir: dict | None = None
     # Every analyze_audio_window probe the agent made: {window, chords, bpm, beats}.
     mir_windows: list[dict] = field(default_factory=list)
+    # Low-confidence chord placements worth a human look — see
+    # timing.confidence.build_review_queue. Small by construction (a
+    # handful of entries), so it stays in the run summary (list views),
+    # unlike "mir"/"mirWindows" which get stripped there.
+    review_queue: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -99,6 +104,7 @@ class RunTrace:
             "steps": [s.to_dict() for s in self.steps],
             "mir": self.mir,
             "mirWindows": self.mir_windows,
+            "reviewQueue": self.review_queue,
         }
 
 
@@ -140,6 +146,13 @@ class TraceRecorder:
         """Record one agent analyze_audio_window probe (window + its results)."""
         with self._lock:
             self.trace.mir_windows.append(window)
+        _publish(self.trace)
+
+    def set_review_queue(self, review_queue: list[dict]) -> None:
+        """Attach the run's low-confidence-chord review queue (see
+        timing.confidence) — replaces any previous value."""
+        with self._lock:
+            self.trace.review_queue = list(review_queue)
         _publish(self.trace)
 
     def finish(self, status: str, model: str = "", error: str | None = None) -> None:

@@ -19,6 +19,22 @@ Invariants enforced here (not just documented):
 - placements per line strictly ascending by charIndex,
 - sections reference valid, non-overlapping, ascending line ranges,
 - syncMap times non-decreasing and lineIndexes valid.
+
+Schema v2 additions (all OPTIONAL — v1 documents keep decoding unchanged):
+- ChordPlacement.timeSeconds/confidence/beat: when the audio's actual sound
+  of a chord change is known (MIR-grounded), it lives here. Populated by a
+  deterministic post-pass (snoocle_server.timing.snap), never invented by an
+  LLM.
+- ChordPlacement.voicingHint: a DISPLAY hint only (e.g. a fret-diagram
+  string like "244222"). It is never chord-parsed and never participates in
+  the sounding-harmony rule — see validate_stored_chord, which is only ever
+  called on `chord`, not on this field.
+- Line.timeSeconds/confidence: when this line starts singing.
+- AudioInfo.analyzedVideoId: which upload the song's times were measured
+  against — a DIFFERENT upload of the same song needs a videoOffsets entry.
+- AudioInfo.videoOffsets: videoId -> seconds to ADD to every stored time when
+  that specific video is the one playing.
+- AudioInfo.beats: a downbeat/beat grid, MIR-derived, for metronome/snapping.
 """
 
 from __future__ import annotations
@@ -30,7 +46,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ..chords import ChordParseError, validate_stored_chord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Guard against pathological payloads (a beat grid is O(song-duration), never
+# tens of thousands of entries for anything that is actually a song).
+_MAX_BEATS = 10_000
 
 SectionKind = Literal[
     "intro",
@@ -52,10 +72,25 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class BeatRef(_Model):
+    """A pointer into the song's beat grid (AudioInfo.beats) — measure/beat
+    numbering, not seconds, so it survives small timing re-estimates."""
+
+    measure: int = Field(ge=1)
+    beat: float = Field(ge=1)
+
+
 class ChordPlacement(_Model):
     charIndex: int = Field(ge=0)
     # Sounding harmony, never a fretboard shape. Enforced by validator.
     chord: str
+    # --- schema v2, all optional --------------------------------------
+    timeSeconds: Optional[float] = Field(default=None, ge=0)
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    beat: Optional[BeatRef] = None
+    # DISPLAY hint only (e.g. "244222"). Never validated as a chord identity
+    # and never read by the sounding-harmony rule — see module docstring.
+    voicingHint: Optional[str] = None
 
     @field_validator("chord")
     @classmethod
@@ -71,10 +106,14 @@ class Line(_Model):
     lineIndex: int = Field(ge=0)
     lyrics: str
     chordPlacements: list[ChordPlacement] = Field(default_factory=list)
+    # --- schema v2, optional -------------------------------------------
+    timeSeconds: Optional[float] = Field(default=None, ge=0)
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def _placements_valid(self) -> "Line":
         prev = -1
+        prev_time: Optional[float] = None
         for p in self.chordPlacements:
             if p.charIndex <= prev:
                 raise ValueError(
@@ -82,6 +121,13 @@ class Line(_Model):
                     f"ascending by charIndex (got {p.charIndex} after {prev})"
                 )
             prev = p.charIndex
+            if p.timeSeconds is not None:
+                if prev_time is not None and p.timeSeconds < prev_time:
+                    raise ValueError(
+                        f"line {self.lineIndex}: chordPlacements.timeSeconds must be "
+                        f"non-decreasing by charIndex (got {p.timeSeconds} after {prev_time})"
+                    )
+                prev_time = p.timeSeconds
         if self.lyrics:  # empty-lyric lines use ordinal slots, no upper bound
             for p in self.chordPlacements:
                 if p.charIndex > len(self.lyrics):
@@ -115,16 +161,50 @@ class SyncPoint(_Model):
     time: float = Field(ge=0)  # seconds into the recording
 
 
+class BeatMark(_Model):
+    """One entry of the song's beat grid — MIR-derived, used for metronome
+    click scheduling and snapping chord/line times to musical positions."""
+
+    time: float = Field(ge=0)
+    measure: int = Field(ge=1)
+    beatInMeasure: int = Field(ge=1)
+
+
 class AudioInfo(_Model):
     youtubeVideoId: Optional[str] = None
     durationSeconds: Optional[float] = Field(default=None, ge=0)
     syncMap: list[SyncPoint] = Field(default_factory=list)
+    # --- schema v2, optional --------------------------------------------
+    # The upload the song's stored times were actually measured against.
+    # Playing a DIFFERENT upload of the same song needs a videoOffsets entry
+    # (below) rather than re-measuring the whole song.
+    analyzedVideoId: Optional[str] = None
+    # videoId -> seconds to ADD to every stored time when that video plays.
+    videoOffsets: dict[str, float] = Field(default_factory=dict)
+    # Downbeat/beat grid. Capped well above anything a real song produces —
+    # a guard against a pathological payload, not a working limit.
+    beats: list[BeatMark] = Field(default_factory=list)
 
-    @field_validator("youtubeVideoId")
+    @field_validator("youtubeVideoId", "analyzedVideoId")
     @classmethod
     def _plausible_video_id(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and not re.fullmatch(r"[A-Za-z0-9_-]{11}", v):
             raise ValueError(f"implausible YouTube video id: {v!r}")
+        return v
+
+    @field_validator("videoOffsets")
+    @classmethod
+    def _offset_keys_are_video_ids(cls, v: dict[str, float]) -> dict[str, float]:
+        for key in v:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", key):
+                raise ValueError(f"implausible YouTube video id in videoOffsets: {key!r}")
+        return v
+
+    @field_validator("beats")
+    @classmethod
+    def _beats_bounded(cls, v: list[BeatMark]) -> list[BeatMark]:
+        if len(v) > _MAX_BEATS:
+            raise ValueError(f"beats grid too large ({len(v)} > {_MAX_BEATS})")
         return v
 
 
@@ -172,11 +252,19 @@ class Song(_Model):
 
     @model_validator(mode="after")
     def _cross_field_invariants(self) -> "Song":
+        prev_line_time: Optional[float] = None
         for i, line in enumerate(self.lines):
             if line.lineIndex != i:
                 raise ValueError(
                     f"lines must be contiguous from 0: position {i} has lineIndex {line.lineIndex}"
                 )
+            if line.timeSeconds is not None:
+                if prev_line_time is not None and line.timeSeconds < prev_line_time:
+                    raise ValueError(
+                        f"line {line.lineIndex}: timeSeconds must be non-decreasing "
+                        f"across lines (got {line.timeSeconds} after {prev_line_time})"
+                    )
+                prev_line_time = line.timeSeconds
         n = len(self.lines)
         prev_end = -1
         prev_idx = -1

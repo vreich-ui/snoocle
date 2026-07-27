@@ -41,6 +41,8 @@ from .reconcile.trace import TraceRecorder, start_run
 from .schema.song import slugify_song_id
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
+from .timing.confidence import build_review_queue, score_song
+from .timing.snap import snap_chords
 
 log = logging.getLogger(__name__)
 
@@ -332,10 +334,49 @@ async def run_pipeline_async(
         ) from e
     result = report.reconcile
     recorder.finish("ok", model=result.model)
-    _persist_trace(recorder)
     report.steps["reconcile"] = (
         f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"
     )
+
+    # 5b. deterministic MIR-grounded chord/line timing (best-effort — a
+    # failure here must never block storing an otherwise-good reconciled
+    # song; the pipeline continues with whatever timing the reconciler
+    # itself produced, which today is none — this is the only step that
+    # populates it). A no-op when MIR didn't run for this song.
+    try:
+        timed_song = snap_chords(result.song, report.mir)
+        if report.mir is not None and report.audio is not None:
+            timed_song = timed_song.model_copy(
+                update={
+                    "audio": timed_song.audio.model_copy(
+                        update={"analyzedVideoId": report.audio.video_id}
+                    )
+                }
+            )
+        result.song = timed_song
+        report.steps["timing"] = "ok" if report.mir is not None else "skipped (no MIR)"
+    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+        report.steps["timing"] = f"failed: {e}"
+        log.warning("pipeline.step error step=timing err=%s", e)
+
+    # 5c. per-chord agreement scoring (best-effort). Must run AFTER 5b: the
+    # MIR-agreement signal reads placement.timeSeconds, which 5b is what
+    # populates. Refines confidence when both a source and MIR signal exist,
+    # and records a compact "check these first" queue on the run trace.
+    try:
+        scored_song, scores = score_song(result.song, report.candidates, report.mir)
+        result.song = scored_song
+        recorder.set_review_queue(build_review_queue(scores))
+        report.steps["confidence"] = f"ok: {len(scores)} placement(s) scored"
+    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+        report.steps["confidence"] = f"failed: {e}"
+        log.warning("pipeline.step error step=confidence err=%s", e)
+
+    # Persist the trace now that timing/confidence (5b/5c) have had their
+    # chance to attach a review queue -- persisting right after `finish()`
+    # (as the fatal-path branches above still correctly do, since those
+    # never reach 5b/5c) would durably store a run missing that data.
+    _persist_trace(recorder)
 
     # 6-7. version-controlled persistence (FATAL, except a 409 conflict which
     # the API surfaces as-is). Every run is a new immutable version.

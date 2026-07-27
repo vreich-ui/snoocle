@@ -8,6 +8,7 @@ lives only in the git-backed store and the audio cache.
 from __future__ import annotations
 
 import dataclasses
+import mimetypes
 import os
 import secrets
 import tempfile
@@ -26,6 +27,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
 from .audio import utils as audio_utils
+from .batch import MAX_ITEMS_PER_SUBMIT, get_queue, parse_batch_line
 from .audio.acquire import AcquisitionError, YouTubeAuthError, acquire
 from .config import settings
 from .discovery import CandidateSource, discover_sources
@@ -85,9 +87,18 @@ _mcp_asgi_app = _mcp.streamable_http_app()  # creates the session manager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Run the MCP StreamableHTTP session manager for the app's lifetime.
+    # Run the MCP StreamableHTTP session manager for the app's lifetime, and
+    # alongside it the batch-analysis worker (master plan D2). The worker is
+    # an in-process asyncio task, so on Cloud Run the service must be deployed
+    # with --min-instances=1 or a scale-to-zero drops a queue mid-drain; see
+    # docs/DEPLOY_CLOUD_RUN.md.
+    queue = get_queue()
     async with _mcp.session_manager.run():
-        yield
+        queue.start()
+        try:
+            yield
+        finally:
+            await queue.stop()
 
 
 app = FastAPI(
@@ -600,9 +611,93 @@ def _aggregate_scores(metrics: list[dict]) -> dict:
     keys = ["chordSimilarity", "chordRootSimilarity", "lyricSimilarity",
             "sectionSimilarity", "overall"]
     out = {k: round(sum(m[k] for m in metrics) / len(metrics), 4) for k in keys}
-    timings = [m["timingMAE"] for m in metrics if m.get("timingMAE") is not None]
-    out["timingMAE"] = round(sum(timings) / len(timings), 3) if timings else None
+
+    # Optional metrics average only over the songs that HAVE them, and stay
+    # None when none do — a scorecard column reading "—" means "not measured";
+    # 0.0 would mean "measured, and terrible". Those must not be confusable.
+    for key, places in (("timingMAE", 3), ("chordTimeCoverage", 4),
+                        ("lineTimeCoverage", 4), ("confidentLineShare", 4)):
+        present = [m[key] for m in metrics if m.get(key) is not None]
+        out[key] = round(sum(present) / len(present), places) if present else None
     return out
+
+
+# --- batch analysis queue (master plan D2) ----------------------------------
+# Submit many songs, one worker drains them sequentially through the same
+# pipeline as POST /v1/songs/analyze. A failure marks that job and moves on.
+
+
+class QueueItem(BaseModel):
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    youtubeUrlOrId: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _identity_or_url(self) -> "QueueItem":
+        if not ((self.title and self.artist) or self.youtubeUrlOrId or self.title):
+            raise ValueError("provide a title (with artist when known), or youtubeUrlOrId")
+        return self
+
+
+class QueueRequest(BaseModel):
+    """Either structured `items`, or `text` — one song per line, exactly what
+    the admin's 'Add many' textarea contains."""
+
+    items: list[QueueItem] = Field(default_factory=list)
+    text: Optional[str] = None
+    provider: Optional[str] = None
+    analysisDepth: Optional[Literal["fast", "standard", "thorough"]] = None
+
+
+@app.post("/v1/queue")
+def post_queue(req: QueueRequest) -> dict:
+    specs: list[dict] = [i.model_dump(exclude_none=True) for i in req.items]
+    if req.text:
+        for line in req.text.splitlines():
+            parsed = parse_batch_line(line)
+            if parsed:
+                specs.append(parsed)
+    if not specs:
+        raise HTTPException(status_code=400, detail="no songs to queue")
+    try:
+        jobs = get_queue().submit(specs, provider=req.provider,
+                                  analysis_depth=req.analysisDepth)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"queued": len(jobs), "jobs": [j.to_json() for j in jobs]}
+
+
+@app.get("/v1/queue")
+def get_queue_status(limit: int = 200) -> dict:
+    q = get_queue()
+    return {"jobs": [j.to_json() for j in q.list_jobs(limit=limit)], **q.stats(),
+            "maxPerSubmit": MAX_ITEMS_PER_SUBMIT}
+
+
+@app.post("/v1/queue/{job_id}/retry")
+def post_queue_retry(job_id: str) -> dict:
+    try:
+        return get_queue().retry(job_id).to_json()
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@app.post("/v1/queue/{job_id}/cancel")
+def post_queue_cancel(job_id: str) -> dict:
+    try:
+        return get_queue().cancel(job_id).to_json()
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@app.delete("/v1/queue")
+def delete_queue_finished() -> dict:
+    """Drop finished jobs from the list. Running/queued jobs are untouched."""
+    return {"removed": get_queue().clear_finished()}
 
 
 # --- step 7: versioned store -------------------------------------------------
@@ -610,7 +705,22 @@ def _aggregate_scores(metrics: list[dict]) -> dict:
 
 @app.get("/v1/songs")
 def get_songs() -> dict:
-    return {"songs": get_store().list_songs()}
+    """The library listing.
+
+    ``songs`` stays exactly what it always was — a sorted list of ids — because
+    the iOS app, the MCP tools and every existing script read it that way.
+    ``items`` is the ADDITIVE Phase C addition: the same songs as list-view
+    rows (title, artist, latestVersion, updatedAt, youtubeVideoId, hasTiming)
+    so the player's library grid can render artwork, labels and a timing badge
+    in one request instead of N+1 song fetches. Clients that don't know about
+    ``items`` are unaffected; clients that do fall back to ``songs`` when a
+    server predates it.
+    """
+    summaries = get_store().list_song_summaries()
+    return {
+        "songs": [s.id for s in summaries],
+        "items": [s.to_json() for s in summaries],
+    }
 
 
 @app.get("/v1/songs/{song_id}")
@@ -1019,6 +1129,12 @@ async def post_probe(file: UploadFile = File(...)) -> dict:
 @app.get("/")
 def root_redirect() -> RedirectResponse:
     return RedirectResponse("/ui/")
+
+
+# The PWA manifest (master plan C5). Python's mimetypes table predates the
+# .webmanifest extension, so StaticFiles would serve it as text/plain and some
+# browsers refuse to install from that. Registering the type is the whole fix.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 
 class _RevalidatingStatic(StaticFiles):

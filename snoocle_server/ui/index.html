@@ -3,22 +3,32 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Snoocle</title>
+  <title>Snoocle — admin</title>
+  <link rel="stylesheet" href="tokens.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <div id="app">
+    <button id="sidebar-toggle" class="btn secondary" aria-expanded="false"
+      aria-controls="sidebar" title="Show song list">&#9776;<span class="visually-hidden"> Songs</span></button>
+    <div id="sidebar-scrim" hidden></div>
+
     <aside id="sidebar">
       <header>
         <h1>Snoocle</h1>
         <div class="row">
           <button class="btn" id="add-song-btn">Add song</button>
-          <button class="btn secondary" id="refresh-btn" title="Refresh list">&#x21bb;</button>
+          <button class="btn secondary" id="refresh-btn" title="Refresh list"
+            aria-label="Refresh list">&#x21bb;</button>
         </div>
-        <button class="btn secondary" id="scorecard-btn" style="margin-top:8px; width:100%"
+        <button class="btn secondary sidebar-wide" id="queue-btn"
+          title="Queue many songs for analysis">Queue</button>
+        <button class="btn secondary sidebar-wide" id="scorecard-btn"
           title="Score the agent against gold versions">Scorecard</button>
-        <button class="btn secondary" id="workbench-btn" style="margin-top:6px; width:100%"
+        <button class="btn secondary sidebar-wide" id="workbench-btn"
           title="Program the reconciliation agent">Workbench</button>
+        <a class="btn secondary sidebar-wide" id="player-link" href="play/"
+          title="Open the play-along player">Play-along player &rarr;</a>
       </header>
       <ul id="song-list"></ul>
     </aside>
@@ -28,19 +38,24 @@
 
       <nav id="tabs">
         <button data-tab="edit" class="active">Edit</button>
+        <button data-tab="review">Review</button>
         <button data-tab="agent">Agent</button>
         <button data-tab="versions">Versions</button>
         <button data-tab="play">Play</button>
       </nav>
 
       <section id="tab-edit" class="tab-panel active"></section>
+      <section id="tab-review" class="tab-panel"></section>
       <section id="tab-agent" class="tab-panel"></section>
       <section id="tab-versions" class="tab-panel"></section>
       <section id="tab-play" class="tab-panel"></section>
     </main>
   </div>
 
-  <!-- app.js is a dependency-free vanilla module; no build step, no CDN. -->
+  <!-- Dependency-free vanilla scripts; no build step, no CDN.
+       common.js holds the api/apiJson/el/clear helpers the player shares. -->
+  <script src="common.js"></script>
   <script src="app.js"></script>
+  <script src="admin-d.js"></script>
 </body>
 </html>

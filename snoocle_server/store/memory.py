@@ -20,6 +20,7 @@ from ..schema import Song
 from .base import (
     SaveResult,
     SongRepository,
+    SongSummary,
     SongVersion,
     StoreError,
     VersionConflictError,
@@ -28,6 +29,7 @@ from .base import (
     count_cookie_lines,
     next_timestamp,
     now_iso,
+    song_has_timing,
     unified_song_diff,
     version_sha,
 )
@@ -49,6 +51,11 @@ class _Record:
     updated_at: str
     versions: dict[str, _Version] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)  # append order == oldest->newest
+    # Denormalized list-view extras (mirrors the Firestore document's
+    # top-level fields, so both backends answer list_song_summaries()
+    # identically without reading a song blob).
+    youtube_video_id: str | None = None
+    has_timing: bool = False
 
 
 class InMemorySongRepository(SongRepository):
@@ -82,6 +89,21 @@ class InMemorySongRepository(SongRepository):
     def list_songs(self) -> list[str]:
         with self._lock:
             return sorted(self._songs)
+
+    def list_song_summaries(self) -> list[SongSummary]:
+        with self._lock:
+            return [
+                SongSummary(
+                    id=song_id,
+                    title=rec.title,
+                    artist=rec.artist,
+                    latest_version=rec.latest_version,
+                    updated_at=rec.updated_at,
+                    youtube_video_id=rec.youtube_video_id,
+                    has_timing=rec.has_timing,
+                )
+                for song_id, rec in sorted(self._songs.items())
+            ]
 
     def current_version(self, song_id: str) -> str | None:
         with self._lock:
@@ -167,4 +189,6 @@ class InMemorySongRepository(SongRepository):
             rec.updated_at = ts
             rec.title = song.metadata.title
             rec.artist = song.metadata.artist
+            rec.youtube_video_id = song.audio.youtubeVideoId if song.audio else None
+            rec.has_timing = song_has_timing(song)
             return SaveResult(song.id, sha, ts, message)

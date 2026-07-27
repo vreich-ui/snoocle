@@ -1,16 +1,16 @@
 # Acceptance test report
 
-- Run: 2026-07-06T21:42:27+00:00 — mode: offline (fixtures)
+- Run: 2026-07-27T11:54:48+00:00 — mode: offline (fixtures)
 - Command: `scripts/acceptance.py --offline`
-Summary: 1x BLOCKED, 1x PARTIAL, 5x PASS
+Summary: 1x BLOCKED, 1x FAIL, 5x PASS
 
 ## Step 1: title+artist -> video -> audio -> schema-compliant JSON
-**PARTIAL**
+**FAIL**
 
-- live YouTube search+acquire (no URL): HTTP 502 — {'detail': 'YouTube search failed for \'The Beatles Let It Be\': ERROR: query "The Beatles Let It Be" page 1: Unable to download API page: (\'Unable to connect to proxy\', OSError(\'Tunnel connection 
+- live YouTube search+acquire (no URL): HTTP 502 — {'detail': 'yt-dlp failed for CGj85pVzRJs: ERROR: [youtube] CGj85pVzRJs: This video is not available'}
 - offline fallback: cache-seeded synthetic recording as video ZZacceptZZ0
-- POST /v1/songs/analyze: HTTP 200, steps={'discover': 'ok: 3 candidate source(s)', 'acquire': 'ok: ZZacceptZZ0 (Acceptance Song [ZZacceptZZ0])', 'mir': "ok: engines={'beats': 'madmom', 'chords': 'chroma-template-fallback', 'structure': 'librosa-agglomerative-fallback'}", 'reconcile': 'ok: provider=mock model=mock-reconciler-v1 attempts=1', 'store': 'ok: version 52019163375f'}
-- produced JSON contains: {'chords': True, 'lyrics': True, 'sections': True, 'mirTimestamps': True}
+- POST /v1/songs/analyze: HTTP 200, steps={'discover': 'skipped (mock: offline deterministic reconciler)', 'acquire': 'ok: ZZacceptZZ0 (Acceptance Song [ZZacceptZZ0])', 'mir': "ok: engines={'beats': 'librosa-fallback', 'chords': 'chroma-template-fallback', 'structure': 'librosa-agglomerative-fallback'}", 'reconcile': 'ok: provider=mock model=mock-reconciler-v1 attempts=1', 'timing': 'ok', 'lrc': 'skipped (mock: offline deterministic reconciler)', 'confidence': 'ok: 4 placement(s) scored', 'store': 'ok: version 5ac9f0354467'}
+- produced JSON contains: {'chords': True, 'lyrics': True, 'sections': True, 'mirTimestamps': False}
 
 ## Step 2: reconciliation on >=2 of 3 LLM providers, same input, all sources used
 **BLOCKED**
@@ -21,35 +21,35 @@ Summary: 1x BLOCKED, 1x PARTIAL, 5x PASS
   "error": {
     "code": 403,
     "message": "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of AP
-- provider openai: HTTP 502 — openai: connection failed: 403 Forbidden
+- provider openai: HTTP 502 — openai: connection failed: Illegal header value b'Bearer '
 - mock provider (offline stand-in): HTTP 200, attempts=1
 - offline evidence for multi-source use + identical cross-provider input: tests/test_provider_parity.py (3 passed)
 
-## Step 3: re-run creates new committed version; prior preserved and git-diffable
+## Step 3: re-run creates new stored version; prior preserved and diffable
 **PASS**
 
-- run A stored f1b59ce42493, run B stored 03f2801fd79e (distinct=True)
+- run A stored 74d19fc4c676, run B stored 650c6b663401 (distinct=True)
 - versions endpoint lists 3 versions; both runs present=True
-- git diff between runs: 47 lines (rc=0)
+- JSON diff between runs: 41 lines (rc=0)
 - prior version still retrievable: HTTP 200
 
 ## Step 4: output validates against Song schema; no capo'd/shape chord stored
 **PASS**
 
-- stored JSON validates against Song schema (schemaVersion=1)
-- spot check: 32 chord placements, all parse as sounding harmonies, shape-like identities found: 0
+- stored JSON validates against Song schema (schemaVersion=2)
+- spot check: 4 chord placements, all parse as sounding harmonies, shape-like identities found: 0
 - chord vocabulary: ['Am', 'C', 'F', 'G']
 
 ## Step 5: whole pipeline callable via curl
 **PASS**
 
-- every call in this run was made through `curl` against the live server (http://127.0.0.1:41875), no iOS app involved
-- e2e pipeline call: POST /v1/songs/analyze -> HTTP 200 with stored version 03f2801fd79e
+- every call in this run was made through `curl` against the live server (http://127.0.0.1:54683), no iOS app involved
+- e2e pipeline call: POST /v1/songs/analyze -> HTTP 200 with stored version 650c6b663401
 
 ## Step 6: MCP wrapper callable from MCP client; distinct per-step tools
 **PASS**
 
-- real MCP client over stdio (official `mcp` SDK): 1 passed in 1.52s
+- real MCP client over stdio (official `mcp` SDK): 10 passed, 1 warning in 10.37s
 - verifies: 16 distinct step-scoped tools listed, server_status + trim_audio (base64 round-trip) + get_song_schema callable
 
 ## Step 7: deterministic audio utilities (convert, trim) work on a sample file

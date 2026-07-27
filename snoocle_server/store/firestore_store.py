@@ -3,8 +3,9 @@
 Data model (per the build brief):
 
 - ``songs/{songId}`` — the latest Song plus denormalized ``{title, artist,
-  latestVersion, updatedAt}`` so GET /v1/songs and title/artist queries are
-  cheap (no need to open the versions subcollection).
+  latestVersion, updatedAt, youtubeVideoId, hasTiming}`` so GET /v1/songs and
+  title/artist queries are cheap (no need to open the versions subcollection,
+  and — via a projection query — no need to read the song blob at all).
 - ``songs/{songId}/versions/{versionSha}`` — an immutable snapshot
   ``{song, message, timestamp, parent}``. ``versionSha`` is the content hash
   (see :func:`version_sha`); ``parent`` is the sha this was written on top of,
@@ -25,6 +26,7 @@ from ..schema import Song
 from .base import (
     SaveResult,
     SongRepository,
+    SongSummary,
     SongVersion,
     StoreError,
     StoreUnavailableError,
@@ -34,6 +36,8 @@ from .base import (
     count_cookie_lines,
     next_timestamp,
     now_iso,
+    summarize_song,
+    summary_from_record,
     unified_song_diff,
     version_sha,
 )
@@ -142,6 +146,26 @@ class FirestoreSongRepository(SongRepository):
         # blobs — cheap id enumeration.
         return sorted(ref.id for ref in self._collection.list_documents())
 
+    _SUMMARY_FIELDS = [
+        "title",
+        "artist",
+        "latestVersion",
+        "updatedAt",
+        "youtubeVideoId",
+        "hasTiming",
+    ]
+
+    @_translate_infra_errors
+    def list_song_summaries(self) -> list[SongSummary]:
+        # select() projects server-side: Firestore returns ONLY the small
+        # denormalized fields, never the (large) song blob. Documents written
+        # before youtubeVideoId/hasTiming existed simply omit them and
+        # summary_from_record fills the empty defaults.
+        query = self._collection.select(self._SUMMARY_FIELDS)
+        rows = [summary_from_record(doc.id, doc.to_dict() or {}) for doc in query.stream()]
+        rows.sort(key=lambda s: s.id)
+        return rows
+
     @_translate_infra_errors
     def current_version(self, song_id: str) -> str | None:
         data = self._song_ref(song_id).get().to_dict()
@@ -225,13 +249,7 @@ class FirestoreSongRepository(SongRepository):
             )
             transaction.set(
                 song_ref,
-                {
-                    "song": song_json,
-                    "title": song.metadata.title,
-                    "artist": song.metadata.artist,
-                    "latestVersion": sha,
-                    "updatedAt": ts,
-                },
+                {"song": song_json, **summarize_song(song, sha, ts)},
             )
             return SaveResult(song.id, sha, ts, message)
 

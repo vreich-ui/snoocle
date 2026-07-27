@@ -1,0 +1,199 @@
+/* Snoocle design tokens — the single source of colour, type, space, shape and
+ * motion for BOTH surfaces: the developer admin (/ui/) and the play-along
+ * player (/ui/play/). Values are transcribed verbatim from the master plan's
+ * §3.5 design system; nothing here is improvised, and no UI file may hardcode
+ * a colour or a radius that isn't defined below.
+ *
+ * Dark is the player default. The light theme keeps the same hues and inverts
+ * lightness. `prefers-color-scheme` picks automatically; `data-theme="dark"`
+ * or `data-theme="light"` on <html> forces one. `data-theme="stage"` is the
+ * OLED stage mode: pure black, 1.15x sheet text.
+ *
+ * No build step: these are plain CSS custom properties.
+ */
+
+:root {
+  /* --- palette (dark, the default) ------------------------------------- */
+  --bg0: #0E1116;        /* app background */
+  --bg1: #151A21;        /* cards / panels */
+  --bg2: #1D242E;        /* raised: popovers, bars */
+  --stroke: #2A3340;
+  --text: #E9EDF2;
+  --text-dim: #8B96A5;
+  --accent: #5B8CFF;
+  --accent-text: #0B0E12;  /* text ON an accent fill */
+  --chord: #FFB454;        /* chords are ALWAYS this amber family */
+  --chord-active: #FFD27D;
+  --ok: #3FCF8E;
+  --warn: #F6C445;
+  --danger: #FF6B5E;
+
+  /* Confidence tints — the same hues at 18% alpha (D4 / Phase H). */
+  --tint-ok: rgba(63, 207, 142, 0.18);
+  --tint-warn: rgba(246, 196, 69, 0.18);
+  --tint-danger: rgba(255, 107, 94, 0.18);
+  --tint-accent: rgba(91, 140, 255, 0.18);
+  --tint-chord: rgba(255, 180, 84, 0.12);
+  --glow-chord: 0 0 10px rgba(255, 210, 125, 0.45);
+
+  /* --- type ------------------------------------------------------------ */
+  --font-ui: system-ui, -apple-system, "SF Pro Text", Segoe UI, Roboto,
+             Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --fs-sheet-chord: 15px;
+  --fs-sheet-lyric: 17px;
+  --fs-section: 13px;
+  --fs-title: 20px;
+  --fs-body: 15px;
+  --fs-small: 13px;
+  --lh-sheet: 1.6;
+  --tracking-section: 0.06em;
+  /* Player font-size control multiplies this; 1 = the spec sizes above. */
+  --sheet-scale: 1;
+
+  /* --- space (4pt scale) ----------------------------------------------- */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+
+  /* --- shape ------------------------------------------------------------ */
+  --r-control: 10px;
+  --r-card: 14px;
+  --r-sheet: 20px;
+  --hairline: 1px;
+
+  /* --- elevation (dark: popovers only) ---------------------------------- */
+  --shadow-popover: 0 2px 16px rgba(0, 0, 0, 0.30);
+
+  /* Text drawn on top of a saturated generated fill (the MIR timeline's
+     per-chord blocks pick their own hue). White in BOTH themes on purpose —
+     the fill underneath is always saturated, never the page background. */
+  --text-on-fill: #FFFFFF;
+
+  /* --- motion ----------------------------------------------------------- */
+  --dur-fast: 120ms;    /* chord-pill activation */
+  --dur: 180ms;         /* default state change */
+  --dur-slow: 250ms;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1); /* ease-out */
+
+  /* --- touch ------------------------------------------------------------ */
+  --touch: 44px;
+}
+
+/* Light theme: same hues, inverted lightness. Dark-first, but shipped. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]):not([data-theme="stage"]) {
+    --bg0: #FBFCFD;
+    --bg1: #F2F4F7;
+    --bg2: #E7EBF1;
+    --stroke: #D2D9E2;
+    --text: #141A21;
+    --text-dim: #5D6875;
+    --accent: #2F5FD0;
+    --accent-text: #FFFFFF;
+    --chord: #A96410;
+    --chord-active: #7E4805;
+    --ok: #17794F;
+    --warn: #8A6A08;
+    --danger: #C0392B;
+
+    --tint-ok: rgba(23, 121, 79, 0.18);
+    --tint-warn: rgba(138, 106, 8, 0.18);
+    --tint-danger: rgba(192, 57, 43, 0.18);
+    --tint-accent: rgba(47, 95, 208, 0.18);
+    --tint-chord: rgba(169, 100, 16, 0.12);
+    --glow-chord: 0 0 10px rgba(126, 72, 5, 0.28);
+    --shadow-popover: 0 2px 16px rgba(20, 26, 33, 0.18);
+  }
+}
+
+/* Explicit overrides (a theme switch beats the OS preference). */
+:root[data-theme="light"] {
+  --bg0: #FBFCFD;
+  --bg1: #F2F4F7;
+  --bg2: #E7EBF1;
+  --stroke: #D2D9E2;
+  --text: #141A21;
+  --text-dim: #5D6875;
+  --accent: #2F5FD0;
+  --accent-text: #FFFFFF;
+  --chord: #A96410;
+  --chord-active: #7E4805;
+  --ok: #17794F;
+  --warn: #8A6A08;
+  --danger: #C0392B;
+  --tint-ok: rgba(23, 121, 79, 0.18);
+  --tint-warn: rgba(138, 106, 8, 0.18);
+  --tint-danger: rgba(192, 57, 43, 0.18);
+  --tint-accent: rgba(47, 95, 208, 0.18);
+  --tint-chord: rgba(169, 100, 16, 0.12);
+  --glow-chord: 0 0 10px rgba(126, 72, 5, 0.28);
+  --shadow-popover: 0 2px 16px rgba(20, 26, 33, 0.18);
+}
+
+/* Stage mode — pure black for OLED, oversized sheet. */
+:root[data-theme="stage"] {
+  --bg0: #000000;
+  --bg1: #000000;
+  --bg2: #0B0E12;
+  --stroke: #1B222C;
+  --sheet-scale: 1.15;
+}
+
+/* Reduced motion: decorative transitions stop. Highlighting still moves —
+   it IS the content, not decoration. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur: 0ms;
+    --dur-slow: 0ms;
+  }
+}
+
+/* --- primitives shared by both surfaces ---------------------------------- */
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg1) 25%,
+    var(--bg2) 37%,
+    var(--bg1) 63%
+  );
+  background-size: 400% 100%;
+  animation: skeleton-shimmer 1.4s ease infinite;
+  border-radius: var(--r-control);
+  color: transparent !important;
+  pointer-events: none;
+}
+
+@keyframes skeleton-shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+}
+
+/* Visible focus everywhere — AA-contrast ring, never `outline: none`. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-control);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

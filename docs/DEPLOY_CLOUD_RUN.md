@@ -126,6 +126,19 @@ the REST API and mounts the MCP transport at `/mcp` (embedded in the same ASGI
 app, one lifespan). `--command`/`--args` are **not** overridden — there is only
 one service.
 
+**`--min-instances=1` is required if you use the batch queue.** The queue
+(`POST /v1/queue`, master plan D2) is an in-process asyncio worker started by
+the app's lifespan, and its pending jobs live in that instance's memory. With
+`--min-instances=0` Cloud Run scales the instance away as soon as the last
+request finishes — which is exactly when a queue is quietly draining in the
+background — and everything still pending is lost. The admin's queue dashboard
+surfaces this directly: it shows "the queue worker is not running" rather than
+appearing to work and silently dropping songs.
+
+Deploy with `--min-instances=1` if you want to queue songs and walk away;
+`--min-instances=0` is fine if you only ever analyze one song at a time
+through `POST /v1/songs/analyze`, which completes within its own request.
+
 **`--timeout=3600` is required, not optional.** A real analyze
 (discover → yt-dlp → MIR chord model → LLM/agent reconcile) takes 2–8 minutes;
 Cloud Run's default 300s request timeout would silently kill it mid-flight and

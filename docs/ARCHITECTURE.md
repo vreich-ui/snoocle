@@ -43,6 +43,30 @@ snoocle_server/
 │                    (memory.py, hermetic) backends; content-hash versions,
 │                    expected_version optimistic locking via a Firestore
 │                    transaction, append-only provenance, JSON diffs
+├── timing/          Phase A/B deterministic timing: snap.py (MIR chord/line
+│                    time assignment), quantize.py (beat grid + snapping),
+│                    confidence.py (per-placement agreement scoring + the
+│                    review queue), lrc.py (LRCLIB synced lyrics),
+│                    offset.py (cross-video offset by cross-correlation)
+├── batch.py         D2: in-process analysis queue — one asyncio worker drains
+│                    submitted jobs through pipeline.py sequentially; a failure
+│                    marks that job and moves on. In-memory by design, so
+│                    Cloud Run needs --min-instances=1 to use it
+├── ui/              the two browser surfaces (vanilla JS, NO build step)
+│   ├── tokens.css   the §3.5 design system — every colour/size/space/motion
+│   │                token, dark-first + light + stage themes. Both surfaces
+│   │                consume these and define none of their own
+│   ├── common.js    the only shared code: api/apiJson/el/clear
+│   ├── app.js       the admin SPA (edit, agent trace, versions, play)
+│   ├── admin-d.js   Phase D admin panes: review queue, batch queue, version
+│   │                "what changed" chips
+│   ├── vendor/      committed third-party assets (chords-db); see its README
+│   │                for what is deliberately NOT vendored, and why
+│   └── play/        the play-along player: player.js (library + song page),
+│                    timedscroll.js (the iOS scroll model ported as PURE
+│                    functions — unit-tested in tests_js/), theory.js
+│                    (display-only transpose/capo), chordbox.js (SVG chord
+│                    diagrams), diagrams.js, controls.js, sw.js (PWA)
 ├── pipeline.py      orchestration: per-step timeouts, best-effort
 │                    discover/acquire/mir + fatal reconcile/store (502 names
 │                    the failed step), truthful per-step status report
@@ -58,6 +82,46 @@ snoocle_server/
                      bind-host + DNS-rebinding-security resolver used by both
                      the standalone server and the embedded /mcp route.
 ```
+
+## The two browser surfaces
+
+`/ui/` is the **admin**: a developer tool for editing a song, watching the
+agent's run trace, comparing versions, and now (Phase D) working the review
+queue and the batch queue.
+
+`/ui/play/` is the **player**: the user-facing play-along surface — library
+grid, a sheet that scrolls in time with the video, chord-level highlighting,
+diagrams on tap, practice controls, installable as a PWA.
+
+They share exactly one file (`common.js`) and one design system
+(`tokens.css`). That is deliberate: the admin is allowed to stay dense and
+desktop-shaped, and the player is allowed to be touch-first, without either
+constraining the other.
+
+**The scroll model is the interesting part.** `play/timedscroll.js` is a port
+of the iOS `SyncTimeline` + `TimedScrollModel`, written as pure functions of
+(timeline, layout, playhead) so it can be unit-tested with no DOM
+(`tests_js/timedscroll.test.mjs`). Four regimes:
+
+1. **Hold at top** until the first timed line is due — a 40-second intro sits
+   still rather than drifting a third of the way down the sheet.
+2. **Glide** linearly between lines that are close together.
+3. **Hold across a break**, then glide in over the final `maxGlide` seconds,
+   so the sheet *arrives* on the next line rather than crawling through a
+   30-second solo.
+4. **Hold** after the last timed line.
+
+`maxGlide = max(8s, medianLineGap * 2.5)` — derived per song, so a dense song
+gets a short budget and a ballad a longer one.
+
+Nothing tracks "where we scrolled to" as state: every frame asks the model
+where the sheet should be for the current playhead. Seeking, playback-rate
+changes and A/B loop wraps are therefore correct without any extra code.
+
+The playhead itself comes from the YouTube IFrame API polled at 4 Hz and
+extrapolated per frame from the last (wall clock, media time) anchor. Per-video
+offsets (B3) are applied in exactly one place, so every other caller thinks in
+song seconds.
 
 ## Reconciliation providers
 

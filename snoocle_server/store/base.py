@@ -57,6 +57,81 @@ class SongVersion:
 
 
 @dataclass
+class SongSummary:
+    """A song's list-view row — everything a library grid needs, and nothing
+    that costs a full song read.
+
+    Backends denormalize these fields at save time (see
+    :func:`summarize_song`), so listing 200 songs never deserializes 200 song
+    blobs. Documents written before a field existed simply report its empty
+    value: ``youtube_video_id=None``, ``has_timing=False``. That is a display
+    degradation (no artwork, no timing badge), never an error.
+    """
+
+    id: str
+    title: str = ""
+    artist: str = ""
+    latest_version: str = ""
+    updated_at: str = ""
+    youtube_video_id: str | None = None
+    has_timing: bool = False
+
+    def to_json(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "artist": self.artist,
+            "latestVersion": self.latest_version,
+            "updatedAt": self.updated_at,
+            "youtubeVideoId": self.youtube_video_id,
+            "hasTiming": self.has_timing,
+        }
+
+
+def song_has_timing(song: Song) -> bool:
+    """True when the song carries schema-v2 playback timing — i.e. enough for
+    a player to scroll in sync rather than at a constant speed.
+
+    Any ONE of: a line time, a chord time, or a legacy syncMap entry. The
+    syncMap clause is what keeps v1 songs (analyzed before Phase A) showing a
+    timing badge, since their line times live only there."""
+    if song.audio is not None and song.audio.syncMap:
+        return True
+    for line in song.lines:
+        if line.timeSeconds is not None:
+            return True
+        for p in line.chordPlacements:
+            if p.timeSeconds is not None:
+                return True
+    return False
+
+
+def summarize_song(song: Song, version: str, timestamp: str) -> dict:
+    """The denormalized list-view fields a backend stores beside the song."""
+    return {
+        "title": song.metadata.title,
+        "artist": song.metadata.artist,
+        "latestVersion": version,
+        "updatedAt": timestamp,
+        "youtubeVideoId": song.audio.youtubeVideoId if song.audio else None,
+        "hasTiming": song_has_timing(song),
+    }
+
+
+def summary_from_record(song_id: str, data: dict) -> SongSummary:
+    """Build a summary from a backend's denormalized record."""
+    return SongSummary(
+        id=song_id,
+        title=data.get("title") or "",
+        artist=data.get("artist") or "",
+        latest_version=data.get("latestVersion") or "",
+        updated_at=data.get("updatedAt") or "",
+        youtube_video_id=data.get("youtubeVideoId"),
+        has_timing=bool(data.get("hasTiming")),
+    )
+
+
+@dataclass
 class SaveResult:
     song_id: str
     version: str  # content sha of the new version
@@ -151,6 +226,26 @@ class SongRepository(ABC):
     @abstractmethod
     def list_songs(self) -> list[str]:
         """All song ids present, sorted."""
+
+    def list_song_summaries(self) -> list["SongSummary"]:
+        """List-view rows for every song, sorted by id.
+
+        Concrete backends override this with a projection that avoids reading
+        song blobs. The base implementation is the correct-but-slow fallback so
+        a third backend is never *wrong*, only slower."""
+        out: list[SongSummary] = []
+        for song_id in self.list_songs():
+            try:
+                song = self.get(song_id)
+            except StoreError:  # deleted between listing and reading
+                continue
+            out.append(
+                summary_from_record(
+                    song_id,
+                    summarize_song(song, self.current_version(song_id) or "", ""),
+                )
+            )
+        return out
 
     @abstractmethod
     def get(self, song_id: str, version: str | None = None) -> Song:

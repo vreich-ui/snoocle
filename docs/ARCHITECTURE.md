@@ -38,6 +38,10 @@ snoocle_server/
 │                    JSON, identical across providers), engine.py (validate ->
 │                    repair loop -> server-side provenance/guardrails),
 │                    mock_reconciler.py (deterministic offline reconciler)
+├── store/jobs.py    the job broker: durable queue with time-boxed LEASES, so
+│                    a worker that sleeps or dies simply loses its claim and
+│                    the job returns to the pool. Reclaimed lazily on read —
+│                    no cron, no scheduler, no always-on CPU
 ├── store/           step 6-7: SongRepository interface (base.py) with
 │                    Firestore (firestore_store.py, durable) and in-memory
 │                    (memory.py, hermetic) backends; content-hash versions,
@@ -48,10 +52,10 @@ snoocle_server/
 │                    confidence.py (per-placement agreement scoring + the
 │                    review queue), lrc.py (LRCLIB synced lyrics),
 │                    offset.py (cross-video offset by cross-correlation)
-├── batch.py         D2: in-process analysis queue — one asyncio worker drains
-│                    submitted jobs through pipeline.py sequentially; a failure
-│                    marks that job and moves on. In-memory by design, so
-│                    Cloud Run needs --min-instances=1 to use it
+├── batch.py         parses the admin's "add many" textarea into job specs
+├── worker.py        the analysis worker (`snoocle-worker`) — claims jobs from
+│                    a server and runs them locally. Outbound-only; runs on
+│                    Wolf's Mac under launchd. See docs/WORKER.md
 ├── ui/              the two browser surfaces (vanilla JS, NO build step)
 │   ├── tokens.css   the §3.5 design system — every colour/size/space/motion
 │   │                token, dark-first + light + stage themes. Both surfaces
@@ -82,6 +86,32 @@ snoocle_server/
                      bind-host + DNS-rebinding-security resolver used by both
                      the standalone server and the embedded /mcp route.
 ```
+
+## Where analysis actually runs
+
+Two paths, on purpose:
+
+**One song, now** — `POST /v1/songs/analyze` runs in-process on the server and
+returns the finished song. It completes inside its own request, so it needs no
+worker and no always-on CPU. This is the "Add song" button, and it works from
+the iPad whether or not any other machine is awake.
+
+**A queue** — `POST /v1/queue` stores jobs; an external worker claims and runs
+them. The server never executes them.
+
+That split exists because background work on Cloud Run is priced out of
+proportion to itself: CPU is throttled outside a request under the default
+billing mode, so a background task needs `--no-cpu-throttling --min-instances=1`
+to survive — about $53/month at 1 vCPU / 2 GiB before analyzing anything. A Mac
+that is already on the desk does the same work faster (demucs: ~12s per song on
+Apple Silicon vs ~6 minutes on a Cloud Run vCPU) for nothing.
+
+The mechanism that makes it dependable is the **lease**. A claim expires after
+five minutes without a heartbeat, so a closed laptop, a dropped connection or a
+crashed worker all resolve the same way: the job returns to the queue. Nothing
+has to detect the failure, which means nothing can fail to detect it. Leases are
+reclaimed lazily when the queue is read, so the property holds with no scheduler
+anywhere. `docs/WORKER.md` has the protocol.
 
 ## The two browser surfaces
 

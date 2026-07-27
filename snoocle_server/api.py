@@ -27,7 +27,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
 from .audio import utils as audio_utils
-from .batch import MAX_ITEMS_PER_SUBMIT, get_queue, parse_batch_line
+from .batch import MAX_ITEMS_PER_SUBMIT, parse_batch_line
 from .audio.acquire import AcquisitionError, YouTubeAuthError, acquire
 from .config import settings
 from .discovery import CandidateSource, discover_sources
@@ -48,6 +48,12 @@ from .reconcile.providers import ProviderError
 from .export import to_chordpro, to_txt
 from .schema import ProvenanceEntry, Song, song_json_schema
 from .timing.offset import estimate_offset
+from .store.jobs import (
+    DEFAULT_LEASE_SECONDS,
+    UnknownJobError,
+    WrongWorkerError,
+    get_job_store,
+)
 from .store import (
     StoreError,
     StoreUnavailableError,
@@ -87,18 +93,15 @@ _mcp_asgi_app = _mcp.streamable_http_app()  # creates the session manager
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Run the MCP StreamableHTTP session manager for the app's lifetime, and
-    # alongside it the batch-analysis worker (master plan D2). The worker is
-    # an in-process asyncio task, so on Cloud Run the service must be deployed
-    # with --min-instances=1 or a scale-to-zero drops a queue mid-drain; see
-    # docs/DEPLOY_CLOUD_RUN.md.
-    queue = get_queue()
+    # Run the MCP StreamableHTTP session manager for the app's lifetime.
+    #
+    # There is deliberately NO background worker here. Analysis jobs are held
+    # in the store and executed by an external worker that claims them (see
+    # store/jobs.py and docs/WORKER.md), which is what lets this service stay
+    # on request-based billing at --min-instances=0: nothing here ever needs a
+    # CPU outside a request.
     async with _mcp.session_manager.run():
-        queue.start()
-        try:
-            yield
-        finally:
-            await queue.stop()
+        yield
 
 
 app = FastAPI(
@@ -622,19 +625,24 @@ def _aggregate_scores(metrics: list[dict]) -> dict:
     return out
 
 
-# --- batch analysis queue (master plan D2) ----------------------------------
-# Submit many songs, one worker drains them sequentially through the same
-# pipeline as POST /v1/songs/analyze. A failure marks that job and moves on.
+# --- analysis job queue (broker) --------------------------------------------
+# The server holds jobs; an external worker claims and runs them. See
+# store/jobs.py for why, and docs/WORKER.md for the worker itself.
+#
+# Single-song analysis (POST /v1/songs/analyze) is UNCHANGED and still runs
+# in-process — it completes inside its own request, so it needs no worker and
+# no always-on CPU. The queue is for work that outlives a request.
 
 
 class QueueItem(BaseModel):
     title: Optional[str] = None
     artist: Optional[str] = None
     youtubeUrlOrId: Optional[str] = None
+    wants: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "QueueItem":
-        if not ((self.title and self.artist) or self.youtubeUrlOrId or self.title):
+        if not (self.title or self.youtubeUrlOrId):
             raise ValueError("provide a title (with artist when known), or youtubeUrlOrId")
         return self
 
@@ -647,6 +655,35 @@ class QueueRequest(BaseModel):
     text: Optional[str] = None
     provider: Optional[str] = None
     analysisDepth: Optional[Literal["fast", "standard", "thorough"]] = None
+    # Optional extra work for a capable worker, e.g. ["stems"]. A job is only
+    # ever handed to a worker that advertises everything it wants.
+    wants: list[str] = Field(default_factory=list)
+
+
+class ClaimRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=128)
+    capabilities: list[str] = Field(default_factory=list)
+    leaseSeconds: int = Field(default=DEFAULT_LEASE_SECONDS, ge=30, le=3600)
+
+
+class HeartbeatRequest(BaseModel):
+    worker: str
+    leaseSeconds: int = Field(default=DEFAULT_LEASE_SECONDS, ge=30, le=3600)
+
+
+class CompleteRequest(BaseModel):
+    worker: str
+    songId: str
+    runId: Optional[str] = None
+    storedVersion: Optional[str] = None
+
+
+class FailRequest(BaseModel):
+    worker: str
+    error: str
+    # A worker that knows the failure is permanent (a 404 video, an unparseable
+    # song) says so, and the broker doesn't burn two more attempts on it.
+    retry: bool = True
 
 
 @app.post("/v1/queue")
@@ -659,26 +696,85 @@ def post_queue(req: QueueRequest) -> dict:
                 specs.append(parsed)
     if not specs:
         raise HTTPException(status_code=400, detail="no songs to queue")
-    try:
-        jobs = get_queue().submit(specs, provider=req.provider,
-                                  analysis_depth=req.analysisDepth)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    if len(specs) > MAX_ITEMS_PER_SUBMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too many items: {len(specs)} (max {MAX_ITEMS_PER_SUBMIT} per submit)",
+        )
+    jobs = get_job_store().submit(
+        specs, provider=req.provider, analysis_depth=req.analysisDepth,
+        wants=req.wants,
+    )
     return {"queued": len(jobs), "jobs": [j.to_json() for j in jobs]}
 
 
 @app.get("/v1/queue")
 def get_queue_status(limit: int = 200) -> dict:
-    q = get_queue()
-    return {"jobs": [j.to_json() for j in q.list_jobs(limit=limit)], **q.stats(),
-            "maxPerSubmit": MAX_ITEMS_PER_SUBMIT}
+    store = get_job_store()
+    return {
+        "jobs": [j.to_json() for j in store.list_jobs(limit=limit)],
+        **store.stats(),
+        "maxPerSubmit": MAX_ITEMS_PER_SUBMIT,
+    }
+
+
+@app.post("/v1/queue/claim")
+def post_queue_claim(req: ClaimRequest) -> dict:
+    """A worker asks for work. 204 means 'nothing for you right now' — an
+    empty queue is the normal case, not an error, and a worker polling every
+    few seconds should not be reading exception paths."""
+    job = get_job_store().claim(
+        req.worker, capabilities=req.capabilities, lease_seconds=req.leaseSeconds
+    )
+    if job is None:
+        return JSONResponse(status_code=204, content=None)
+    return job.to_worker_json()
+
+
+@app.post("/v1/queue/{job_id}/heartbeat")
+def post_queue_heartbeat(job_id: str, req: HeartbeatRequest) -> dict:
+    try:
+        job = get_job_store().heartbeat(job_id, req.worker, lease_seconds=req.leaseSeconds)
+    except UnknownJobError as e:
+        raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
+    except WrongWorkerError as e:
+        # The lease was lost (expired and reclaimed, or cancelled). 409 tells
+        # the worker to stop and drop its result rather than racing whoever
+        # holds it now.
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"leaseExpiresAt": job.lease_expires_at, "status": job.status}
+
+
+@app.post("/v1/queue/{job_id}/complete")
+def post_queue_complete(job_id: str, req: CompleteRequest) -> dict:
+    try:
+        job = get_job_store().complete(
+            job_id, req.worker, song_id=req.songId,
+            run_id=req.runId, stored_version=req.storedVersion,
+        )
+    except UnknownJobError as e:
+        raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
+    except WrongWorkerError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return job.to_json()
+
+
+@app.post("/v1/queue/{job_id}/fail")
+def post_queue_fail(job_id: str, req: FailRequest) -> dict:
+    try:
+        job = get_job_store().fail(job_id, req.worker, req.error, retry=req.retry)
+    except UnknownJobError as e:
+        raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
+    except WrongWorkerError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return job.to_json()
 
 
 @app.post("/v1/queue/{job_id}/retry")
 def post_queue_retry(job_id: str) -> dict:
     try:
-        return get_queue().retry(job_id).to_json()
-    except KeyError as e:
+        return get_job_store().retry(job_id).to_json()
+    except UnknownJobError as e:
         raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -687,8 +783,8 @@ def post_queue_retry(job_id: str) -> dict:
 @app.post("/v1/queue/{job_id}/cancel")
 def post_queue_cancel(job_id: str) -> dict:
     try:
-        return get_queue().cancel(job_id).to_json()
-    except KeyError as e:
+        return get_job_store().cancel(job_id).to_json()
+    except UnknownJobError as e:
         raise HTTPException(status_code=404, detail=f"no such job: {job_id}") from e
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -696,8 +792,8 @@ def post_queue_cancel(job_id: str) -> dict:
 
 @app.delete("/v1/queue")
 def delete_queue_finished() -> dict:
-    """Drop finished jobs from the list. Running/queued jobs are untouched."""
-    return {"removed": get_queue().clear_finished()}
+    """Drop finished jobs. Queued and leased jobs are untouched."""
+    return {"removed": get_job_store().clear_finished()}
 
 
 # --- step 7: versioned store -------------------------------------------------

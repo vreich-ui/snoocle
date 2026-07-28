@@ -102,17 +102,41 @@ class Settings(BaseSettings):
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
 
     # --- text-source discovery ---
-    # Comma-separated ordered preference of search backends: brave, serpapi, duckduckgo.
-    search_backends: str = "duckduckgo"
+    # Comma-separated ordered preference of search backends: brave, serpapi,
+    # duckduckgo, static.
+    #
+    # The keyed backends lead. They cost nothing to have in the list when no key
+    # is set — each raises immediately on the missing key and web_search() falls
+    # through to the next — but the old "duckduckgo"-only default meant setting
+    # SNOOCLE_BRAVE_API_KEY did precisely nothing until you ALSO knew to edit
+    # this variable. Configuring a key should be sufficient to be used.
+    #
+    # duckduckgo stays last as the keyless fallback. It is dependable from a
+    # residential IP and heavily throttled from datacenter ranges — measured 2
+    # successes in 8 attempts, which the retry in _search_duckduckgo lifts to
+    # roughly 4 in 6. Usable on Cloud Run, not something to depend on there.
+    search_backends: str = "brave,serpapi,duckduckgo"
     brave_api_key: str = ""
     serpapi_api_key: str = ""
     search_max_candidates: int = 8  # gather generously; reconciliation uses all of them
     fetch_timeout_seconds: float = 20.0
-    # Ultimate Guitar discovery source (master plan B5) -- OFF by default.
-    # Scrapes UG's undocumented js-store JSON (see
-    # discovery/sources/ultimate_guitar.py); personal-use, one flag to
-    # disable instantly if the endpoint breaks or changes shape.
-    source_ug_enabled: bool = False
+    # Ultimate Guitar discovery source (master plan B5). Scrapes UG's
+    # undocumented js-store JSON (see discovery/sources/ultimate_guitar.py);
+    # personal-use, one flag to kill it instantly if the endpoint changes shape.
+    #
+    # ON by default since 2026-07. It shipped OFF because it was an extra,
+    # opt-in source alongside a general web search that worked; that assumption
+    # no longer holds. The keyless general backend is now throttled from
+    # datacenter IPs (DuckDuckGo answers Cloud Run with HTTP 202 and an empty
+    # shell most of the time), so discovery kept returning nothing and the
+    # reconciler had no chord text to work from. UG's endpoint answers those
+    # same IPs reliably, which makes it the only dependable keyless source.
+    # Set SNOOCLE_SOURCE_UG=0 to switch it off — but configure a keyed search
+    # backend if you do, or discovery is back to depending on a coin flip.
+    #
+    # Tests force this back OFF (tests/conftest.py) — the suite is hermetic and
+    # must not reach the live endpoint.
+    source_ug_enabled: bool = True
     source_ug_max_candidates: int = 3
 
     # --- YouTube acquisition (yt-dlp) ---

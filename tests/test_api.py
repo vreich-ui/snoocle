@@ -58,6 +58,18 @@ def test_healthz():
     assert isinstance(body["ytdlp"]["challengeSolver"], bool)
 
 
+def test_health_is_an_alias_for_healthz():
+    """External uptime checks must have a path that works.
+
+    On the deployed service a request for exactly `/healthz` is answered by a
+    Google 404 at the edge and never reaches the app, so a monitor pointed
+    there reports the service down while it is perfectly healthy. `/health` is
+    the path that gets through; it must return the identical document, or the
+    two would drift and the alias would quietly stop being a health check.
+    """
+    assert client.get("/health").json() == client.get("/healthz").json()
+
+
 def test_song_schema_endpoint():
     r = client.get("/v1/schema/song")
     assert r.status_code == 200

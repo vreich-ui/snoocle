@@ -40,6 +40,7 @@ from .mir import MirAnalysis, analyze_audio as _analyze_audio
 from .pipeline import get_store, run_pipeline_async
 from .reconcile import provider_capabilities, reconcile as _reconcile
 from .schema import Song, song_json_schema
+from .scope import AnalysisScope
 from .store import backend_label as _store_backend_label
 
 def _now_iso() -> str:
@@ -199,6 +200,7 @@ async def analyze_and_store_song(
     skip_audio: bool = False,
     expected_version: Optional[str] = None,
     accuracy: Optional[str] = None,
+    scope: Optional[dict] = None,
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
@@ -206,7 +208,14 @@ async def analyze_and_store_song(
     title/artist are omitted, they're derived from the video's own metadata.
     Each external step runs under its own timeout so the call can't hang; a
     fatal step failure raises with the step name. Returns the song, the per-step
-    report, and the stored version sha."""
+    report, and the stored version sha.
+
+    scope (optional, same shape as the HTTP API's `scope`):
+    {"listen": bool, "reconcile": bool} — which evidence-gathering stages this
+    run may do. listen=false reuses the existing audio analysis instead of
+    re-downloading and re-analyzing; reconcile=false skips web source
+    discovery. Both false means "apply the notes to the prior song and gather
+    nothing". OMIT it for the full pipeline (the default)."""
     report = await run_pipeline_async(
         title,
         artist,
@@ -216,6 +225,9 @@ async def analyze_and_store_song(
         skip_audio=skip_audio,
         expected_version=expected_version,
         accuracy=accuracy,
+        # None in -> None out: an omitted scope must stay omitted all the way
+        # down, or every MCP caller silently starts getting a "scope" step.
+        scope=AnalysisScope.parse(scope),
     )
     assert report.reconcile is not None
     return {

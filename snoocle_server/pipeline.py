@@ -17,6 +17,11 @@ Reliability contract (POST /v1/songs/analyze):
   far) so the client sees exactly what broke — and why upstream.
 - **Truthful ``steps``.** Each entry is the real per-step outcome
   (``"ok: ..."`` / ``"skipped"`` / ``"failed: ..."``).
+- **Scope.** An optional :class:`~.scope.AnalysisScope` turns the two
+  evidence-gathering stages off independently (``listen`` -> acquire+MIR,
+  ``reconcile`` -> discover). Reconciliation itself always runs. An ABSENT
+  scope is not a scope: the pipeline behaves exactly as it did before the
+  field existed.
 - **Offline mock.** ``provider="mock"`` never touches the network: discovery is
   skipped and the deterministic reconciler synthesizes a small Song, so the
   whole analyze -> persist -> fetch -> versions path runs in CI with no keys.
@@ -39,6 +44,7 @@ from .reconcile import ReconcileResult, provider_preflight, reconcile
 from .reconcile.depth import resolve_depth
 from .reconcile.trace import TraceRecorder, start_run
 from .schema.song import slugify_song_id
+from .scope import AnalysisScope
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
 from .timing.confidence import build_review_queue, score_song
@@ -126,8 +132,10 @@ def _step_reconcile(
     audio: AcquiredAudio | None,
     trace: TraceRecorder | None = None,
     guidance: str | None = None,
+    guidance_origin: str | None = None,
     prior_song: dict | None = None,
     depth=None,
+    scope: AnalysisScope | None = None,
 ) -> ReconcileResult:
     return reconcile(
         title,
@@ -142,8 +150,10 @@ def _step_reconcile(
         song_id=song_id,
         trace=trace,
         guidance=guidance,
+        guidance_origin=guidance_origin,
         prior_song=prior_song,
         depth=depth,
+        scope=scope,
     )
 
 
@@ -211,8 +221,16 @@ async def run_pipeline_async(
     analysis_depth: str | None = None,
     guidance: str | None = None,
     prior_song: dict | None = None,
+    scope: AnalysisScope | None = None,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
+    # Scope constrains ONLY when it was explicitly supplied. `None` means the
+    # caller never heard of scope, and gets exactly the historical pipeline —
+    # this is why the flags below are read through `scope is None` rather than
+    # defaulting the parameter to FULL_SCOPE (the report would then grow a
+    # "scope" step for every legacy caller, changing their response shape).
+    want_listen = True if scope is None else scope.listen
+    want_sources = True if scope is None else scope.reconcile
     # analysisDepth is the canonical control; the older `accuracy` field is
     # honored as its source when a depth isn't given explicitly. The chosen
     # profile drives MIR accuracy, agent effort, the tool budget, and syncMap.
@@ -258,9 +276,29 @@ async def run_pipeline_async(
     song_id = slugify_song_id(artist, title)
     report = PipelineReport(song_id=song_id, steps=steps)
 
+    # Reconciliation notes replay (contract §2). This has to happen HERE, not in
+    # the API layer: when the caller gave only a media URL, the song id is not
+    # known until the identity step above has run, and notes keyed by any other
+    # id would silently never replay.
+    guidance, guidance_origin = _resolve_guidance(song_id, guidance)
+    if guidance:
+        report.steps["notes"] = f"ok: guidance applied (from {guidance_origin})"
+
+    # Only recorded when the caller actually asked for a scope — an absent
+    # scope must leave the report shape untouched.
+    if scope is not None:
+        report.steps["scope"] = scope.describe()
+
     # 1-3. text-source discovery (best-effort). Skipped entirely for the mock
-    # provider, which is the fully-offline deterministic path (no network).
-    if resolved_provider == "mock":
+    # provider, which is the fully-offline deterministic path (no network), and
+    # for a run whose scope turned source-gathering off.
+    if not want_sources:
+        report.steps["discover"] = (
+            "skipped (scope: notes only)"
+            if not want_listen
+            else "skipped (scope: no new sources)"
+        )
+    elif resolved_provider == "mock":
         report.steps["discover"] = "skipped (mock: offline deterministic reconciler)"
     else:
         try:
@@ -273,10 +311,14 @@ async def run_pipeline_async(
         except Exception as e:  # noqa: BLE001 — best-effort (incl. timeout)
             report.steps["discover"] = _fail_text(e, settings.discover_timeout_seconds)
 
-    # 4. audio acquisition + MIR analysis (both best-effort)
-    if skip_audio:
-        report.steps["acquire"] = "skipped"
-        report.steps["mir"] = "skipped"
+    # 4. audio acquisition + MIR analysis (both best-effort). `listen=off` is
+    # the same skip as the long-standing `skipAudio`, but says WHY in the
+    # report — "I turned listening off" and "this caller never wants audio"
+    # look identical afterwards otherwise.
+    if skip_audio or not want_listen:
+        skip_text = "skipped" if skip_audio else "skipped (scope: reusing the existing audio analysis)"
+        report.steps["acquire"] = skip_text
+        report.steps["mir"] = skip_text
     else:
         try:
             report.audio = await _timed_step(
@@ -312,7 +354,8 @@ async def run_pipeline_async(
             lambda: _step_reconcile(
                 title, artist, song_id, report.candidates, report.mir,
                 provider, model, attach_audio, report.audio,
-                trace=recorder, guidance=guidance, prior_song=prior_song, depth=depth,
+                trace=recorder, guidance=guidance, guidance_origin=guidance_origin,
+                prior_song=prior_song, depth=depth, scope=scope,
             ),
             settings.reconcile_timeout_seconds,
         )
@@ -435,6 +478,33 @@ async def run_pipeline_async(
     return report
 
 
+def _resolve_guidance(song_id: str, guidance: str | None) -> tuple[str | None, str | None]:
+    """Decide this run's reconciler guidance and where it came from.
+
+    Request guidance wins and is persisted as the song's notes BEFORE any
+    expensive step runs — a user's typed instruction must survive a run that
+    dies at acquire or reconcile, otherwise a flaky analysis silently eats it.
+    With no request guidance, stored notes replay. Store trouble degrades to
+    "no guidance": notes are an assist, never a reason to fail an analysis.
+    """
+    from .store.song_notes import get_song_notes_store
+
+    text = (guidance or "").strip()
+    try:
+        store = get_song_notes_store()
+        if text:
+            store.set(song_id, text)
+            return text, "this request"
+        stored = (store.get(song_id) or "").strip()
+        if stored:
+            return stored, "stored notes"
+    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+        log.warning("song notes unavailable for %s (continuing): %s", song_id, e)
+        if text:
+            return text, "this request"
+    return (text or None), ("this request" if text else None)
+
+
 def _fail_text(exc: BaseException, timeout: float) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return f"failed: timed out after {timeout:.0f}s"
@@ -465,6 +535,7 @@ def run_pipeline(
     analysis_depth: str | None = None,
     guidance: str | None = None,
     prior_song: dict | None = None,
+    scope: AnalysisScope | None = None,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -485,5 +556,6 @@ def run_pipeline(
             analysis_depth=analysis_depth,
             guidance=guidance,
             prior_song=prior_song,
+            scope=scope,
         )
     )

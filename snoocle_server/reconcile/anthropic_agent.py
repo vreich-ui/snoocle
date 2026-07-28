@@ -284,6 +284,30 @@ class AnthropicAgentProvider(LLMProvider):
             payload["priorHumanEditedSong"] = ctx["prior_song"]
         if ctx.get("guidance"):
             payload["humanCorrectionNotes"] = ctx["guidance"]
+        # The pipeline can only decline to CALL discover/acquire; this provider
+        # has its own fetch/analyze tools and would happily re-gather exactly
+        # the evidence the user just switched off. The scope has to reach the
+        # agent as an instruction, not just as an empty candidates list.
+        scope = ctx.get("scope")
+        if scope is not None:
+            payload["scope"] = {"listen": scope.listen, "reconcile": scope.reconcile}
+            if scope.notes_only:
+                payload["scopeInstruction"] = (
+                    "APPLY-NOTES-ONLY run: do not fetch chord sheets and do not "
+                    "analyze audio windows. Return priorHumanEditedSong with "
+                    "humanCorrectionNotes applied and nothing else changed."
+                )
+            elif not scope.reconcile:
+                payload["scopeInstruction"] = (
+                    "Do not fetch new chord sheets for this run — source "
+                    "gathering was switched off. Work from the audio analysis, "
+                    "the prior song, and the user's notes."
+                )
+            elif not scope.listen:
+                payload["scopeInstruction"] = (
+                    "Do not analyze audio windows for this run — listening was "
+                    "switched off. Keep the prior song's existing times."
+                )
         return {"role": "user", "content": json.dumps(payload)}
 
     def _run_tool(self, block) -> dict:

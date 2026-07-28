@@ -74,6 +74,13 @@ snoocle_server/
 ├── pipeline.py      orchestration: per-step timeouts, best-effort
 │                    discover/acquire/mir + fatal reconcile/store (502 names
 │                    the failed step), truthful per-step status report
+├── oauth/           OAuth 2.1 authorization server for /mcp — Claude's
+│                    remote-MCP connector cannot use a static bearer token, so
+│                    the service issues its own. protocol.py is pure rules
+│                    (redirect matching, PKCE, audience) and unit-tested
+│                    directly; store.py is durable so a Cloud Run cold start
+│                    doesn't silently unauthorize the connector. See
+│                    docs/MCP_OAUTH.md
 ├── api.py           HTTP surface (one endpoint per step + full pipeline);
 │                    ALSO embeds the MCP transport at /mcp (single-service
 │                    topology) — imports the FastMCP instance, runs its

@@ -12,6 +12,7 @@ import mimetypes
 import os
 import secrets
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ from .reconcile import (
 )
 from .reconcile.engine import ReconcileError
 from .reconcile.providers import ProviderError
+from .scope import AnalysisScope
 from .export import to_chordpro, to_txt
 from .schema import ProvenanceEntry, Song, song_json_schema
 from .timing.offset import estimate_offset
@@ -498,6 +500,23 @@ def post_reconcile(req: ReconcileRequest) -> dict:
 # --- full pipeline -----------------------------------------------------------
 
 
+class AnalysisScopeRequest(BaseModel):
+    """``{"listen": bool, "reconcile": bool}`` — the two evidence-gathering
+    stages of a re-analysis, each independently switchable.
+
+    Each flag defaults to True so a partial object (``{"listen": false}``) can
+    only ever turn OFF what it names; a client can never accidentally disable a
+    stage by omitting it. The all-off case is legitimate and means "apply my
+    notes to the song I already have".
+    """
+
+    listen: bool = True      # acquire the audio + run MIR on it
+    reconcile: bool = True   # search the web for chord/lyric sources
+
+    def to_scope(self) -> AnalysisScope:
+        return AnalysisScope(listen=self.listen, reconcile=self.reconcile)
+
+
 class PipelineRequest(BaseModel):
     # title+artist may be omitted when youtubeUrlOrId is given — the pipeline
     # derives them from the media's own metadata.
@@ -522,6 +541,12 @@ class PipelineRequest(BaseModel):
     # re-analysis honors the user's fixes instead of rediscovering from scratch.
     guidance: Optional[str] = None
     priorSong: Optional[dict] = None
+    # Re-analysis SCOPE: which evidence-gathering stages this run may do.
+    # ABSENT means "no opinion" -> the full pipeline, exactly as before this
+    # field existed; every pre-scope client and test is unaffected. Present
+    # means constrain. Reconciliation itself always runs — the flags decide
+    # what evidence it is handed, not whether it happens.
+    scope: Optional[AnalysisScopeRequest] = None
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
@@ -547,6 +572,7 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             analysis_depth=req.analysisDepth,
             guidance=req.guidance,
             prior_song=req.priorSong,
+            scope=req.scope.to_scope() if req.scope is not None else None,
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -564,6 +590,59 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
         "runId": report.run_id,  # fetch the step trace at /v1/runs/{runId}
         **_reconcile_response(report.reconcile),
     }
+
+
+# --- per-song reconciliation notes -------------------------------------------
+# Free-text "how to build this song" instructions, stored beside the song (not
+# in it — the Song document is the app's content contract) and replayed as
+# reconciler guidance by every analyze of the same song id.
+
+
+class NotesRequest(BaseModel):
+    notes: str = ""
+
+
+def _notes_response(song_id: str, doc: dict | None) -> dict:
+    return {
+        "songId": song_id,
+        "notes": (doc or {}).get("notes", "") or "",
+        "updatedAt": (doc or {}).get("updated_at"),
+    }
+
+
+@app.get("/v1/songs/{song_id}/notes")
+def get_song_notes(song_id: str) -> dict:
+    """Notes for a song, or an empty document when there are none.
+
+    Never 404: the app asks this for every song it opens, so "no notes" is a
+    normal answer, not an error the client has to special-case.
+    """
+    from .store.song_notes import get_song_notes_store
+
+    return _notes_response(song_id, get_song_notes_store().get_record(song_id))
+
+
+@app.put("/v1/songs/{song_id}/notes")
+def put_song_notes(song_id: str, req: NotesRequest) -> dict:
+    from .store.song_notes import MAX_NOTES_CHARS, get_song_notes_store
+
+    if len(req.notes or "") > MAX_NOTES_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"notes too long: {len(req.notes)} chars (limit {MAX_NOTES_CHARS})"
+            ),
+        )
+    store = get_song_notes_store()
+    store.set(song_id, req.notes)  # empty/whitespace deletes
+    return _notes_response(song_id, store.get_record(song_id))
+
+
+@app.delete("/v1/songs/{song_id}/notes")
+def delete_song_notes(song_id: str) -> dict:
+    from .store.song_notes import get_song_notes_store
+
+    return {"deleted": get_song_notes_store().delete(song_id)}
 
 
 # --- agent run traces (watch the reconciler's step-by-step logic) ------------
@@ -1372,6 +1451,51 @@ def put_agent_config_endpoint(body: dict) -> dict:
     doc["source"] = "rest"
     get_agent_config_store().set(doc)
     return {"status": "stored", "configVersion": config_version(cfg), "updatedAt": doc["updated_at"]}
+
+
+class InstructionsAppendRequest(BaseModel):
+    add: str = ""
+
+
+# One process-wide lock around the append's read-modify-write: two clients
+# promoting a note at the same time must not both read the same config and
+# write back disjoint versions, silently dropping one instruction.
+_INSTRUCTIONS_APPEND_LOCK = threading.Lock()
+
+
+@app.post("/v1/config/agent/instructions")
+def post_agent_instructions_endpoint(req: InstructionsAppendRequest) -> dict:
+    """Append one standing instruction to `instructions_extra`, atomically.
+
+    Exists so a client never has to read-modify-write the whole agent config
+    (and clobber a concurrent edit) just to add a line.
+    """
+    from .reconcile.agent_config import AgentConfig, config_version
+    from .store.agent_config import get_agent_config_store
+
+    _require_app_auth_configured()
+    line = (req.add or "").strip()
+    if not line:
+        raise HTTPException(status_code=400, detail="`add` must be a non-empty instruction")
+
+    store = get_agent_config_store()
+    with _INSTRUCTIONS_APPEND_LOCK:
+        doc = store.get()
+        cfg = AgentConfig.model_validate(doc) if doc else AgentConfig()
+        existing = cfg.instructions_extra or ""
+        # Re-promoting the same note is a no-op, not a duplicated instruction.
+        if line not in [ln.strip() for ln in existing.splitlines() if ln.strip()]:
+            merged = f"{existing.rstrip()}\n{line}" if existing.strip() else line
+            new_doc = cfg.model_copy(update={"instructions_extra": merged}).model_dump()
+            new_doc["updated_at"] = _dt_now()
+            new_doc["source"] = "rest"
+            store.set(new_doc)
+            cfg = AgentConfig.model_validate(new_doc)
+    return {
+        "config": cfg.model_dump(),
+        "configVersion": config_version(cfg),
+        "isDefault": cfg.is_default(),
+    }
 
 
 @app.delete("/v1/config/agent")

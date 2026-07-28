@@ -25,6 +25,7 @@ from ..discovery.models import CandidateSource
 from ..mir.base import MirAnalysis
 from ..schema import Song, song_json_schema
 from ..schema.song import ProvenanceEntry, slugify_song_id
+from ..scope import AnalysisScope
 from .agent_config import AgentConfig, config_version
 from .depth import DepthProfile, resolve_depth
 from .prompt import SYSTEM_PROMPT, build_repair_prompt, build_user_prompt
@@ -104,6 +105,9 @@ def _finalize(
     provider: LLMProvider,
     model: str,
     attempts: int,
+    guidance: str | None = None,
+    guidance_origin: str | None = None,
+    scope: AnalysisScope | None = None,
 ) -> Song:
     """Server-side guardrails + append provenance (never trusted to the LLM)."""
     updates: dict = {"id": song_id, "provenance": []}
@@ -147,6 +151,16 @@ def _finalize(
     conf = min(0.45 + 0.1 * min(len(candidates), 3) + (0.15 if mir else 0.0), 0.9)
     if provider.name == "mock":
         conf = min(conf, 0.5)
+    # Guidance is never applied silently: a reader of the song's history must be
+    # able to see that a human instruction shaped this run, and whether it came
+    # from the request or replayed from the song's stored notes.
+    guidance_note = ""
+    if guidance:
+        guidance_note = f"; guidance applied (from {guidance_origin or 'this request'})"
+    # Same reasoning for scope: a version produced from the prior song + notes
+    # alone is a very different artifact from a full re-analysis, and six
+    # months later the history is the only place that difference survives.
+    scope_note = f"; scope: {scope.describe()}" if scope is not None else ""
     prov.append(
         ProvenanceEntry(
             timestamp=_now(),
@@ -154,7 +168,11 @@ def _finalize(
             action="reconciled",
             sources=[c.sourceId for c in candidates],
             confidence=round(conf, 3),
-            notes=f"attempt(s)={attempts}; chord rule enforced by schema validation",
+            notes=(
+                f"attempt(s)={attempts}; chord rule enforced by schema validation"
+                + guidance_note
+                + scope_note
+            ),
         )
     )
     return song.model_copy(update={"provenance": prov})
@@ -174,8 +192,10 @@ def reconcile(
     media_url: str | None = None,
     trace: TraceRecorder | None = None,
     guidance: str | None = None,
+    guidance_origin: str | None = None,
     prior_song: dict | None = None,
     depth: DepthProfile | None = None,
+    scope: AnalysisScope | None = None,
 ) -> ReconcileResult:
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
@@ -190,9 +210,17 @@ def reconcile(
 
     # The mock provider is a deterministic offline reconciler: it can synthesize
     # a small Song from title/artist alone, so it never requires inputs. Every
-    # other provider needs something concrete to reconcile.
-    if not candidates and mir is None and provider.name != "mock":
-        raise ReconcileError("nothing to reconcile: no candidate sources and no MIR analysis")
+    # other provider needs something concrete to reconcile — and a PRIOR SONG
+    # counts: the notes-only scope (listen=off, reconcile=off) deliberately
+    # gathers nothing and asks the model to correct what the user already has.
+    # Without a prior song that scope would have the model invent a song from
+    # the title alone, which is exactly the hallucination this guard exists to
+    # prevent, so it still fails here.
+    if not candidates and mir is None and prior_song is None and provider.name != "mock":
+        raise ReconcileError(
+            "nothing to reconcile: no candidate sources and no MIR analysis"
+            + (" and no prior song to correct" if scope is not None else "")
+        )
 
     if media_url is None and youtube_video_id:
         media_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
@@ -229,6 +257,7 @@ def reconcile(
                     else None
                 ),
                 "guidance": guidance,
+                "scope": scope.describe() if scope is not None else None,
             },
         )
 
@@ -250,6 +279,7 @@ def reconcile(
             "guidance": guidance,
             "prior_song": prior_song,
             "depth": depth,
+            "scope": scope,
             "agent_config": agent_config if not agent_config.is_default() else None,
         }
     if hasattr(provider, "trace"):
@@ -263,6 +293,7 @@ def reconcile(
     user_prompt = build_user_prompt(
         title, artist, candidates, mir, song_json_schema(), song_id, youtube_video_id,
         guidance=guidance, prior_song=prior_song, time_align=depth.time_align,
+        scope=scope,
     )
     turns: list[dict] = [{"role": "user", "text": user_prompt}]
 
@@ -304,6 +335,9 @@ def reconcile(
             provider=provider,
             model=resolved_model,
             attempts=attempt,
+            guidance=guidance,
+            guidance_origin=guidance_origin,
+            scope=scope,
         )
         if trace is not None:
             trace.step(

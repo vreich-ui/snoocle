@@ -90,6 +90,16 @@ class Job:
     # ["stems"]. Named capabilities rather than booleans so a worker can
     # advertise what it can actually do and the broker can match.
     wants: list[str] = field(default_factory=list)
+    # What this job IS, as opposed to what it needs. "analyze" runs the
+    # reconcile pipeline and produces a song; "stems" separates an existing
+    # song's audio and produces files beside it. They share a queue because
+    # they share the thing that makes the queue worth having — a lease, a
+    # worker that may sleep, and a retry that costs nothing.
+    kind: str = "analyze"
+    # Only meaningful for kind="stems": the song these stems belong to. An
+    # analyze job doesn't have one yet, which is exactly why `song_id` below
+    # is a RESULT field and this is a separate input.
+    target_song_id: Optional[str] = None
 
     status: str = QUEUED
     queued_at: str = ""
@@ -131,6 +141,8 @@ class Job:
             "provider": data["provider"],
             "analysisDepth": data["analysis_depth"],
             "wants": data["wants"],
+            "kind": data["kind"],
+            "targetSongId": data["target_song_id"],
             "status": data["status"],
             "queuedAt": data["queued_at"],
             "startedAt": data["started_at"],
@@ -155,6 +167,8 @@ class Job:
             "provider": self.provider,
             "analysisDepth": self.analysis_depth,
             "wants": self.wants,
+            "kind": self.kind,
+            "targetSongId": self.target_song_id,
             "leaseExpiresAt": self.lease_expires_at,
             "attempts": self.attempts,
         }
@@ -325,6 +339,8 @@ class InMemoryJobRepository(JobRepository):
                     provider=spec.get("provider") or provider,
                     analysis_depth=spec.get("analysisDepth") or analysis_depth,
                     wants=list(spec.get("wants") or wants or []),
+                    kind=spec.get("kind") or "analyze",
+                    target_song_id=spec.get("targetSongId"),
                     queued_at=_iso(_now()) or "",
                 )
                 self._jobs[job.id] = job
@@ -495,6 +511,8 @@ class FirestoreJobRepository(JobRepository):
                     provider=spec.get("provider") or provider,
                     analysis_depth=spec.get("analysisDepth") or analysis_depth,
                     wants=list(spec.get("wants") or wants or []),
+                    kind=spec.get("kind") or "analyze",
+                    target_song_id=spec.get("targetSongId"),
                     queued_at=_iso(_now()) or "",
                 )
                 created.append(self._save(job))

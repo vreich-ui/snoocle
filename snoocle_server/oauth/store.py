@@ -150,6 +150,22 @@ class OAuthRepository:
 
     def save_client(self, client: Client) -> Client: raise NotImplementedError
     def get_client(self, client_id: str) -> Optional[Client]: raise NotImplementedError
+    def list_clients(self) -> list[Client]:
+        """Every registered client, newest first.
+
+        Registration is open by design — that is what DCR means — so the only
+        defence against a stray or hostile registration accumulating unnoticed
+        is being able to see the list.
+        """
+        raise NotImplementedError
+    def delete_client(self, client_id: str) -> bool:
+        """Forget a client AND every token it holds.
+
+        Deleting the registration alone would leave live access tokens working
+        for up to an hour and refresh tokens for 90 days, which is the opposite
+        of what someone clicking "revoke" means.
+        """
+        raise NotImplementedError
 
     def save_code(self, code: AuthCode) -> AuthCode: raise NotImplementedError
     def consume_code(self, code: str) -> Optional[AuthCode]:
@@ -183,6 +199,23 @@ class InMemoryOAuthRepository(OAuthRepository):
     def get_client(self, client_id):
         with self._lock:
             return self._clients.get(client_id)
+
+    def list_clients(self):
+        with self._lock:
+            return sorted(self._clients.values(),
+                          key=lambda c: c.created_at or "", reverse=True)
+
+    def delete_client(self, client_id):
+        with self._lock:
+            if self._clients.pop(client_id, None) is None:
+                return False
+            for token in [t for t in self._tokens.values() if t.client_id == client_id]:
+                self._tokens.pop(token.access_token, None)
+                self._refresh.pop(token.refresh_token, None)
+            for code, record in list(self._codes.items()):
+                if record.client_id == client_id:
+                    self._codes.pop(code, None)
+            return True
 
     def save_code(self, code):
         with self._lock:
@@ -262,6 +295,29 @@ class FirestoreOAuthRepository(OAuthRepository):
     def get_client(self, client_id):
         snap = self._col("oauth_clients").document(client_id).get()
         return Client(**snap.to_dict()) if snap.exists else None
+
+    def list_clients(self):
+        clients = [Client(**(s.to_dict() or {})) for s in self._col("oauth_clients").stream()]
+        clients.sort(key=lambda c: c.created_at or "", reverse=True)
+        return clients
+
+    def delete_client(self, client_id):
+        doc = self._col("oauth_clients").document(client_id)
+        if not doc.get().exists:
+            return False
+        # Tokens first: if this half fails, the client is still listed and the
+        # operator can retry. The other order would leave live tokens behind
+        # with nothing in the UI pointing at them.
+        for snap in self._col("oauth_tokens").where("client_id", "==", client_id).stream():
+            record = snap.to_dict() or {}
+            refresh = record.get("refresh_token")
+            if refresh:
+                self._col("oauth_refresh").document(refresh).delete()
+            snap.reference.delete()
+        for snap in self._col("oauth_codes").where("client_id", "==", client_id).stream():
+            snap.reference.delete()
+        doc.delete()
+        return True
 
     # --- codes -----------------------------------------------------------
 

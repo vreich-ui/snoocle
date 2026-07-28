@@ -343,13 +343,104 @@ def _is_worth_retrying(error: BaseException) -> bool:
     return not any(marker in text for marker in permanent)
 
 
+def run_stems_job(job: dict) -> dict:
+    """Separate an existing song's audio into stems.
+
+    Note what this does NOT do: re-run the analysis. The song already exists
+    and its times were measured against a specific upload; producing a new
+    version as a side effect of asking for a backing track would be a nasty
+    surprise. This only writes files beside the song.
+
+    Imported lazily, like everything else that needs the heavy extras.
+    """
+    from .audio import stems
+    from .audio.acquire import acquire
+
+    song_id = job.get("targetSongId")
+    if not song_id:
+        raise ValueError("a stems job needs targetSongId")
+
+    audio = acquire(job.get("youtubeUrlOrId"))
+    result = stems.separate(audio.path, song_id, model=job.get("model") or stems.DEFAULT_MODEL)
+    return {
+        "songId": song_id,
+        "stems": sorted(result.stems),
+        "mixes": sorted(result.mixes),
+    }
+
+
+def run_align_job(job: dict) -> dict:
+    """Time an existing song's lyrics against its audio and store the result.
+
+    Unlike stems, the output here is small structured data, so it goes where
+    the rest of the song's timing lives — on the song, as a new version with a
+    provenance entry naming the engine and which audio it heard. That is what
+    makes it reviewable later instead of a number nobody can account for.
+
+    Only lines that have no time yet are filled. LRCLIB is the more reliable
+    layer where it has coverage, and a human correction in the review queue is
+    more reliable than either; neither should be quietly overwritten by a
+    later alignment run.
+    """
+    from .audio.acquire import acquire
+    from .pipeline import get_store
+    from .schema import ProvenanceEntry
+    from .timing.align import align_lyrics
+
+    song_id = job.get("targetSongId")
+    if not song_id:
+        raise ValueError("an align job needs targetSongId")
+
+    store = get_store()
+    song = store.get(song_id)
+    audio = acquire(job.get("youtubeUrlOrId"))
+
+    result = align_lyrics(
+        audio.path,
+        [line.lyrics or "" for line in song.lines],
+        song_id=song_id,
+    )
+
+    filled = 0
+    for timed in result.lines:
+        if timed.start is None or timed.lineIndex >= len(song.lines):
+            continue
+        line = song.lines[timed.lineIndex]
+        if line.timeSeconds is None:
+            line.timeSeconds = round(timed.start, 3)
+            line.confidence = round(timed.coverage, 3)
+            filled += 1
+
+    song.provenance.append(ProvenanceEntry(
+        step="align",
+        detail=(
+            f"whisperx forced alignment on the {result.source}; "
+            f"coverage {result.coverage:.2f}; filled {filled} previously untimed lines"
+        ),
+    ))
+    version = store.save(song, message=f"align: {filled} line times from audio")
+    return {
+        "songId": song_id,
+        "storedVersion": getattr(version, "version", None) or str(version),
+        "filledLines": filled,
+        "coverage": round(result.coverage, 3),
+        "source": result.source,
+    }
+
+
 def run_pipeline_job(job: dict) -> dict:
-    """Execute one job with the very same pipeline the server would run.
+    """Execute one job, dispatching on its kind.
 
     Imported lazily so the worker module stays importable (and testable) on a
     machine without the MIR/ML extras installed.
     """
     import asyncio
+
+    kind = job.get("kind")
+    if kind == "stems":
+        return run_stems_job(job)
+    if kind == "align":
+        return run_align_job(job)
 
     from .pipeline import run_pipeline_async
 

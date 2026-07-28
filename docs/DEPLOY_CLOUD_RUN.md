@@ -236,6 +236,7 @@ URL=$(gcloud run services describe snoocle --region="$REGION" --format='value(st
 TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
 
 curl -H "Authorization: Bearer $TOKEN" "$URL/healthz"
+
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"title":"Let It Be","artist":"The Beatles"}' \
     "$URL/v1/songs/analyze"

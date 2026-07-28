@@ -96,7 +96,7 @@ import re, subprocess, unicodedata
 raw = subprocess.run(["scutil", "--get", "ComputerName"],
                      capture_output=True, text=True).stdout.strip()
 raw = raw or subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
-raw = raw.translate(str.maketrans({"‘": chr(39), "’": chr(39), "–": "-", "—": "-"}))
+raw = raw.translate(str.maketrans({"\\u2018": chr(39), "\\u2019": chr(39), "\\u2013": "-", "\\u2014": "-"}))
 raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode()
 # The value is embedded verbatim in plist XML and in a double-quoted, sourced
 # shell file - whitelist, because &, <, $ or a backtick in a machine name

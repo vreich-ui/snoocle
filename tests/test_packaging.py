@@ -50,7 +50,7 @@ def _matches(rel: str, patterns: list[str]) -> bool:
 
 def _ui_files() -> list[str]:
     return [
-        str(p.relative_to(PKG)).replace("\\\\", "/")
+        str(p.relative_to(PKG)).replace("\\", "/")
         for p in sorted(UI.rglob("*"))
         if p.is_file() and "__pycache__" not in p.parts
     ]
@@ -106,7 +106,7 @@ def _dependency_specs() -> dict[str, str]:
         cfg = tomllib.load(fh)
     specs = {}
     for raw in cfg["project"]["dependencies"]:
-        name = re.split(r"[<>=!\\[ ]", raw, maxsplit=1)[0].strip()
+        name = re.split(r"[<>=!\[ ]", raw, maxsplit=1)[0].strip()
         specs[name] = raw
     return specs
 

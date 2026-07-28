@@ -166,6 +166,50 @@ def test_rest_roundtrip_and_reset(client, monkeypatch):
     assert client.get("/v1/config/agent", headers=h).json()["isDefault"] is True
 
 
+def test_rest_instructions_append_is_additive_and_deduped(client, monkeypatch):
+    """Promoting a note to the standing prompt: one atomic append, so a client
+    never read-modify-writes the whole config to add a line."""
+    monkeypatch.setattr(settings, "api_token", "tok")
+    h = {"Authorization": "Bearer tok"}
+
+    first = client.post("/v1/config/agent/instructions", headers=h,
+                        json={"add": "prefer open chords"})
+    assert first.status_code == 200
+    assert first.json()["config"]["instructions_extra"] == "prefer open chords"
+    assert first.json()["isDefault"] is False and first.json()["configVersion"]
+
+    second = client.post("/v1/config/agent/instructions", headers=h,
+                         json={"add": "never write N.C."})
+    assert second.json()["config"]["instructions_extra"] == "prefer open chords\nnever write N.C."
+
+    # re-promoting an existing line is a no-op success, not a duplicate
+    again = client.post("/v1/config/agent/instructions", headers=h,
+                        json={"add": "  prefer open chords  "})
+    assert again.status_code == 200
+    assert again.json()["config"]["instructions_extra"] == "prefer open chords\nnever write N.C."
+    assert again.json()["configVersion"] == second.json()["configVersion"]
+
+
+def test_rest_instructions_append_rejects_empty_and_keeps_other_fields(client, monkeypatch):
+    monkeypatch.setattr(settings, "api_token", "tok")
+    h = {"Authorization": "Bearer tok"}
+    client.put("/v1/config/agent", headers=h,
+               json={"effort": "high", "model": "claude-opus-4-8", "max_turns": 7,
+                     "disabled_tools": ["web_fetch"]})
+
+    for body in ({"add": ""}, {"add": "   "}, {}):
+        assert client.post("/v1/config/agent/instructions", headers=h, json=body).status_code == 400
+
+    cfg = client.post("/v1/config/agent/instructions", headers=h,
+                      json={"add": "capo 0 always"}).json()["config"]
+    assert cfg["instructions_extra"] == "capo 0 always"
+    assert cfg["effort"] == "high" and cfg["model"] == "claude-opus-4-8"
+    assert cfg["max_turns"] == 7 and cfg["disabled_tools"] == ["web_fetch"]
+    # and it is what a subsequent GET reports (it was really stored)
+    got = client.get("/v1/config/agent", headers=h).json()["config"]
+    assert got["instructions_extra"] == "capo 0 always" and got["effort"] == "high"
+
+
 # --- MCP tool functions (callable without a live server / ffmpeg) -----------
 
 

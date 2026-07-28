@@ -333,3 +333,269 @@ def _fake_result_from(song: Song) -> ReconcileResult:
     return ReconcileResult(
         song=song, provider="anthropic", model="fake", attempts=1, audio_attached=False, usage={}
     )
+
+
+# --- re-analysis scope -------------------------------------------------------
+# Two independent evidence-gathering stages, each switchable: `listen` (acquire
+# + MIR) and `reconcile` (web source discovery). The LLM reconciliation itself
+# ALWAYS runs — the flags decide what evidence it gets. An ABSENT scope is not
+# a scope: it must reproduce the pre-scope pipeline exactly.
+
+
+class _Recorder:
+    """Stands in for `reconcile`, capturing what the pipeline handed it."""
+
+    def __init__(self, song_id="anon--x"):
+        self.calls: list[dict] = []
+        self.song_id = song_id
+
+    def __call__(self, title, artist, candidates, mir, **kwargs):
+        # candidates/mir ride positionally through `_step_reconcile`; normalize
+        # everything into one dict so the assertions read the same either way.
+        self.calls.append({"candidates": candidates, "mir": mir, **kwargs})
+        return _fake_result(self.song_id)
+
+    @property
+    def last(self) -> dict:
+        assert self.calls, "reconcile was never called"
+        return self.calls[-1]
+
+
+def _no_scope_analyze_body(**extra) -> dict:
+    body = {"title": "X", "artist": "Anon", "provider": "anthropic"}
+    body.update(extra)
+    return body
+
+
+def test_absent_scope_leaves_the_pipeline_exactly_as_before(monkeypatch):
+    """The compatibility guarantee: a request with no `scope` key runs every
+    stage and its report grows no new entries. Every pre-scope client depends
+    on this, so it is asserted positively rather than by omission."""
+    discovered: list[str] = []
+    monkeypatch.setattr(
+        pipeline_mod, "discover_sources", lambda *a, **k: discovered.append("ran") or []
+    )
+    recorder = _Recorder()
+    monkeypatch.setattr(pipeline_mod, "reconcile", recorder)
+
+    r = client.post("/v1/songs/analyze", json=_no_scope_analyze_body(skipAudio=True))
+    assert r.status_code == 200, r.text
+    steps = r.json()["steps"]
+    assert discovered == ["ran"], "discovery must still run without a scope"
+    assert steps["discover"].startswith("ok")
+    assert "scope" not in steps, "an absent scope must not add a step to the report"
+    assert recorder.last["scope"] is None
+
+
+def test_scope_reconcile_off_skips_discovery_and_says_so(monkeypatch):
+    def boom(*a, **k):  # noqa: ANN001
+        raise AssertionError("discovery ran despite reconcile=false")
+
+    monkeypatch.setattr(pipeline_mod, "discover_sources", boom)
+    recorder = _Recorder()
+    monkeypatch.setattr(pipeline_mod, "reconcile", recorder)
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json=_no_scope_analyze_body(skipAudio=True, scope={"listen": True, "reconcile": False}),
+    )
+    assert r.status_code == 200, r.text
+    steps = r.json()["steps"]
+    assert steps["discover"] == "skipped (scope: no new sources)"
+    assert steps["scope"] == "listen=on, reconcile=off"
+    assert recorder.last["candidates"] == []
+
+
+def test_scope_listen_off_skips_acquire_and_mir(monkeypatch):
+    def boom(*a, **k):  # noqa: ANN001
+        raise AssertionError("audio was acquired/analyzed despite listen=false")
+
+    monkeypatch.setattr(pipeline_mod, "acquire", boom)
+    monkeypatch.setattr(pipeline_mod, "analyze_audio", boom)
+    monkeypatch.setattr(pipeline_mod, "discover_sources", lambda *a, **k: [])
+    recorder = _Recorder()
+    monkeypatch.setattr(pipeline_mod, "reconcile", recorder)
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json=_no_scope_analyze_body(scope={"listen": False, "reconcile": True}),
+    )
+    assert r.status_code == 200, r.text
+    steps = r.json()["steps"]
+    assert steps["acquire"].startswith("skipped (scope:")
+    assert steps["mir"].startswith("skipped (scope:")
+    assert steps["scope"] == "listen=off, reconcile=on"
+    assert recorder.last["mir"] is None
+
+
+def test_scope_both_off_gathers_nothing_but_still_reconciles(monkeypatch):
+    """The owner's "no checkbox" case: apply my notes to the song I already
+    have. Nothing is fetched, but the reconciler still runs and still receives
+    the prior song AND the guidance — without both it would have nothing to
+    correct and nothing to correct it with."""
+    def boom(*a, **k):  # noqa: ANN001
+        raise AssertionError("evidence was gathered despite an all-off scope")
+
+    monkeypatch.setattr(pipeline_mod, "discover_sources", boom)
+    monkeypatch.setattr(pipeline_mod, "acquire", boom)
+    monkeypatch.setattr(pipeline_mod, "analyze_audio", boom)
+    recorder = _Recorder()
+    monkeypatch.setattr(pipeline_mod, "reconcile", recorder)
+
+    prior = _fake_song("anon--x").model_dump()
+    r = client.post(
+        "/v1/songs/analyze",
+        json=_no_scope_analyze_body(
+            scope={"listen": False, "reconcile": False},
+            guidance="the bridge is in D",
+            priorSong=prior,
+        ),
+    )
+    assert r.status_code == 200, r.text
+    steps = r.json()["steps"]
+    assert steps["discover"] == "skipped (scope: notes only)"
+    assert steps["acquire"].startswith("skipped")
+    assert steps["mir"].startswith("skipped")
+    assert steps["reconcile"].startswith("ok"), "reconciliation must still run"
+
+    call = recorder.last
+    assert call["prior_song"] == prior
+    assert call["guidance"] == "the bridge is in D"
+    assert call["scope"].notes_only
+    assert call["candidates"] == [] and call["mir"] is None, "nothing was gathered"
+
+
+def test_partial_scope_object_only_turns_off_what_it_names(monkeypatch):
+    """`{"listen": false}` must not silently disable discovery too — a missing
+    flag defaults ON, so a partial object can only ever narrow what it says."""
+    ran: list[str] = []
+    monkeypatch.setattr(
+        pipeline_mod, "discover_sources", lambda *a, **k: ran.append("discover") or []
+    )
+    monkeypatch.setattr(pipeline_mod, "reconcile", _Recorder())
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json=_no_scope_analyze_body(scope={"listen": False}),
+    )
+    assert r.status_code == 200, r.text
+    assert ran == ["discover"]
+    assert r.json()["steps"]["scope"] == "listen=off, reconcile=on"
+
+
+def test_scope_is_recorded_in_the_reconcile_provenance():
+    """A version built from the prior song plus notes is a different artifact
+    from a full re-analysis; six months later the provenance is the only place
+    that difference survives. Runs through the REAL reconciler (mock provider)
+    so the provenance is the one the engine actually writes."""
+    r = client.post(
+        "/v1/songs/analyze",
+        json={
+            "title": "Scoped", "artist": "Tester", "provider": "mock",
+            "scope": {"listen": False, "reconcile": True},
+        },
+    )
+    assert r.status_code == 200, r.text
+    entries = [p for p in r.json()["song"]["provenance"] if p["action"] == "reconciled"]
+    assert entries, "no reconciled provenance entry"
+    notes = entries[-1]["notes"]
+    assert "scope: listen=off, reconcile=on" in notes
+    # …alongside, not instead of, the existing text.
+    assert "chord rule enforced by schema validation" in notes
+
+
+def test_absent_scope_writes_no_scope_provenance():
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "Unscoped", "artist": "Tester", "provider": "mock", "skipAudio": True},
+    )
+    assert r.status_code == 200, r.text
+    entries = [p for p in r.json()["song"]["provenance"] if p["action"] == "reconciled"]
+    assert "scope:" not in (entries[-1]["notes"] or "")
+
+
+@pytest.mark.parametrize(
+    "scope_arg, expected",
+    [
+        (None, None),
+        ({"listen": False, "reconcile": False}, (False, False)),
+        ({"listen": True, "reconcile": False}, (True, False)),
+        ({"reconcile": False}, (True, False)),  # missing flag defaults ON
+    ],
+)
+def test_mcp_tool_accepts_the_same_scope_shape(monkeypatch, scope_arg, expected):
+    """Parity: the MCP tool takes the wire object verbatim, and an omitted
+    scope stays omitted all the way down (None, not a full-scope object)."""
+    import asyncio
+
+    from snoocle_server import mcp_server as mcp_mod
+
+    seen: dict = {}
+
+    async def fake_pipeline(*a, **k):
+        seen.update(k)
+        report = pipeline_mod.PipelineReport(song_id="anon--x")
+        report.reconcile = _fake_result()
+        return report
+
+    monkeypatch.setattr(mcp_mod, "run_pipeline_async", fake_pipeline)
+    asyncio.run(mcp_mod.analyze_and_store_song(title="X", artist="Anon", scope=scope_arg))
+
+    scope = seen["scope"]
+    if expected is None:
+        assert scope is None, "an omitted MCP scope must not become a full-scope object"
+    else:
+        assert (scope.listen, scope.reconcile) == expected
+
+
+def test_notes_only_prompt_says_nothing_was_gathered():
+    """With zero candidates and no MIR the prompt must SAY so. A model handed
+    two empty evidence sections and no explanation concludes the evidence
+    failed to load and reconstructs the song from memory — the exact
+    hallucination this scope exists to avoid."""
+    from snoocle_server.reconcile.prompt import build_user_prompt
+    from snoocle_server.schema import song_json_schema
+    from snoocle_server.scope import AnalysisScope
+
+    prior = _fake_song("anon--x").model_dump()
+    prompt = build_user_prompt(
+        "X", "Anon", [], None, song_json_schema(), "anon--x", None,
+        guidance="the bridge is in D",
+        prior_song=prior,
+        scope=AnalysisScope(listen=False, reconcile=False),
+    )
+    assert "apply the user's notes only" in prompt
+    assert "No new sources were gathered" in prompt
+    assert "do not invent a song" in prompt
+    # The empty candidate section can no longer read "0 found — use ALL of them".
+    assert "use ALL of them" not in prompt
+    assert "NONE were gathered for this run" in prompt
+    # The prior song is the starting document, not one opinion among several.
+    assert "this is your starting document" in prompt
+    assert "the bridge is in D" in prompt
+
+
+def test_reconcile_accepts_a_prior_song_as_its_only_input():
+    """The guard that stops the reconciler inventing a song from nothing has to
+    let the notes-only scope through — a prior song IS something to work on —
+    while still rejecting a run that has neither."""
+    from snoocle_server.reconcile.engine import reconcile as real_reconcile
+    from snoocle_server.scope import AnalysisScope
+
+    scope = AnalysisScope(listen=False, reconcile=False)
+    with pytest.raises(ReconcileError) as exc:
+        real_reconcile(
+            "X", "Anon", [], None, provider_name="anthropic", prior_song=None, scope=scope
+        )
+    assert "nothing to reconcile" in str(exc.value)
+    assert "no prior song to correct" in str(exc.value)
+
+    # With a prior song the guard no longer fires — the run gets as far as the
+    # provider (which has no real credential here, so it fails LATER and with a
+    # different error).
+    with pytest.raises(Exception) as later:
+        real_reconcile(
+            "X", "Anon", [], None, provider_name="anthropic",
+            prior_song=_fake_song("anon--x").model_dump(), scope=scope,
+        )
+    assert "nothing to reconcile" not in str(later.value)

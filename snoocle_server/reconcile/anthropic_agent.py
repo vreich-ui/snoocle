@@ -382,8 +382,20 @@ class AnthropicAgentProvider(LLMProvider):
         web = _pick(cfg.max_web_search if cfg else None, "max_web_search", 2)
         fetch = _pick(cfg.max_fetch if cfg else None, "max_fetch", 3)
         windows = _pick(cfg.max_windows if cfg else None, "max_windows", 2)
-        disabled = frozenset(cfg.disabled_tools) if cfg else frozenset()
-        tools = _build_tools(web, fetch, disabled)
+        disabled = set(cfg.disabled_tools) if cfg else set()
+        # Scope must REMOVE tools, not merely ask the model not to use them.
+        # The payload carries a scopeInstruction too, but an instruction is a
+        # request: the model kept searching and re-analyzing audio on runs where
+        # the user had switched exactly that off, then ground into the 900s
+        # reconcile timeout. An undeclared tool cannot be called, so the scope
+        # is enforced here and merely explained in the prompt.
+        scope = (self.context or {}).get("scope")
+        if scope is not None:
+            if not scope.listen:
+                disabled.add("analyze_audio_window")
+            if not scope.reconcile:
+                disabled.update(("web_search", "web_fetch", "fetch_chord_sheet"))
+        tools = _build_tools(web, fetch, frozenset(disabled))
         system_blocks = build_system_blocks(cfg)
         # Budget the first user message advertises to the model (see _build...).
         self._effective_budget = {"webSearch": web, "pageFetch": fetch, "audioWindow": windows}
@@ -422,10 +434,14 @@ class AnthropicAgentProvider(LLMProvider):
                 # prior conversation (system block carries its own breakpoint).
                 "cache_control": {"type": "ephemeral"},
                 "system": system_blocks,
-                "tools": tools,
                 # no temperature/top_p/top_k: sampling params are rejected here
                 "messages": self._messages,
             }
+            # A notes-only run disables every tool. Send no `tools` key at all
+            # rather than an empty list — the two are not equivalent, and an
+            # empty list is rejected.
+            if tools:
+                request["tools"] = tools
             # Omitted entirely rather than sent as null: the parameter is typed
             # Optional[str] and an explicit None is not the same as absent.
             if container_id:

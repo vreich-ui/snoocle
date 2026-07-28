@@ -201,23 +201,26 @@ token be the gate.
 
 ```sh
 # 1. Generate a strong token and store it in Secret Manager.
+#    NOTE: the secret in the live project is named SNOOCLE_API_TOKEN
+#    (same spelling as the env var), not a kebab-case name. Commands
+#    below use the real name so they work against the deployment as-is.
 python -c "import secrets; print(secrets.token_urlsafe(32))" \
-    | gcloud secrets create snoocle-api-token --data-file=-
-gcloud secrets add-iam-policy-binding snoocle-api-token \
+    | gcloud secrets create SNOOCLE_API_TOKEN --data-file=-
+gcloud secrets add-iam-policy-binding SNOOCLE_API_TOKEN \
     --member="serviceAccount:snoocle-run@${PROJECT_ID}.iam.gserviceaccount.com" \
     --role=roles/secretmanager.secretAccessor
 
 # 2. Redeploy PUBLIC, injecting the token (add these flags to the deploy in §4).
 gcloud run services update snoocle --region="$REGION" \
     --allow-unauthenticated \
-    --update-secrets="SNOOCLE_API_TOKEN=snoocle-api-token:latest"
+    --update-secrets="SNOOCLE_API_TOKEN=SNOOCLE_API_TOKEN:latest"
 ```
 
 Clients then send the same fixed token to either surface — no `gcloud` needed:
 
 ```sh
 URL=$(gcloud run services describe snoocle --region="$REGION" --format='value(status.url)')
-TOKEN=$(gcloud secrets versions access latest --secret=snoocle-api-token)
+TOKEN=$(gcloud secrets versions access latest --secret=SNOOCLE_API_TOKEN)
 
 curl -H "Authorization: Bearer $TOKEN" "$URL/v1/songs"          # REST
 # MCP: pass the same header (see §7) — Authorization: Bearer $TOKEN
@@ -233,7 +236,6 @@ URL=$(gcloud run services describe snoocle --region="$REGION" --format='value(st
 TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
 
 curl -H "Authorization: Bearer $TOKEN" "$URL/healthz"
-
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"title":"Let It Be","artist":"The Beatles"}' \
     "$URL/v1/songs/analyze"
@@ -286,7 +288,7 @@ TOKEN=$(gcloud auth print-identity-token --audiences="$URL")
 Any MCP client that supports the streamable-HTTP transport with custom headers
 can connect to `"$URL/mcp"` sending `Authorization: Bearer $TOKEN`. (If you
 enabled the [static bearer token](#optional-a-static-bearer-token), set
-`TOKEN=$(gcloud secrets versions access latest --secret=snoocle-api-token)`
+`TOKEN=$(gcloud secrets versions access latest --secret=SNOOCLE_API_TOKEN)`
 instead — the fixed token doesn't expire, so no per-hour refresh.) With the
 Python SDK directly:
 

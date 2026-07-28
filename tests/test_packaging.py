@@ -18,6 +18,7 @@ directory added later is covered the day it appears.
 from __future__ import annotations
 
 import fnmatch
+import re
 import tomllib
 from pathlib import Path
 
@@ -49,7 +50,7 @@ def _matches(rel: str, patterns: list[str]) -> bool:
 
 def _ui_files() -> list[str]:
     return [
-        str(p.relative_to(PKG)).replace("\\", "/")
+        str(p.relative_to(PKG)).replace("\\\\", "/")
         for p in sorted(UI.rglob("*"))
         if p.is_file() and "__pycache__" not in p.parts
     ]
@@ -84,3 +85,44 @@ def test_the_glob_actually_reaches_the_player_and_its_vendor_files():
 @pytest.mark.parametrize("rel", ["ui/index.html", "ui/app.js", "ui/admin-d.js", "ui/tokens.css"])
 def test_admin_assets_still_covered(rel):
     assert _matches(rel, _package_data_patterns())
+
+
+# --- dependency ceilings ------------------------------------------------------
+#
+# The other half of "the image runs the INSTALLED package": the image also
+# resolves dependencies fresh at build time, while a developer's venv keeps
+# whatever it resolved months ago. So an upstream major release can break every
+# deploy without a single line of our code changing, and the whole test suite
+# stays green on the stale venv that can no longer reproduce it.
+#
+# That is not hypothetical — it is what happened: `mcp` was declared `>=1.10.0`
+# with no ceiling, a rebuild resolved to 2.0.0, and 2.0.0 removed
+# `mcp.server.fastmcp`, which `mcp_server.py` imports at module scope. Every
+# Cloud Run instance exited(1) at import before it could bind $PORT.
+
+
+def _dependency_specs() -> dict[str, str]:
+    with (REPO / "pyproject.toml").open("rb") as fh:
+        cfg = tomllib.load(fh)
+    specs = {}
+    for raw in cfg["project"]["dependencies"]:
+        name = re.split(r"[<>=!\\[ ]", raw, maxsplit=1)[0].strip()
+        specs[name] = raw
+    return specs
+
+
+def test_mcp_is_capped_below_the_release_that_dropped_fastmcp():
+    """A floor alone is not a version constraint — it is an open invitation."""
+    spec = _dependency_specs().get("mcp")
+    assert spec is not None, "mcp is no longer a declared dependency"
+    assert "<" in spec, (
+        "the upper bound on `mcp` is load-bearing: 2.0.0 removed "
+        "mcp.server.fastmcp and every container died at import. Removing this "
+        "ceiling requires porting mcp_server.py to the 2.x server API first."
+    )
+
+
+def test_the_module_the_ceiling_protects_actually_imports():
+    """Pins the reason the ceiling exists, so it fails loudly rather than
+    turning back into a deploy-time surprise."""
+    from mcp.server.fastmcp import FastMCP  # noqa: F401

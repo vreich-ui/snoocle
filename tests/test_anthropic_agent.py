@@ -358,3 +358,71 @@ def test_no_container_key_is_sent_when_none_was_allocated(monkeypatch):
 
     for call in _create_kwargs(captured):
         assert "container" not in call
+
+
+# --- scope must remove tools, not just ask ------------------------------------
+#
+# The payload carries a scopeInstruction, but an instruction is a request. On a
+# live run with listen=off the model went on calling analyze_audio_window and
+# web_search anyway, then ground into the 900s reconcile timeout. Tools the
+# scope switched off must be UNDECLARED, which makes them uncallable.
+
+
+def _tool_names(captured: dict) -> list[str]:
+    tools = _create_kwargs(captured)[0].get("tools", [])
+    return [t["name"] for t in tools]
+
+
+def _reconcile_with_scope(monkeypatch, scope, queue):
+    from snoocle_server.scope import AnalysisScope
+
+    captured = _install_recording(monkeypatch, queue)
+    reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+              provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4",
+              scope=scope)
+    return captured
+
+
+def test_listen_off_removes_the_audio_window_tool(monkeypatch):
+    from snoocle_server.scope import AnalysisScope
+
+    captured = _reconcile_with_scope(
+        monkeypatch, AnalysisScope(listen=False, reconcile=True),
+        [_response("end_turn", [_text(json.dumps(_SONG))])],
+    )
+    names = _tool_names(captured)
+    assert "analyze_audio_window" not in names, "listening was switched off"
+    assert "web_search" in names, "source gathering was left on"
+
+
+def test_reconcile_off_removes_every_source_gathering_tool(monkeypatch):
+    from snoocle_server.scope import AnalysisScope
+
+    captured = _reconcile_with_scope(
+        monkeypatch, AnalysisScope(listen=True, reconcile=False),
+        [_response("end_turn", [_text(json.dumps(_SONG))])],
+    )
+    names = _tool_names(captured)
+    for gone in ("web_search", "web_fetch", "fetch_chord_sheet"):
+        assert gone not in names, f"{gone} should be undeclared"
+    assert "analyze_audio_window" in names, "listening was left on"
+
+
+def test_notes_only_sends_no_tools_key_at_all(monkeypatch):
+    """Every tool is off, and an empty list is not the same as no list."""
+    from snoocle_server.scope import AnalysisScope
+
+    captured = _reconcile_with_scope(
+        monkeypatch, AnalysisScope(listen=False, reconcile=False),
+        [_response("end_turn", [_text(json.dumps(_SONG))])],
+    )
+    call = _create_kwargs(captured)[0]
+    assert "tools" not in call
+
+
+def test_absent_scope_leaves_every_tool_declared(monkeypatch):
+    captured = _install_recording(monkeypatch, [_response("end_turn", [_text(json.dumps(_SONG))])])
+    reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+              provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+    names = _tool_names(captured)
+    assert {"web_search", "web_fetch", "fetch_chord_sheet", "analyze_audio_window"} <= set(names)

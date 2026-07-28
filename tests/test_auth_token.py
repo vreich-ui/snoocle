@@ -36,8 +36,10 @@ def test_rest_requires_token_when_configured(token_enabled):
 
 
 def test_healthz_is_exempt(token_enabled):
-    # liveness probes must work without the token
+    # liveness probes must work without the token — both spellings, since an
+    # external monitor has to use /health (see test_api.py for why)
     assert client.get("/healthz").status_code == 200
+    assert client.get("/health").status_code == 200
 
 
 def test_ui_shell_is_exempt_but_api_still_gated(token_enabled):

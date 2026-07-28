@@ -24,6 +24,7 @@ from snoocle_server.api import app
 from snoocle_server.config import settings
 from snoocle_server.oauth import protocol as P
 from snoocle_server.oauth import routes as R
+from snoocle_server.oauth import store as S
 from snoocle_server.oauth.store import (
     InMemoryOAuthRepository,
     issue_code,
@@ -36,9 +37,16 @@ CLAUDE_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 
 @pytest.fixture()
 def store(monkeypatch):
+    """Install an in-memory repo as THE store, not as a patched name.
+
+    Setting the module singleton means every caller resolves to it — the OAuth
+    routes and the /v1 admin endpoints alike. Patching `get_oauth_store` in one
+    module only would leave the other talking to the real backend, and a test
+    that quietly exercises a different store than the code under test is worse
+    than no test.
+    """
     repo = InMemoryOAuthRepository()
-    monkeypatch.setattr(R, "get_oauth_store", lambda: repo)
-    monkeypatch.setattr("snoocle_server.oauth.routes.get_oauth_store", lambda: repo)
+    monkeypatch.setattr(S, "_repo", repo)
     return repo
 
 
@@ -535,3 +543,46 @@ def test_an_expired_code_is_burned_not_honoured(store):
     code.expires_at = "2020-01-01T00:00:00+00:00"
     store.save_code(code)
     assert store.consume_code(code.code) is None
+
+
+# --- registered clients: visibility and revocation ---------------------------
+
+
+def test_registered_clients_are_listable(client):
+    """DCR accepts anyone, so the list is the only thing standing between a
+    stray registration and nobody ever noticing it."""
+    reg = register(client)
+    body = client.get("/v1/oauth/clients", headers={"Authorization": f"Bearer {TOKEN}"}).json()
+    assert reg["client_id"] in [c["clientId"] for c in body["clients"]]
+
+
+def test_deleting_a_client_kills_its_tokens_too(client, store):
+    """Revoking a registration but leaving its access token working for an hour
+    (and its refresh token for 90 days) is the opposite of what revoke means."""
+    tokens = full_flow(client)
+    client_id = store.list_clients()[0].client_id
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+
+    assert client.delete(f"/v1/oauth/clients/{client_id}", headers=auth).status_code == 200
+    # the registration is gone...
+    assert client_id not in [c["clientId"] for c in client.get("/v1/oauth/clients", headers=auth).json()["clients"]]
+    # ...and so is the token it was holding
+    r = client.post("/mcp", headers={"Authorization": f"Bearer {tokens['access_token']}"}, json={})
+    assert r.status_code == 401
+    refused = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+    })
+    assert refused.status_code == 400
+
+
+def test_deleting_an_unknown_client_is_404(client):
+    r = client.delete("/v1/oauth/clients/snc_nope", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 404
+
+
+def test_an_oauth_token_cannot_enumerate_or_delete_clients(client):
+    """A connector must not be able to see or revoke its siblings."""
+    tokens = full_flow(client)
+    auth = {"Authorization": f"Bearer {tokens['access_token']}"}
+    assert client.get("/v1/oauth/clients", headers=auth).status_code == 401
+    assert client.delete("/v1/oauth/clients/snc_x", headers=auth).status_code == 401

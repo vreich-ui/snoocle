@@ -52,6 +52,14 @@ snoocle_server/
 │                    confidence.py (per-placement agreement scoring + the
 │                    review queue), lrc.py (LRCLIB synced lyrics),
 │                    offset.py (cross-video offset by cross-correlation)
+├── audio/stems.py   B4: demucs separation + ffmpeg-rendered practice mixes.
+│                    Separation needs torch and minutes of CPU, so it runs on a
+│                    worker; READING the cache needs nothing, which is what
+│                    lets the API serve what the Mac made. docs/STEMS.md
+├── timing/align.py  B2: WhisperX alignment-only — the lyrics are known, so the
+│                    model is asked WHEN each word is sung, never what. Prefers
+│                    the vocals stem when B4 has produced one, and records
+│                    which input it heard
 ├── batch.py         parses the admin's "add many" textarea into job specs
 ├── worker.py        the analysis worker (`snoocle-worker`) — claims jobs from
 │                    a server and runs them locally. Outbound-only; runs on

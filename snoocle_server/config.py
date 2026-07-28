@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     # --- storage ---
     data_dir: Path = Path("data")
     audio_cache_dir: Path = Path("data/audio-cache")
+    # Separated stems and the practice mixes derived from them (B4). Sits
+    # beside the audio cache and is equally disposable — everything here can be
+    # regenerated from the source audio, it is just expensive to. NOTE on Cloud
+    # Run this is tmpfs (RAM, wiped on restart), which is why separation is a
+    # worker job: the machine that produces stems is the machine that keeps
+    # them. See docs/STEMS.md.
+    stems_dir: Path = Path("data/stems")
 
     # Song persistence backend. "auto" (default) picks Firestore when a GCP
     # project or the Firestore emulator is configured, else an in-process

@@ -26,6 +26,7 @@ from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
+from .audio import stems
 from .audio import utils as audio_utils
 from .batch import MAX_ITEMS_PER_SUBMIT, parse_batch_line
 from .audio.acquire import AcquisitionError, YouTubeAuthError, acquire
@@ -121,7 +122,7 @@ app = FastAPI(
 # (it carries no secrets — every /v1 call it makes is still gated), and the
 # OAuth endpoints themselves, which are by definition reached without a token.
 _ALWAYS_OPEN_PREFIXES = ("/ui", "/oauth/", "/.well-known/")
-_ALWAYS_OPEN_EXACT = ("/healthz", "/")
+_ALWAYS_OPEN_EXACT = ("/healthz", "/health", "/")
 
 
 def _is_open_path(path: str) -> bool:
@@ -231,7 +232,21 @@ def _asdict(obj: Any) -> Any:
 # --- health / meta ---------------------------------------------------------
 
 
+# Two paths, same handler. `/healthz` is what the Dockerfile HEALTHCHECK and
+# Cloud Run's own probes use, and those reach the container directly on
+# 127.0.0.1, so they are unaffected by anything in front of the service.
+#
+# `/health` exists because EXTERNAL monitors are not so lucky: on the deployed
+# service, a request for exactly `/healthz` is answered by a Google-branded 404
+# at the edge and never reaches this process (no `x-cloud-trace-context` on the
+# response — the tell that Cloud Run's ingress never saw it). `/health`,
+# `/healthz/`, `/livez`, `/_ah/health` and every other path all get through, so
+# it is a single-path rule somewhere above the service, not an app fault.
+#
+# Rather than depend on getting that rule changed, uptime checks should point
+# at `/health`. Both paths return the identical document.
 @app.get("/healthz")
+@app.get("/health")
 def healthz() -> dict:
     import importlib.metadata
     import shutil
@@ -847,6 +862,163 @@ def post_queue_cancel(job_id: str) -> dict:
 def delete_queue_finished() -> dict:
     """Drop finished jobs. Queued and leased jobs are untouched."""
     return {"removed": get_job_store().clear_finished()}
+
+
+# --- stems (B4) --------------------------------------------------------------
+# Separation runs where the ML extras and the CPU are: a worker. This process
+# only ever reads the cache and streams files, which is why none of these
+# endpoints import demucs. On Cloud Run they will report "no stems yet" until
+# something with the [stems] extra has run the job — see docs/STEMS.md for why
+# that boundary is where it is.
+
+
+@app.post("/v1/songs/{song_id}/stems", status_code=202)
+def post_song_stems(song_id: str, model: str = stems.DEFAULT_MODEL,
+                    force: bool = False) -> dict:
+    """Queue a separation. 202 because this takes minutes, not milliseconds."""
+    if not stems.known_model(model):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown model {model!r} (known: {sorted(stems.MODELS)})",
+        )
+    try:
+        song = get_store().get(song_id)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    # Separate the upload the song's times were measured against, not whatever
+    # video happens to be linked — stems whose timeline disagrees with the
+    # song's are worse than no stems.
+    video = song.audio.analyzedVideoId or song.audio.youtubeVideoId
+    if not video:
+        raise HTTPException(
+            status_code=409,
+            detail="this song has no analyzed video to separate — run an analysis first",
+        )
+
+    existing = stems.available(song_id, model)
+    if existing and existing.complete and not force:
+        return {"status": "cached", **existing.to_json()}
+
+    jobs = get_job_store().submit([{
+        "kind": "stems",
+        "targetSongId": song_id,
+        "youtubeUrlOrId": video,
+        "title": song.metadata.title,
+        "artist": song.metadata.artist,
+        "wants": ["stems"],
+    }])
+    return {"status": "queued", "model": model, "jobs": [j.to_json() for j in jobs]}
+
+
+@app.get("/v1/songs/{song_id}/stems")
+def get_song_stems(song_id: str, model: str = stems.DEFAULT_MODEL) -> dict:
+    found = stems.available(song_id, model)
+    if found is None:
+        return {"songId": song_id, "model": model, "complete": False,
+                "stems": [], "mixes": []}
+    return found.to_json()
+
+
+@app.get("/v1/songs/{song_id}/stems/{name}")
+def get_song_stem_audio(song_id: str, name: str, model: str = stems.DEFAULT_MODEL):
+    """Stream one stem or derived mix.
+
+    FileResponse handles Range itself, which is what lets a player seek in a
+    40 MB backing track instead of refetching it.
+    """
+    path = stems.stem_path(song_id, name, model)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"no stem {name!r} for {song_id}")
+    return FileResponse(str(path), media_type="audio/wav", filename=f"{song_id}-{name}.wav")
+
+
+@app.delete("/v1/songs/{song_id}/stems")
+def delete_song_stems(song_id: str, model: Optional[str] = None) -> dict:
+    """Reclaim the disk. Everything here regenerates from the source audio."""
+    return {"removed": stems.clear(song_id, model)}
+
+
+@app.post("/v1/songs/{song_id}/align", status_code=202)
+def post_song_align(song_id: str, language: str = "en") -> dict:
+    """Queue forced alignment of this song's lyrics against its audio (B2).
+
+    Queued rather than run here for the same reason as stems: whisperx and
+    torch live on the worker, not in the Cloud Run image. The job additionally
+    `wants` the vocals stem's engine implicitly — alignment works on the full
+    mix, just less well — so it is not made to depend on stems existing.
+    """
+    try:
+        song = get_store().get(song_id)
+    except StoreError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    if not any((line.lyrics or "").strip() for line in song.lines):
+        raise HTTPException(
+            status_code=409,
+            detail="this song has no lyrics to align",
+        )
+    video = song.audio.analyzedVideoId or song.audio.youtubeVideoId
+    if not video:
+        raise HTTPException(
+            status_code=409,
+            detail="this song has no analyzed video to align against — run an analysis first",
+        )
+
+    untimed = sum(1 for line in song.lines
+                  if (line.lyrics or "").strip() and line.timeSeconds is None)
+    jobs = get_job_store().submit([{
+        "kind": "align",
+        "targetSongId": song_id,
+        "youtubeUrlOrId": video,
+        "title": song.metadata.title,
+        "artist": song.metadata.artist,
+        "language": language,
+        "wants": ["align"],
+    }])
+    return {"status": "queued", "untimedLines": untimed,
+            "jobs": [j.to_json() for j in jobs]}
+
+
+# --- registered OAuth clients ------------------------------------------------
+# Dynamic client registration is open — that is what the spec requires, and it
+# is what lets Claude connect without anyone pre-provisioning anything. The
+# cost is that /oauth/register accepts anyone, so registrations accumulate:
+# every reconnect, every experiment, every probe. None of them can DO anything
+# without the owner's token at the consent screen, but a list nobody can see is
+# a list nobody will notice something odd in.
+#
+# These two endpoints take the static SNOOCLE_API_TOKEN like the rest of /v1 —
+# an OAuth token cannot reach them, which is deliberate: a connector must not
+# be able to enumerate or delete its siblings.
+
+
+@app.get("/v1/oauth/clients")
+def get_oauth_clients() -> dict:
+    from .oauth.store import get_oauth_store
+
+    return {
+        "clients": [
+            {
+                "clientId": c.client_id,
+                "clientName": c.client_name,
+                "redirectUris": c.redirect_uris,
+                "scope": c.scope,
+                "createdAt": c.created_at,
+            }
+            for c in get_oauth_store().list_clients()
+        ]
+    }
+
+
+@app.delete("/v1/oauth/clients/{client_id}")
+def delete_oauth_client(client_id: str) -> dict:
+    """Revoke a registration and every token it holds."""
+    from .oauth.store import get_oauth_store
+
+    if not get_oauth_store().delete_client(client_id):
+        raise HTTPException(status_code=404, detail=f"no such client: {client_id}")
+    return {"deleted": client_id}
 
 
 # --- step 7: versioned store -------------------------------------------------

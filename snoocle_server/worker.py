@@ -38,6 +38,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -62,6 +63,31 @@ def default_worker_name() -> str:
     """Something a human can recognise in the queue dashboard."""
     host = socket.gethostname().split(".")[0]
     return f"{host} ({platform.system()} {platform.machine()})"
+
+
+# Typographic characters macOS puts in machine names ("Wolf's Laptop" ships
+# with U+2019, the default for every "<Name>'s MacBook"), mapped to their
+# ASCII lookalikes. Anything else non-ASCII is transliterated or dropped.
+_ASCII_SUBSTITUTIONS = str.maketrans({
+    "‘": "'", "’": "'",   # curly single quotes
+    "“": '"', "”": '"',   # curly double quotes
+    "–": "-", "—": "-",   # en/em dash
+    " ": " ",                  # non-breaking space
+})
+
+
+def _header_safe(name: str) -> str:
+    """The worker name, made safe for an HTTP header value.
+
+    Header values must encode as latin-1 and in practice should be ASCII;
+    httpx enforces this at client construction, so a curly apostrophe in the
+    machine name used to crash the worker before its first request — and
+    launchd would restart it into the same crash, forever. The JSON payloads
+    keep the original name (UTF-8 is fine there); only the header is coerced.
+    """
+    text = name.translate(_ASCII_SUBSTITUTIONS)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return text.strip() or "unnamed-worker"
 
 
 def detect_capabilities() -> list[str]:
@@ -179,8 +205,18 @@ class Worker:
             )
         self.config = config
         self._run_job = run_job or run_pipeline_job
-        headers = {"User-Agent": f"snoocle-worker/{config.name}"}
+        headers = {"User-Agent": f"snoocle-worker/{_header_safe(config.name)}"}
         if config.token:
+            try:
+                config.token.encode("ascii")
+            except UnicodeEncodeError as exc:
+                # Don't coerce a credential — a mangled token would just 401
+                # mysteriously. Name the actual problem instead.
+                raise ValueError(
+                    "SNOOCLE_API_TOKEN contains a non-ASCII character "
+                    "(often a smart quote or invisible space from copy-paste); "
+                    "re-copy the token as plain text"
+                ) from exc
             headers["Authorization"] = f"Bearer {config.token}"
         self.client = httpx.Client(
             base_url=config.base_url, headers=headers, timeout=config.timeout,

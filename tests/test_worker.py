@@ -29,6 +29,7 @@ from snoocle_server.store.jobs import (
 from snoocle_server.worker import (
     Worker,
     WorkerConfig,
+    _header_safe,
     _is_worth_retrying,
     default_worker_name,
     detect_capabilities,
@@ -84,6 +85,44 @@ def test_capabilities_always_include_analyze_and_are_import_proven():
 
 def test_worker_name_is_human_recognisable():
     assert default_worker_name()
+
+
+def test_a_mac_with_the_default_curly_apostrophe_name_can_start():
+    """macOS names every machine "<Name>'s MacBook" with U+2019. HTTP headers
+    are latin-1, so building the User-Agent from that name used to raise at
+    client construction — the worker died before its first request and launchd
+    restarted it into the same crash, forever. Regression: it must start, and
+    the header must be pure ASCII while the JSON-facing name stays intact."""
+    config = WorkerConfig(base_url="http://testserver", name="Wolf’s Laptop",
+                          capabilities=["analyze"])
+    worker = Worker(config, run_job=lambda job: {"songId": "x"})
+    try:
+        assert worker.client.headers["User-Agent"] == "snoocle-worker/Wolf's Laptop"
+        assert config.name == "Wolf’s Laptop", "the dashboard name is not mangled"
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("raw,safe", [
+    ("Wolf’s Laptop", "Wolf's Laptop"),
+    ("“Studio” — Máté", '"Studio" - Mate'),
+    ("日本語のMac", "Mac"),
+    ("💻", "unnamed-worker"),
+])
+def test_header_safe_transliterates_or_drops(raw, safe):
+    result = _header_safe(raw)
+    assert result == safe
+    result.encode("ascii")  # must never raise
+
+
+def test_a_token_with_smuggled_unicode_fails_loudly_not_mysteriously():
+    """A token pasted with a smart quote would otherwise crash deep inside
+    httpx with a UnicodeEncodeError nobody can act on. Coercing it would be
+    worse — a silently mangled credential just 401s. It must refuse, by name."""
+    config = WorkerConfig(base_url="http://testserver", name="ok",
+                          token="secret’s", capabilities=["analyze"])
+    with pytest.raises(ValueError, match="non-ASCII"):
+        Worker(config, run_job=lambda job: {"songId": "x"})
 
 
 def test_a_worker_without_a_server_url_refuses_to_start():

@@ -54,6 +54,9 @@ from .store.jobs import (
     WrongWorkerError,
     get_job_store,
 )
+from .oauth import authenticate_bearer, resource_metadata_url
+from .oauth import router as oauth_router
+from .oauth.protocol import www_authenticate as oauth_www_authenticate
 from .store import (
     StoreError,
     StoreUnavailableError,
@@ -114,51 +117,101 @@ app = FastAPI(
 )
 
 
-class _BearerTokenMiddleware:
-    """Optional app-level static bearer token, enforced uniformly on the REST
-    API and the embedded /mcp transport (this middleware wraps the whole ASGI
-    app, so both surfaces share the one token — send it as
-    `Authorization: Bearer <token>`).
+# Paths that never require a credential: liveness probes, the static GUI shell
+# (it carries no secrets — every /v1 call it makes is still gated), and the
+# OAuth endpoints themselves, which are by definition reached without a token.
+_ALWAYS_OPEN_PREFIXES = ("/ui", "/oauth/", "/.well-known/")
+_ALWAYS_OPEN_EXACT = ("/healthz", "/")
 
-    Active only when SNOOCLE_API_TOKEN is set; otherwise a pass-through so the
-    default posture (Cloud Run IAM gates access) is unchanged. `/healthz` is
-    always exempt so liveness probes work without the token. The token is read
-    per request so it can be rotated/toggled without re-importing the app.
+
+def _is_open_path(path: str) -> bool:
+    return path in _ALWAYS_OPEN_EXACT or path.startswith(_ALWAYS_OPEN_PREFIXES)
+
+
+class _BearerTokenMiddleware:
+    """Authentication for both surfaces, with different credentials.
+
+    The REST API takes the static `SNOOCLE_API_TOKEN` — that is what the iOS
+    app and the admin UI have, and nothing about it needed to change.
+
+    The MCP transport at /mcp additionally accepts an **OAuth access token**,
+    because Claude's remote-MCP connector will not use a static token: it
+    discovers an authorization server, registers itself, and runs an
+    authorization-code flow. A 401 from /mcp therefore carries the
+    `WWW-Authenticate: Bearer resource_metadata="..."` header that starts that
+    discovery — Claude ignores the header on any other status, so the 401 is
+    load-bearing, not decorative.
+
+    OAuth tokens are accepted ONLY on /mcp. They are minted with /mcp as their
+    audience, and honouring them on the REST API would be exactly the
+    audience-confusion the MCP spec forbids.
+
+    Active only when SNOOCLE_API_TOKEN is set; otherwise a pass-through, so the
+    default posture (Cloud Run IAM gates access) is unchanged. The token is read
+    per request so it can be rotated without re-importing the app.
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        token = settings.api_token
-        # Exempt: liveness probes, and the static GUI shell (`/` redirect and
-        # everything under `/ui`). The shell carries no secrets; every API call
-        # it makes to `/v1/...` still requires the token.
-        path = scope.get("path", "")
-        if (
-            not token
-            or scope["type"] != "http"
-            or path == "/healthz"
-            or path == "/"
-            or path.startswith("/ui")
-        ):
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+
+        path = scope.get("path", "")
+        token = settings.api_token
+        if not token or _is_open_path(path):
+            await self.app(scope, receive, send)
+            return
+
         auth = Headers(scope=scope).get("authorization", "")
-        if not (auth.startswith("Bearer ") and secrets.compare_digest(auth, f"Bearer {token}")):
+        presented = auth[7:] if auth.startswith("Bearer ") else ""
+        is_mcp = path.rstrip("/") == "/mcp"
+
+        if presented and secrets.compare_digest(presented, token):
+            await self.app(scope, receive, send)
+            return
+
+        if is_mcp and presented:
+            from starlette.requests import Request as _Request
+
+            if authenticate_bearer(presented, _Request(scope)) is not None:
+                await self.app(scope, receive, send)
+                return
+
+        if is_mcp:
+            # The handshake: point the client at the metadata that tells it
+            # where to authorize.
+            from starlette.requests import Request as _Request
+
+            metadata = resource_metadata_url(_Request(scope))
             response = JSONResponse(
-                {"detail": "missing or invalid bearer token"},
+                {"error": "invalid_token", "error_description":
+                 "authorization required; see the WWW-Authenticate header"},
                 status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": oauth_www_authenticate(
+                    metadata, scope="snoocle:mcp",
+                    error="invalid_token" if presented else "",
+                )},
             )
             await response(scope, receive, send)
             return
-        await self.app(scope, receive, send)
+
+        response = JSONResponse(
+            {"detail": "missing or invalid bearer token"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        await response(scope, receive, send)
 
 
-# Wrap the entire app (REST routes + the /mcp transport appended below) so one
-# token authorizes both surfaces when SNOOCLE_API_TOKEN is configured.
+# Wrap the entire app (REST routes + the /mcp transport appended below).
 app.add_middleware(_BearerTokenMiddleware)
+
+# The OAuth 2.1 authorization server + RFC 9728/8414 discovery documents.
+# Registered before the /ui static mount so the /.well-known/* routes win.
+app.include_router(oauth_router)
 
 
 @app.exception_handler(StoreUnavailableError)

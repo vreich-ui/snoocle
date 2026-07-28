@@ -19,9 +19,12 @@ Keeping one alive needs instance-based billing plus a warm instance
 at the full rate: **~$53/month at 1 vCPU / 2 GiB, before a single song is
 analyzed.**
 
-**And the laptop is faster anyway.** Demucs separates a 7-minute song in ~12
-seconds on Apple Silicon versus ~6 minutes on a Cloud Run vCPU. Paying $53 a
-month to do the work 30× slower is a bad trade in both directions.
+**And the laptop is faster anyway.** Demucs (htdemucs, MPS) separates a
+7-minute song in ~70 seconds on an M2 — measured, not estimated — versus
+roughly a quarter of an hour CPU-only (~116 s per audio-minute measured on a
+cloud vCPU). Paying $53 a month to do the work ~12× slower is a bad trade in
+both directions. Bigger Apple Silicon closes on the old ~12-second folklore
+number; no machine we've measured reaches it.
 
 So the server brokers and the Mac works. Cloud Run stays at
 `--min-instances=0`, request-based, and costs approximately nothing when nobody
@@ -39,7 +42,10 @@ Double-click `scripts/install_worker.command`. It asks for the server URL and
 your API token, builds a private virtualenv, and registers a launchd agent that
 starts at login and stays running.
 
-Prerequisites: Python 3.10+ and `ffmpeg` (`brew install ffmpeg`).
+Prerequisites: Python 3.10–3.12 (the installer refuses 3.9 and below, and the
+analysis dependencies are not vetted on 3.13+) and `ffmpeg`
+(`brew install ffmpeg`, or any install the script can find — MacPorts and
+micromamba locations are searched too).
 
 To check on it:
 

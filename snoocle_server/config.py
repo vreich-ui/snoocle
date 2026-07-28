@@ -203,6 +203,11 @@ class Settings(BaseSettings):
     # must send `Authorization: Bearer <token>`. Leave empty to rely solely on
     # Cloud Run IAM (the default posture). Store it in Secret Manager, not here.
     api_token: str = ""
+    # The externally visible base URL (e.g. https://snoocle-x.run.app). Only
+    # needed when the forwarded headers can't be trusted to reconstruct it;
+    # every OAuth metadata document is built from this, so a wrong value makes
+    # discovery advertise URLs the client cannot reach.
+    public_url: str = ""
 
     def provider_key(self, provider: str) -> str:
         """The credential/endpoint whose presence makes a provider usable."""

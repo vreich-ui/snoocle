@@ -55,7 +55,15 @@ def test_mcp_endpoint_shares_the_same_token(token_enabled):
     # session-manager lifespan).
     unauth = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
     assert unauth.status_code == 401
-    assert unauth.headers.get("WWW-Authenticate") == "Bearer"
+    # The /mcp 401 additionally carries the OAuth discovery pointer (RFC 9728),
+    # because Claude's remote-MCP connector will not use a static token — it
+    # follows this header to find the authorization server. Claude only honours
+    # the header on a 401, so both parts of this assertion matter. The REST API
+    # keeps the plain `Bearer` challenge (see the test below).
+    challenge = unauth.headers.get("WWW-Authenticate", "")
+    assert challenge.startswith("Bearer ")
+    assert 'resource_metadata="' in challenge
+    assert "/.well-known/oauth-protected-resource" in challenge
 
 
 def test_401_body_and_challenge_header(token_enabled):

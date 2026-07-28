@@ -92,7 +92,14 @@ def discover_sources(
     """General web search -> fetch -> parse -> ranked candidate sources,
     plus Ultimate Guitar (a separate, site-specific channel — see
     discovery/sources/ultimate_guitar.py — additive, not a fallback for the
-    generic web search; it's a no-op unless SNOOCLE_SOURCE_UG=1)."""
+    generic web search; on by default, SNOOCLE_SOURCE_UG=0 disables it).
+
+    Note the two channels fail independently and on purpose: UG is merged in
+    whether the generic search succeeded, returned nothing, or raised, and the
+    search error is only re-raised when the merge leaves nothing at all. Since
+    2026-07 that is not a corner case — from a datacenter IP the keyless
+    general backend is throttled to roughly a coin flip, so on any given run UG
+    is quite often the only channel that returns anything."""
     max_candidates = max_candidates or settings.search_max_candidates
     search_fn = search_fn or (lambda q, n: web_search(q, n))
     fetch_fn = fetch_fn or fetch_page

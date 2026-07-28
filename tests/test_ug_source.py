@@ -98,7 +98,13 @@ def _ug_enabled(monkeypatch):
     monkeypatch.setattr(settings, "source_ug_enabled", True)
 
 
-def test_disabled_by_default_makes_no_calls(monkeypatch):
+def test_flag_off_makes_no_calls(monkeypatch):
+    """The kill switch has to actually kill it — no request, not just no result.
+
+    (This was `test_disabled_by_default_...` back when the default was False.
+    The default flipped to True in 2026-07; what it guards is the flag, not the
+    default, so the name now says that.)
+    """
     monkeypatch.setattr(settings, "source_ug_enabled", False)
 
     def boom(*a, **k):  # noqa: ANN001

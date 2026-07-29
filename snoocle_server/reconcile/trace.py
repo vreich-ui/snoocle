@@ -87,6 +87,10 @@ class RunTrace:
     # handful of entries), so it stays in the run summary (list views),
     # unlike "mir"/"mirWindows" which get stripped there.
     review_queue: list[dict] = field(default_factory=list)
+    # What this run reused vs recomputed (see manifest.py). Small and flat, so
+    # it stays in the run summary alongside reviewQueue rather than being
+    # stripped like "mir"/"mirWindows" — the admin UI wants it in list views.
+    evidence_manifest: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +109,7 @@ class RunTrace:
             "mir": self.mir,
             "mirWindows": self.mir_windows,
             "reviewQueue": self.review_queue,
+            "evidenceManifest": self.evidence_manifest,
         }
 
 
@@ -146,6 +151,12 @@ class TraceRecorder:
         """Record one agent analyze_audio_window probe (window + its results)."""
         with self._lock:
             self.trace.mir_windows.append(window)
+        _publish(self.trace)
+
+    def set_evidence_manifest(self, manifest: dict | None) -> None:
+        """Attach the run's evidence manifest — replaces any previous value."""
+        with self._lock:
+            self.trace.evidence_manifest = dict(manifest) if manifest else None
         _publish(self.trace)
 
     def set_review_queue(self, review_queue: list[dict]) -> None:

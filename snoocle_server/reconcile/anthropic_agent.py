@@ -20,6 +20,7 @@ import time
 from ..config import settings
 from ..discovery.fetch import extract_sheet_text, fetch_page
 from ..discovery.service import candidate_from_text
+from ..mir.cache import WINDOW_ACCURACY, analyze_cached
 from ..mir.pipeline import analyze_window
 from .providers import ContentFilterError, LLMProvider, LLMResponse, ProviderError
 from .trace import TraceRecorder
@@ -212,7 +213,15 @@ def analyze_audio_window(audio_path: str | None, start_seconds: float, end_secon
         if end <= start:
             return {"error": "end_seconds must be greater than start_seconds"}
         end = min(end, start + _MAX_WINDOW_SECONDS)  # analyze_window clamps to track duration
-        analysis = analyze_window(audio_path, start, end)
+        # Cached per (audio bytes, engines, window): an agent that probes the
+        # same span twice in a run — or across re-analyses of the same song —
+        # pays for it once. `analyze_window` stays what computes.
+        analysis, _cache_info = analyze_cached(
+            audio_path,
+            accuracy=WINDOW_ACCURACY,
+            window=(start, end),
+            compute=lambda: analyze_window(audio_path, start, end),
+        )
         # Report the span that was ACTUALLY analyzed (post-clamp) so both the
         # model and the run trace see the real coverage, not the request.
         if analysis.analyzed_windows:
@@ -272,6 +281,10 @@ class AnthropicAgentProvider(LLMProvider):
             "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
             "songSchema": ctx.get("song_schema"),
         }
+        # Descriptive context: what this run reused vs recomputed, and how good
+        # each input is. See manifest.py — never a source of song content.
+        if ctx.get("evidence_manifest"):
+            payload["evidenceManifest"] = ctx["evidence_manifest"]
         if getattr(self, "_effective_budget", None):
             payload["toolBudget"] = self._effective_budget
         if depth is not None and depth.time_align:

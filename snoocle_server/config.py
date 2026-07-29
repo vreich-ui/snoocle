@@ -90,6 +90,24 @@ class Settings(BaseSettings):
     identity_max_tokens: int = 512  # a small JSON object; nothing more
     identity_min_confidence: float = 0.6
 
+    # --- deterministic-step caches ---
+    # Both are pure optimizations: same outputs, fewer executions. Disabling
+    # either only costs time.
+    #
+    # MIR has NO TTL on purpose. Its key is a content hash of the audio bytes
+    # plus the engine ids plus the accuracy profile — everything that can
+    # change the answer is in the key, so an entry cannot go stale. The one
+    # change the key can't see is an engine upgraded IN PLACE without its id
+    # changing; `refreshCache` on a request (or flipping this flag off) is the
+    # escape hatch for that.
+    mir_cache_enabled: bool = True
+    mir_cache_collection: str = "mir_cache"
+    # Discovery DOES need a TTL: its key is (title, artist, backends) and the
+    # web behind it changes. Slowly — hence a generous window — but it changes.
+    discovery_cache_enabled: bool = True
+    discovery_cache_collection: str = "discovery_cache"
+    discovery_cache_ttl_days: float = 30.0
+
     # --- agent-delegated reconciliation (provider "agent") ---
     # Snoocle holds no LLM keys in this mode: reconciliation is delegated to an
     # external agent workspace (e.g. Claude Agent SDK with specialty agents)

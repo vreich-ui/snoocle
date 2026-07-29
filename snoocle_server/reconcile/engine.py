@@ -108,6 +108,7 @@ def _finalize(
     guidance: str | None = None,
     guidance_origin: str | None = None,
     scope: AnalysisScope | None = None,
+    mir_cache=None,
 ) -> Song:
     """Server-side guardrails + append provenance (never trusted to the LLM)."""
     updates: dict = {"id": song_id, "provenance": []}
@@ -138,13 +139,21 @@ def _finalize(
             )
         )
     if mir is not None:
+        # `timestamp` is when THIS version was produced; `analyzedAt` in the
+        # notes is when the audio was actually listened to. On a cache hit
+        # those differ, and collapsing them would make a song's history claim
+        # a re-listen that never happened. Reading a song must still tell you
+        # when its audio was really analyzed.
+        reuse_note = ""
+        if mir_cache is not None and getattr(mir_cache, "from_cache", False):
+            reuse_note = f"; reused from cache (analyzedAt={mir_cache.analyzed_at})"
         prov.append(
             ProvenanceEntry(
                 timestamp=_now(),
                 actor=f"snoocle-server/{__version__}",
                 action="mir-analysis",
                 sources=[f"{slot}:{impl}" for slot, impl in mir.engines.items()],
-                notes=f"audio-grounded analysis; bpm={mir.bpm}, key={mir.key}",
+                notes=f"audio-grounded analysis; bpm={mir.bpm}, key={mir.key}{reuse_note}",
             )
         )
     # more independent sources -> higher reconciliation confidence
@@ -196,6 +205,8 @@ def reconcile(
     prior_song: dict | None = None,
     depth: DepthProfile | None = None,
     scope: AnalysisScope | None = None,
+    evidence_manifest: dict | None = None,
+    mir_cache=None,
 ) -> ReconcileResult:
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
@@ -281,6 +292,7 @@ def reconcile(
             "depth": depth,
             "scope": scope,
             "agent_config": agent_config if not agent_config.is_default() else None,
+            "evidence_manifest": evidence_manifest,
         }
     if hasattr(provider, "trace"):
         provider.trace = trace
@@ -293,7 +305,7 @@ def reconcile(
     user_prompt = build_user_prompt(
         title, artist, candidates, mir, song_json_schema(), song_id, youtube_video_id,
         guidance=guidance, prior_song=prior_song, time_align=depth.time_align,
-        scope=scope,
+        scope=scope, evidence_manifest=evidence_manifest,
     )
     turns: list[dict] = [{"role": "user", "text": user_prompt}]
 
@@ -338,6 +350,7 @@ def reconcile(
             guidance=guidance,
             guidance_origin=guidance_origin,
             scope=scope,
+            mir_cache=mir_cache,
         )
         if trace is not None:
             trace.step(

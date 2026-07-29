@@ -66,6 +66,11 @@ Worth knowing what is and isn't defended:
   is burned whether or not it was still valid.
 - **Refresh tokens rotate.** The old one is invalidated in the same transaction
   that issues the new one, as OAuth 2.1 requires for public clients.
+- **A refresh token's validity is decided from its OWN 90-day expiry, never
+  from the access token it happens to be linked to.** Its record carries that
+  expiry (plus client_id/scope/resource) independently, rather than joining
+  through the access-token doc for them — an hour-old access token expiring
+  must never make a 90-day-old refresh token look expired too.
 - **Everything is stored, not held in memory.** Cloud Run scales to zero; an
   in-memory client registry would silently unauthorize the connector on every
   cold start, which reads to a user as "it keeps asking me to reconnect".

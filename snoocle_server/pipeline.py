@@ -36,14 +36,22 @@ from dataclasses import dataclass, field
 
 from fastapi.concurrency import run_in_threadpool
 
-from .audio.acquire import AcquiredAudio, YouTubeAuthError, acquire, extract_metadata
+from . import __version__
+from .audio.acquire import (
+    AcquiredAudio,
+    ResolvedMeta,
+    YouTubeAuthError,
+    acquire,
+    extract_metadata,
+)
 from .config import settings
 from .discovery import CandidateSource, discover_sources
+from .identity import IdentityError, SongIdentity, resolve_identity
 from .mir import MirAnalysis, analyze_audio
 from .reconcile import ReconcileResult, provider_preflight, reconcile
 from .reconcile.depth import resolve_depth
 from .reconcile.trace import TraceRecorder, start_run
-from .schema.song import slugify_song_id
+from .schema.song import ProvenanceEntry, slugify_song_id
 from .scope import AnalysisScope
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
@@ -84,6 +92,12 @@ def _truncate(text: str, limit: int = 160) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 @dataclass
 class PipelineReport:
     song_id: str
@@ -104,6 +118,23 @@ def get_store() -> SongRepository:
 
 
 # --- individual steps (pure, synchronous, blocking) -------------------------
+
+
+def _step_resolve(youtube_url_or_id: str) -> tuple[ResolvedMeta, SongIdentity]:
+    """Fetch the media's metadata and resolve a song identity from it.
+
+    One step, not two: the metadata fetch and the (occasional) disambiguation
+    call are both network work on the same question, and the caller only cares
+    whether an identity came out the other end.
+    """
+    meta = extract_metadata(youtube_url_or_id)
+    identity = resolve_identity(
+        video_title=meta.video_title,
+        channel=meta.uploader,
+        track=meta.track,
+        track_artist=meta.track_artist,
+    )
+    return meta, identity
 
 
 def _step_discover(title: str, artist: str, max_candidates: int | None) -> list[CandidateSource]:
@@ -249,29 +280,37 @@ async def run_pipeline_async(
 
     # 0. resolve identity: title+artist may be omitted when a media URL is
     # given — derive them from the media's own metadata (no download). FATAL:
-    # without an identity there is nothing to analyze or store.
+    # without an identity there is nothing to analyze or store, and the id it
+    # mints is permanent (content-hash versioned store), so an ambiguous title
+    # fails here rather than becoming a wrong id forever. See `identity`.
+    identity: SongIdentity | None = None
     if not (title and artist):
         if not youtube_url_or_id:
             raise PipelineStepError(
                 "resolve", "provide title and artist, or a youtubeUrlOrId to derive them from"
             )
         try:
-            meta = await _timed_step(
+            meta, identity = await _timed_step(
                 "resolve",
-                lambda: extract_metadata(youtube_url_or_id),
+                lambda: _step_resolve(youtube_url_or_id),
                 settings.acquire_timeout_seconds,
             )
         except asyncio.TimeoutError as e:
             raise PipelineStepError(
                 "resolve", f"timed out after {settings.acquire_timeout_seconds:.0f}s"
             ) from e
+        except IdentityError as e:
+            raise PipelineStepError(
+                "resolve", str(e), error_code="identity_ambiguous"
+            ) from e
         except Exception as e:  # noqa: BLE001
             code = "youtube_auth_required" if isinstance(e, YouTubeAuthError) else None
             raise PipelineStepError("resolve", str(e), error_code=code) from e
-        title = title or meta.title
-        artist = artist or meta.artist
+        # An explicitly-supplied half always wins over the derived one.
+        title = title or identity.title
+        artist = artist or identity.artist
         youtube_url_or_id = youtube_url_or_id or meta.video_id
-        steps["resolve"] = f"ok: title={title!r} artist={artist!r} (from {meta.video_id})"
+        steps["resolve"] = f"ok: {identity.describe()} (from {meta.video_id})"
 
     song_id = slugify_song_id(artist, title)
     report = PipelineReport(song_id=song_id, steps=steps)
@@ -381,6 +420,30 @@ async def run_pipeline_async(
     report.steps["reconcile"] = (
         f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"
     )
+
+    # 5a. cover attribution. `artist` is who is PLAYING on this recording, so
+    # for a cover the artist who originally released the song would otherwise
+    # be lost entirely. Record it as a provenance note rather than bending
+    # metadata.album, which means the album this recording appears on.
+    if identity is not None and identity.is_cover and identity.original_artist:
+        result.song = result.song.model_copy(
+            update={
+                "provenance": list(result.song.provenance)
+                + [
+                    ProvenanceEntry(
+                        timestamp=_now_iso(),
+                        actor=f"snoocle-server/{__version__}",
+                        action="cover-attribution",
+                        confidence=round(identity.confidence, 3),
+                        notes=(
+                            f"cover: performed by {identity.artist!r}, "
+                            f"originally by {identity.original_artist!r} "
+                            f"(identified from the upload's own metadata via {identity.method})"
+                        ),
+                    )
+                ]
+            }
+        )
 
     # 5b. deterministic MIR-grounded chord/line timing (best-effort — a
     # failure here must never block storing an otherwise-good reconciled

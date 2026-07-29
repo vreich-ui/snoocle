@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     # claude-sonnet-5 is the other big speed lever.)
     anthropic_agent_effort: str = "medium"
 
+    # --- song identity resolution (title/artist from a media URL) ---
+    # When only a YouTube URL is given, title+artist come from the video's own
+    # metadata. Deterministic parsing handles most titles; a genuinely
+    # ambiguous one (no separator, cover phrasing, untrustworthy channel) gets
+    # ONE cheap Haiku call. Song ids are permanent (content-hash versioned
+    # store), so below identity_min_confidence the resolve step FAILS rather
+    # than storing a guess — see snoocle_server/identity.py.
+    identity_model: str = "claude-haiku-4-5"
+    identity_max_tokens: int = 512  # a small JSON object; nothing more
+    identity_min_confidence: float = 0.6
+
     # --- agent-delegated reconciliation (provider "agent") ---
     # Snoocle holds no LLM keys in this mode: reconciliation is delegated to an
     # external agent workspace (e.g. Claude Agent SDK with specialty agents)

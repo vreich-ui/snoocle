@@ -17,6 +17,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import identity as _identity
 from ..config import settings
 
 log = logging.getLogger(__name__)
@@ -134,63 +135,50 @@ class AcquiredAudio:
 
 @dataclass
 class ResolvedMeta:
-    """Song identity derived from a media URL's own metadata (no download)."""
+    """Song identity derived from a media URL's own metadata (no download).
+
+    ``title``/``artist`` are the best-effort labels from
+    :func:`derive_title_artist`. The raw signals they were derived from are
+    carried alongside so the caller can run the refuses-rather-than-guesses
+    resolver (:func:`snoocle_server.identity.resolve_identity`) without a
+    second metadata fetch.
+    """
 
     video_id: str
     video_title: str
     title: str
     artist: str
     duration_seconds: float | None = None
+    # Raw identity signals, straight from yt-dlp.
+    uploader: str = ""  # channel name, "- Topic" suffix already removed
+    track: str = ""  # distributor-supplied song title, when present
+    track_artist: str = ""  # distributor-supplied artist, when present
 
 
-# Trailing decoration commonly appended to music video titles — stripped before
-# parsing "Artist - Title". Matches a parenthesized/bracketed group containing
-# one of these words: "(Official Music Video)", "[Lyric Video]", "(Remastered
-# 2009)", "(HD)", "(Audio)", etc.
-_TITLE_NOISE_RE = re.compile(
-    r"\s*[\(\[][^\)\]]*\b(?:official|video|audio|lyrics?|visuali[sz]er|remaster(?:ed)?|"
-    r"hd|4k|hq|mv|m/v|explicit|clean|full\s+album|live|performance|version)\b[^\)\]]*[\)\]]",
-    re.IGNORECASE,
-)
-
-
-def _strip_title_noise(text: str) -> str:
-    prev = None
-    while prev != text:
-        prev = text
-        text = _TITLE_NOISE_RE.sub("", text).strip()
-    return text.strip(" -—–|·")
-
-
-_QUOTE_CHARS = '"“”„‟'
-
-# 'Artist "Track" <anything>' — live/one-off uploads often quote the song name
-# instead of using an "Artist - Title" separator (e.g. 'Blues Traveler "Hook"
-# at Howard Stern's 1996 Birthday Show').
-_QUOTED_TRACK_RE = re.compile(
-    rf"^(?P<artist>[^{_QUOTE_CHARS}]{{2,60}}?)\s+[{_QUOTE_CHARS}]"
-    rf"(?P<track>[^{_QUOTE_CHARS}]{{1,80}})[{_QUOTE_CHARS}]"
-)
+# Title decoration handling and separator parsing live in `identity`, which
+# owns the whole "video title -> (title, artist)" problem: the deterministic
+# layer below plus the escalation path for titles it can't settle. These thin
+# wrappers keep the long-standing call sites here and in `discovery.service`
+# pointed at that single implementation.
+_strip_title_noise = _identity.strip_title_noise
+_QUOTE_CHARS = _identity._QUOTE_CHARS
 
 
 def parse_quoted_track(text: str) -> tuple[str, str] | None:
     """(artist, track) from a video title like 'Artist "Track" at X's show',
     or None when the pattern doesn't apply."""
-    m = _QUOTED_TRACK_RE.match(_strip_title_noise(text))
-    if m:
-        return m.group("artist").strip(), m.group("track").strip()
+    split = _identity.split_artist_title(_strip_title_noise(text))
+    if split and split[2] == "quoted":
+        return split[0], split[1]
     return None
 
 
 def parse_dash_title(text: str) -> tuple[str, str] | None:
     """(artist, track) from an 'Artist - Track' video title (hyphen / en-dash /
     em-dash separators, decoration stripped), or None when it doesn't apply."""
-    cleaned = _strip_title_noise(text)
-    parts = re.split(r"\s+[-\u2013\u2014]\s+", cleaned, maxsplit=1)
-    if len(parts) == 2:
-        left, right = (p.strip().strip(_QUOTE_CHARS).strip() for p in parts)
-        if left and right:
-            return left, right
+    split = _identity.split_artist_title(_strip_title_noise(text))
+    if split and split[2] == "dash":
+        return split[0], split[1]
     return None
 
 
@@ -201,26 +189,24 @@ def derive_title_artist(info: dict) -> tuple[str, str]:
     Music / "Provided to YouTube by..." entries); otherwise parses the video
     title ("Artist - Title", noise stripped) and falls back to the uploader
     (minus a "- Topic" suffix) for the artist.
+
+    Best-effort by contract: it always returns SOMETHING, filling "Unknown"
+    when the title yields nothing — which is exactly why it must not be what
+    mints a song id. The pipeline resolves identity through
+    :func:`snoocle_server.identity.resolve_identity`, which refuses instead of
+    guessing; this stays for display/logging callers that just want a label.
     """
     track = (info.get("track") or "").strip()
     artist = (info.get("artist") or info.get("creator") or "").strip()
     vid_title = (info.get("title") or "").strip()
-    uploader = (info.get("uploader") or info.get("channel") or "").strip()
-    uploader = re.sub(r"\s*-\s*Topic$", "", uploader, flags=re.IGNORECASE).strip()
+    uploader = _identity._strip_topic(info.get("uploader") or info.get("channel") or "")
 
     cleaned = _strip_title_noise(vid_title)
     if not (track and artist):
-        # "Artist - Title", tolerating hyphen / en-dash / em-dash separators
-        parts = re.split(r"\s+[-–—]\s+", cleaned, maxsplit=1)
-        if len(parts) == 2:
-            left, right = (p.strip().strip(_QUOTE_CHARS).strip() for p in parts)
-            artist = artist or left
-            track = track or right
-        else:
-            quoted = parse_quoted_track(cleaned)
-            if quoted:
-                artist = artist or quoted[0]
-                track = track or quoted[1]
+        split = _identity.split_artist_title(cleaned)
+        if split is not None:
+            artist = artist or split[0]
+            track = track or split[1]
 
     title = track or cleaned or vid_title or "Unknown"
     artist = artist or uploader or "Unknown"
@@ -240,13 +226,17 @@ def extract_metadata(url_or_id: str) -> ResolvedMeta:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     except Exception as e:  # yt_dlp raises many exception types
         raise _acquisition_error(f"metadata fetch failed for {vid}", e) from e
-    title, artist = derive_title_artist(info or {})
+    info = info or {}
+    title, artist = derive_title_artist(info)
     return ResolvedMeta(
         video_id=vid,
-        video_title=(info or {}).get("title") or "",
+        video_title=info.get("title") or "",
         title=title,
         artist=artist,
-        duration_seconds=float(info["duration"]) if (info or {}).get("duration") else None,
+        duration_seconds=float(info["duration"]) if info.get("duration") else None,
+        uploader=_identity._strip_topic(info.get("uploader") or info.get("channel") or ""),
+        track=(info.get("track") or "").strip(),
+        track_artist=(info.get("artist") or info.get("creator") or "").strip(),
     )
 
 

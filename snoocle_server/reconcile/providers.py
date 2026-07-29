@@ -64,6 +64,15 @@ class LLMProvider:
     name: str = "base"
     default_model: str = ""
     supports_audio: bool = False
+    #: Does this provider's output come from a model that has been TOLD the
+    #: lyric-reference protocol (reconcile/lyric_refs.py)? Opt-in rather than
+    #: default-on, because the protocol is a contract between this server's
+    #: prompt and the model reading it: a provider that produces its Song some
+    #: other way (the deterministic mock; a test fake) is not party to it and
+    #: would only be failed by a rule it was never given. Every model-backed
+    #: provider in the registry sets this — asserted in tests, so a new one
+    #: cannot quietly inherit "no".
+    emits_lyric_refs: bool = False
 
     def complete(
         self,
@@ -83,6 +92,7 @@ class AnthropicProvider(LLMProvider):
     name = "anthropic"
     default_model = "claude-opus-4-8"
     supports_audio = False  # unclear/inconsistent support — baseline is structured-only
+    emits_lyric_refs = True
 
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         import anthropic
@@ -129,6 +139,7 @@ class OpenAIProvider(LLMProvider):
     default_model = "gpt-4o"
     audio_model = "gpt-4o-audio-preview"
     supports_audio = True
+    emits_lyric_refs = True
 
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         model = self._model(model)
@@ -175,6 +186,7 @@ class GeminiProvider(LLMProvider):
     name = "gemini"
     default_model = "gemini-2.5-pro"
     supports_audio = True
+    emits_lyric_refs = True
 
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         model = self._model(model)

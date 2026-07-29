@@ -26,7 +26,7 @@ from snoocle_server.reconcile.depth import resolve_depth
 from snoocle_server.reconcile.trace import start_run
 from snoocle_server.store.memory import InMemorySongRepository
 from snoocle_server.store.runs import InMemoryRunRepository, reset_run_store
-from tests.fake_agent_mcp import _SONG
+from tests.fake_agent_mcp import _SONG_DRAFT
 
 client = TestClient(app)
 
@@ -97,7 +97,7 @@ def test_agent_trace_captures_turns_and_tool_calls(monkeypatch):
     queue = [
         _response("tool_use", [_tool_use("t1", "analyze_audio_window",
                                          {"start_seconds": 5, "end_seconds": 15})]),
-        _response("end_turn", [_text(json.dumps(_SONG))]),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
     ]
 
     class _Fake:
@@ -157,7 +157,7 @@ def test_agent_run_records_mir_window_with_clamped_span(monkeypatch):
     queue = [
         _response("tool_use", [_tool_use("t1", "analyze_audio_window",
                                          {"start_seconds": 5, "end_seconds": 15})]),
-        _response("end_turn", [_text(json.dumps(_SONG))]),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
     ]
 
     class _Fake:

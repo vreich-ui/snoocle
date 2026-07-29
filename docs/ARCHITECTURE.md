@@ -35,9 +35,12 @@ snoocle_server/
 ├── reconcile/       step 5: providers.py (anthropic/openai/gemini/agent/mock
 │                    as a RUNTIME choice; audio-input capability map),
 │                    prompt.py (baseline = ALL candidates + MIR timeline as
-│                    JSON, identical across providers), engine.py (validate ->
-│                    repair loop -> server-side provenance/guardrails),
-│                    mock_reconciler.py (deterministic offline reconciler)
+│                    JSON, identical across providers), engine.py (splice ->
+│                    validate -> repair loop -> server-side provenance/
+│                    guardrails), lyric_refs.py (the model emits lyric
+│                    REFERENCES, never lyric text; deterministic code splices
+│                    the words in), mock_reconciler.py (deterministic offline
+│                    reconciler)
 ├── store/jobs.py    the job broker: durable queue with time-boxed LEASES, so
 │                    a worker that sleeps or dies simply loses its claim and
 │                    the job returns to the pool. Reclaimed lazily on read —
@@ -207,6 +210,62 @@ not a placement whose chord is "no chord". The iOS app's older model treated
 client-side (see the iOS dev plan, task F1) in favor of rendering a gap
 glyph when a timed instrumental hole exceeds the scroll model's
 `maxGlideSeconds`. Do not reintroduce N.C. as a storable chord identity.
+
+## The model never writes the lyrics
+
+A valid Song document IS the complete lyrics of a copyrighted song, so every
+successful reconciliation used to ask the model for a full verbatim
+reproduction — and two live runs were blocked by Anthropic's content filter
+with four sources successfully fetched each. That is structural, not a
+retrieval failure, and prompt wording cannot fix it.
+
+So a model-backed provider emits a REFERENCE per line instead of text:
+
+    {"lineIndex": 7,
+     "lyricRef": {"sourceId": "ultimate-guitar-1087597", "line": 12},
+     "chordPlacements": [{"charIndex": 0, "chord": "F"}]}
+
+and `reconcile/lyric_refs.py` splices the real words out of the source that
+is already in the run's context, before validation and storage. This is an
+internal protocol between the server and the model, **not a schema change**:
+`lyricRef` never reaches the store, and `schema/song.py` is untouched. The
+agent-facing schema is derived from the real one at request time, so the two
+cannot drift.
+
+Four rules make it a guarantee rather than a request:
+
+1. **Retyped lyrics are rejected** and repaired. An instrumental line is the
+   one exception and says so with `lyrics: ""` and no ref.
+2. **charIndex is validated after splicing**, against the resolved text —
+   named per line, repaired, never silently clamped.
+3. **Unresolvable refs fail the run.** An unknown sourceId or an
+   out-of-range line index is not retried: a retry invites the model to
+   supply the line from memory, and a lyric with no valid provenance must
+   not reach the store.
+4. **Overrides are audited and capped.** `lyricOverride` + a required
+   reason covers the genuine cases (merging two partial sources, an obvious
+   source typo, a line no source covers); each lands in provenance as
+   `action="lyric-override"`, and past ~15% of lines the run fails.
+
+The prior song is registered as a referenceable source under `prior-song`,
+which is what lets a notes-only run (which gathers no candidates by design)
+return the user's own document without retyping it. Sheets the in-process
+agent fetches mid-run are registered the same way, under the `agent-N`
+sourceId the tool returns.
+
+`emits_lyric_refs` on the provider decides who is party to the contract: the
+four model-backed providers whose prompt this repo writes. The deterministic
+mock builds its Song in local code and is never prompted; the external
+`agent` MCP workspace is a third-party system that adopts the protocol by
+flipping the same flag once it emits refs.
+
+`scripts/measure_lyric_refs.py` measures what this costs the model to emit.
+The saving is bounded by the lyric share of the document, which depends
+entirely on chord density: ~14% for a dense 4-chords-per-line sheet, ~39%
+for a lyric-dense one. A long `sourceId` is repeated on every line and eats
+into it — with Ultimate Guitar's ~23-character ids the dense case comes out
+slightly LARGER than before. Token reduction is a side effect here, not the
+point; the point is that no model-backed path can emit a lyric at all.
 
 ## Timing survives a re-analysis that doesn't listen
 

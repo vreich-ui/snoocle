@@ -1,9 +1,16 @@
-"""Reconciliation engine: prompt -> LLM -> validate -> repair -> provenance.
+"""Reconciliation engine: prompt -> LLM -> splice -> validate -> repair -> provenance.
 
 Schema compliance and the chord-normalization rule are ENFORCED here, not
 hoped for: the LLM's JSON must validate against the Song schema (whose
 validators reject shape/tab chords outright). Validation errors are fed back
 to the model for up to SNOOCLE_LLM_REPAIR_ATTEMPTS repair rounds.
+
+Lyrics are the same story. A model-backed provider does not emit them at
+all: it emits REFERENCES into the sources already in this run's context, and
+``lyric_refs.splice_lyrics`` substitutes the real text here, before
+validation. See that module for why (a Song document IS the complete lyrics
+of a copyrighted song) and for the four rules that make it a guarantee
+rather than a request.
 """
 
 from __future__ import annotations
@@ -28,7 +35,15 @@ from ..schema.song import ProvenanceEntry, slugify_song_id
 from ..scope import AnalysisScope
 from .agent_config import AgentConfig, config_version
 from .depth import DepthProfile, resolve_depth
-from .prompt import SYSTEM_PROMPT, build_repair_prompt, build_user_prompt
+from .lyric_refs import (
+    LyricOverride,
+    LyricSpliceError,
+    UnresolvableLyricRefError,
+    agent_song_json_schema,
+    build_ref_index,
+    splice_lyrics,
+)
+from .prompt import build_repair_prompt, build_system_prompt, build_user_prompt
 from .providers import AudioAttachment, LLMProvider, get_provider
 from .trace import RunTrace, TraceRecorder, clock
 
@@ -50,7 +65,16 @@ _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
 
 class ReconcileError(RuntimeError):
-    pass
+    # Optional machine-readable classification the pipeline surfaces to clients.
+    error_code: str | None = None
+
+
+class LyricProvenanceError(ReconcileError):
+    """A lyric reached the document with no valid provenance: a ref this run
+    cannot resolve, or so many overrides that reference resolution is plainly
+    broken. Deliberately NOT repairable — see lyric_refs.py, rules 3 and 4."""
+
+    error_code = "lyric_provenance"
 
 
 @dataclass
@@ -109,6 +133,8 @@ def _finalize(
     guidance_origin: str | None = None,
     scope: AnalysisScope | None = None,
     mir_cache=None,
+    lyric_refs_resolved: int = 0,
+    lyric_overrides: tuple[LyricOverride, ...] = (),
 ) -> Song:
     """Server-side guardrails + append provenance (never trusted to the LLM)."""
     updates: dict = {"id": song_id, "provenance": []}
@@ -170,6 +196,16 @@ def _finalize(
     # alone is a very different artifact from a full re-analysis, and six
     # months later the history is the only place that difference survives.
     scope_note = f"; scope: {scope.describe()}" if scope is not None else ""
+    # How the words got here. A reader of the history should be able to tell
+    # "every line was spliced from a source the run actually had" from "some
+    # lines were written by the model", without diffing anything.
+    lyric_note = ""
+    overrides = lyric_overrides
+    if lyric_refs_resolved or overrides:
+        lyric_note = (
+            f"; lyrics spliced from {lyric_refs_resolved} source reference(s)"
+            + (f" with {len(overrides)} override(s)" if overrides else "")
+        )
     prov.append(
         ProvenanceEntry(
             timestamp=_now(),
@@ -181,9 +217,25 @@ def _finalize(
                 f"attempt(s)={attempts}; chord rule enforced by schema validation"
                 + guidance_note
                 + scope_note
+                + lyric_note
             ),
         )
     )
+    # One entry per override, so the escape hatch is auditable line by line
+    # rather than a count buried in a summary.
+    for override in overrides:
+        prov.append(
+            ProvenanceEntry(
+                timestamp=_now(),
+                actor=f"reconcile:{provider.name}/{model}",
+                action="lyric-override",
+                confidence=None,
+                notes=(
+                    f"line {override.line_index}: written by the model instead "
+                    f"of referenced — {override.reason}"
+                ),
+            )
+        )
     return song.model_copy(update={"provenance": prov})
 
 
@@ -236,6 +288,16 @@ def reconcile(
     if media_url is None and youtube_video_id:
         media_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
 
+    # The lyric-reference protocol (lyric_refs.py). `emits_lyric_refs` is a
+    # PROVIDER capability, not a global switch: the contract is between this
+    # server's prompt and the model that reads it, so a provider opts in only
+    # once it is actually told the contract. The deterministic mock builds its
+    # Song in local code and is never prompted at all.
+    uses_lyric_refs = bool(getattr(provider, "emits_lyric_refs", False))
+    ref_index = build_ref_index(candidates, prior_song) if uses_lyric_refs else {}
+    base_schema = song_json_schema()
+    schema_for_model = agent_song_json_schema(base_schema) if uses_lyric_refs else base_schema
+
     if trace is not None:
         # The FULL MIR snapshot rides on the run itself (un-truncated; the GUI
         # timeline renders from it). The inputs step keeps only a compact
@@ -285,7 +347,8 @@ def reconcile(
             "media_url": media_url,
             "candidates": candidates,
             "mir": mir,
-            "song_schema": song_json_schema(),
+            "song_schema": schema_for_model,
+            "ref_index": ref_index,
             "audio_path": audio_path,
             "guidance": guidance,
             "prior_song": prior_song,
@@ -303,10 +366,12 @@ def reconcile(
         audio = _make_snippet(audio_path)
 
     user_prompt = build_user_prompt(
-        title, artist, candidates, mir, song_json_schema(), song_id, youtube_video_id,
+        title, artist, candidates, mir, schema_for_model, song_id, youtube_video_id,
         guidance=guidance, prior_song=prior_song, time_align=depth.time_align,
         scope=scope, evidence_manifest=evidence_manifest,
+        ref_index=ref_index if uses_lyric_refs else None,
     )
+    system_prompt = build_system_prompt(lyric_refs=uses_lyric_refs)
     turns: list[dict] = [{"role": "user", "text": user_prompt}]
 
     usage: dict = {}
@@ -315,15 +380,38 @@ def reconcile(
     for attempt in range(1, settings.llm_repair_attempts + 2):
         started = clock()
         response = provider.complete(
-            SYSTEM_PROMPT, turns, model=model, audio=audio if attempt == 1 else None
+            system_prompt, turns, model=model, audio=audio if attempt == 1 else None
         )
         for k, v in (response.usage or {}).items():
             if isinstance(v, (int, float)):
                 usage[k] = usage.get(k, 0) + v
         resolved_model = response.model
+        overrides: tuple[LyricOverride, ...] = ()
+        refs_resolved = 0
         try:
-            song = Song.model_validate_json(extract_json(response.text))
-        except (ValidationError, ValueError, json.JSONDecodeError) as e:
+            document = json.loads(extract_json(response.text))
+            if uses_lyric_refs:
+                # Splice BEFORE schema validation: the Song schema knows
+                # nothing about refs, and its charIndex rule only means
+                # something once the real text is in place.
+                spliced = splice_lyrics(document, ref_index)
+                document = spliced.document
+                overrides = spliced.overrides
+                refs_resolved = spliced.refs_resolved
+            song = Song.model_validate(document)
+        except UnresolvableLyricRefError as e:
+            # NOT repaired. A lyric with no valid provenance must not reach
+            # the store, and a retry is an invitation to supply one from
+            # memory instead — see lyric_refs.py rules 3 and 4.
+            if trace is not None:
+                trace.step(
+                    "repair", f"lyric-refs-attempt-{attempt}",
+                    "unresolvable lyric reference — failing the run",
+                    detail={"errors": str(e)[:2000]},
+                    duration_seconds=clock() - started,
+                )
+            raise LyricProvenanceError(str(e)) from e
+        except (ValidationError, ValueError, json.JSONDecodeError, LyricSpliceError) as e:
             last_errors = str(e)[:4000]
             log.info("reconcile attempt %d failed validation: %s", attempt, last_errors[:300])
             if trace is not None:
@@ -334,7 +422,9 @@ def reconcile(
                     duration_seconds=clock() - started,
                 )
             turns.append({"role": "assistant", "text": response.text})
-            turns.append({"role": "user", "text": build_repair_prompt(last_errors)})
+            turns.append(
+                {"role": "user", "text": build_repair_prompt(last_errors, uses_lyric_refs)}
+            )
             continue
         song = _finalize(
             song,
@@ -351,6 +441,8 @@ def reconcile(
             guidance_origin=guidance_origin,
             scope=scope,
             mir_cache=mir_cache,
+            lyric_refs_resolved=refs_resolved,
+            lyric_overrides=overrides,
         )
         if trace is not None:
             trace.step(
@@ -363,6 +455,10 @@ def reconcile(
                     "lineCount": len(song.lines),
                     "chordCount": sum(len(l.chordPlacements) for l in song.lines),
                     "syncMapPoints": len(song.audio.syncMap),
+                    "lyricRefsResolved": refs_resolved if uses_lyric_refs else None,
+                    "lyricOverrides": [
+                        {"lineIndex": o.line_index, "reason": o.reason} for o in overrides
+                    ],
                     "usage": usage,
                 },
                 duration_seconds=clock() - started,

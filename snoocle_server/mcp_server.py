@@ -205,8 +205,11 @@ async def analyze_and_store_song(
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
-    content-hash versions). Give EITHER title+artist OR a youtube_url_or_id: if
-    title/artist are omitted, they're derived from the video's own metadata.
+    content-hash versions). Give title+artist, a youtube_url_or_id, or both.
+    Video metadata is only ever a FALLBACK for whichever of title/artist you
+    did not supply — it never overrides one you did give, even when a
+    youtube_url_or_id is also present. The song id is permanent (content-hash
+    versioned store), so a caller-supplied identity always wins.
     Each external step runs under its own timeout so the call can't hang; a
     fatal step failure raises with the step name. Returns the song, the per-step
     report, and the stored version sha.

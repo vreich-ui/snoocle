@@ -533,7 +533,11 @@ class AnalysisScopeRequest(BaseModel):
 
 class PipelineRequest(BaseModel):
     # title+artist may be omitted when youtubeUrlOrId is given — the pipeline
-    # derives them from the media's own metadata.
+    # derives them from the media's own metadata. That derivation is a
+    # FALLBACK only: a supplied title/artist always wins, even alongside a
+    # youtubeUrlOrId, and a partial supply derives only the missing half. The
+    # song id is permanent (content-hash versioned store), so a caller's own
+    # identity must never be silently replaced by a guess.
     title: Optional[str] = None
     artist: Optional[str] = None
     youtubeUrlOrId: Optional[str] = None

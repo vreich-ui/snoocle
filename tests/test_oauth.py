@@ -453,6 +453,56 @@ def test_an_expired_refresh_token_reports_invalid_grant(client):
     assert r.json()["error"] == "invalid_grant"
 
 
+def test_refresh_succeeds_after_the_access_token_has_expired(client, store):
+    """The live-incident scenario: an hour-old access token must not make a
+    90-day-old refresh token look expired too. Refresh validity is decided
+    from the refresh record's OWN `refresh_expires_at` — see store.py."""
+    tokens = full_flow(client)
+    stored = store.get_by_access_token(tokens["access_token"])
+    stored.access_expires_at = "2000-01-01T00:00:00+00:00"  # long expired
+
+    r = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["access_token"] != tokens["access_token"]
+
+
+def test_a_refresh_token_past_its_own_expiry_is_rejected(client, store):
+    tokens = full_flow(client)
+    record = store._refresh[tokens["refresh_token"]]
+    record.refresh_expires_at = "2000-01-01T00:00:00+00:00"
+
+    r = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+    })
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_grant"
+
+
+def test_a_client_id_mismatch_on_refresh_is_rejected_without_burning_the_token(client, store):
+    """A request naming the wrong client must not be able to invalidate a
+    refresh token that still belongs to its rightful owner."""
+    tokens = full_flow(client)
+    owner_client_id = store.list_clients()[0].client_id
+    other = register(client)
+    assert other["client_id"] != owner_client_id
+
+    wrong = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+        "client_id": other["client_id"],
+    })
+    assert wrong.status_code == 400
+    assert wrong.json()["error"] == "invalid_grant"
+
+    # not consumed: the rightful owner can still use it
+    right = client.post("/oauth/token", data={
+        "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+        "client_id": owner_client_id,
+    })
+    assert right.status_code == 200, right.text
+
+
 def test_unsupported_grant_types_are_named(client):
     r = client.post("/oauth/token", data={"grant_type": "client_credentials"})
     assert r.status_code == 400

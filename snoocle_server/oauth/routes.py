@@ -377,7 +377,13 @@ async def token_endpoint(
             issued = issue_token(record.client_id, record.scope, record.resource)
 
         elif grant_type == "refresh_token":
-            previous = store.rotate_refresh_token(refresh_token)
+            # Validated against the refresh record's OWN expiry (90 days),
+            # never the access token's (1 hour) — see store.py's module
+            # docstring for why that distinction is load-bearing. `client_id`
+            # is checked the same way the authorization_code branch checks it
+            # above: only when the caller sent one, so an older/omitting
+            # client isn't newly broken.
+            previous = store.rotate_refresh_token(refresh_token, client_id)
             if previous is None:
                 raise P.OAuthError("invalid_grant", "refresh token is invalid or expired")
             # OAuth 2.1 requires rotation for public clients: the old refresh

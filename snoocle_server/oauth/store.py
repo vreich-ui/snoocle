@@ -13,7 +13,20 @@ and opaque tokens are revocable by deleting a row, which a JWT is not.
 Three collections:
   oauth_clients   — dynamically registered clients (RFC 7591)
   oauth_codes     — authorization codes, single-use, ~60s TTL
-  oauth_tokens    — access + refresh tokens, audience-bound
+  oauth_tokens    — one doc per ACCESS token (audience-bound, ~1h TTL)
+  oauth_refresh   — one doc per REFRESH token (~90d TTL). Independently
+                    validated: its validity must never be decided by looking
+                    at the access token's own (much shorter) expiry — see
+                    `RefreshRecord` below and `rotate_refresh_token`.
+
+`oauth_refresh` docs carry their OWN `refresh_expires_at`, `client_id`,
+`scope` and `resource` — not just a pointer to the access-token doc. A
+refresh must be answerable from the refresh record alone: if it instead
+joined through the access-token doc for those fields (as this store did
+before), the refresh's effective lifetime would quietly become "however
+long that other doc happens to still exist" rather than its own 90 days,
+and the failure mode is silent — the endpoint still returns a well-formed
+`invalid_grant`, it is just wrong about WHY the token is invalid.
 """
 
 from __future__ import annotations
@@ -145,6 +158,39 @@ class Token:
         }
 
 
+@dataclass
+class RefreshRecord:
+    """A refresh token's OWN record — everything needed to validate and
+    honour it without consulting the access-token doc it currently points
+    at. `access_token` is kept only so rotation can clean that doc up; it is
+    never read to decide whether THIS token is still good.
+    """
+
+    refresh_token: str
+    access_token: str
+    client_id: str
+    scope: str
+    resource: str
+    refresh_expires_at: str
+    created_at: str = ""
+
+    def expired(self) -> bool:
+        exp = _parse(self.refresh_expires_at)
+        return exp is None or exp <= _now()
+
+    @classmethod
+    def from_token(cls, token: Token) -> "RefreshRecord":
+        return cls(
+            refresh_token=token.refresh_token,
+            access_token=token.access_token,
+            client_id=token.client_id,
+            scope=token.scope,
+            resource=token.resource,
+            refresh_expires_at=token.refresh_expires_at,
+            created_at=token.created_at,
+        )
+
+
 class OAuthRepository:
     """Storage contract. Both backends share the expiry rules above."""
 
@@ -173,13 +219,35 @@ class OAuthRepository:
         already used or expired — a replayed code must never succeed."""
         raise NotImplementedError
 
-    def save_token(self, token: Token) -> Token: raise NotImplementedError
+    def save_token(self, token: Token) -> Token:
+        """Persist an access token AND write its refresh token's own
+        independent record (RefreshRecord) — never just a pointer."""
+        raise NotImplementedError
+
     def get_by_access_token(self, access_token: str) -> Optional[Token]:
         raise NotImplementedError
-    def rotate_refresh_token(self, refresh_token: str) -> Optional[Token]:
-        """Atomically invalidate a refresh token and return the record it
-        belonged to. OAuth 2.1 requires rotation for public clients."""
+
+    def rotate_refresh_token(
+        self, refresh_token: str, client_id: str = ""
+    ) -> Optional[RefreshRecord]:
+        """Atomically validate and consume a refresh token, returning the
+        RefreshRecord it belonged to (the caller mints a fresh access+refresh
+        pair from its client_id/scope/resource) — or None.
+
+        Validity is decided ENTIRELY from the refresh record itself:
+        `record.expired()` against its own `refresh_expires_at`. The linked
+        access token's expiry is never consulted — a lapsed 1-hour access
+        token must not make a 90-day refresh token look expired too.
+
+        `client_id`, when given, must match the record's or the token is
+        rejected — but NOT consumed: a request from the wrong client must
+        not be able to burn a token that still belongs to its rightful
+        owner. Only "missing", "expired", or "this client's" lead to a
+        rotation (delete-and-reissue); everything else leaves the stored
+        record untouched.
+        """
         raise NotImplementedError
+
     def revoke(self, token: str) -> bool: raise NotImplementedError
 
 
@@ -187,8 +255,8 @@ class InMemoryOAuthRepository(OAuthRepository):
     def __init__(self) -> None:
         self._clients: dict[str, Client] = {}
         self._codes: dict[str, AuthCode] = {}
-        self._tokens: dict[str, Token] = {}       # by access token
-        self._refresh: dict[str, str] = {}        # refresh -> access
+        self._tokens: dict[str, Token] = {}                 # by access token
+        self._refresh: dict[str, RefreshRecord] = {}         # by refresh token
         self._lock = threading.RLock()
 
     def save_client(self, client):
@@ -238,26 +306,35 @@ class InMemoryOAuthRepository(OAuthRepository):
     def save_token(self, token):
         with self._lock:
             self._tokens[token.access_token] = token
-            self._refresh[token.refresh_token] = token.access_token
+            self._refresh[token.refresh_token] = RefreshRecord.from_token(token)
             return token
 
     def get_by_access_token(self, access_token):
         with self._lock:
             return self._tokens.get(access_token)
 
-    def rotate_refresh_token(self, refresh_token):
+    def rotate_refresh_token(self, refresh_token, client_id=""):
         with self._lock:
-            access = self._refresh.pop(refresh_token, None)
-            if access is None:
+            record = self._refresh.get(refresh_token)
+            if record is None:
                 return None
-            token = self._tokens.pop(access, None)
-            if token is None or token.refresh_expired():
+            if record.expired():
+                # An expired record found is a record we clean up here — but
+                # this is CONSUMPTION, not the "wrong client" non-consuming
+                # path below, so it happens unconditionally.
+                self._refresh.pop(refresh_token, None)
+                self._tokens.pop(record.access_token, None)
                 return None
-            return token
+            if client_id and record.client_id != client_id:
+                return None  # not consumed — still valid for its own client
+            self._refresh.pop(refresh_token, None)
+            self._tokens.pop(record.access_token, None)
+            return record
 
     def revoke(self, token):
         with self._lock:
-            access = self._refresh.pop(token, None) or token
+            refresh_record = self._refresh.pop(token, None)
+            access = refresh_record.access_token if refresh_record is not None else token
             record = self._tokens.pop(access, None)
             if record is not None:
                 self._refresh.pop(record.refresh_token, None)
@@ -314,6 +391,12 @@ class FirestoreOAuthRepository(OAuthRepository):
             if refresh:
                 self._col("oauth_refresh").document(refresh).delete()
             snap.reference.delete()
+        # A refresh record now carries its own client_id, so one whose access
+        # token doc is already gone (rotated away, or a still-unmigrated
+        # legacy pointer) is still reachable directly — not just via the join
+        # above.
+        for snap in self._col("oauth_refresh").where("client_id", "==", client_id).stream():
+            snap.reference.delete()
         for snap in self._col("oauth_codes").where("client_id", "==", client_id).stream():
             snap.reference.delete()
         doc.delete()
@@ -345,8 +428,11 @@ class FirestoreOAuthRepository(OAuthRepository):
 
     def save_token(self, token):
         self._col("oauth_tokens").document(token.access_token).set(asdict(token))
+        # The refresh record is independent, not a pointer: it carries its
+        # own client_id/scope/resource/refresh_expires_at so a refresh is
+        # answerable without ever reading the access-token doc.
         self._col("oauth_refresh").document(token.refresh_token).set(
-            {"access_token": token.access_token}
+            asdict(RefreshRecord.from_token(token))
         )
         return token
 
@@ -354,25 +440,54 @@ class FirestoreOAuthRepository(OAuthRepository):
         snap = self._col("oauth_tokens").document(access_token).get()
         return Token(**snap.to_dict()) if snap.exists else None
 
-    def rotate_refresh_token(self, refresh_token):
+    def rotate_refresh_token(self, refresh_token, client_id=""):
         ref_doc = self._col("oauth_refresh").document(refresh_token)
 
         @self._firestore.transactional
         def _txn(transaction):
+            # All reads first, all writes last — the two documents this
+            # touches are read here in full before anything is deleted, so a
+            # failed validation (wrong client, or a legacy doc that can't be
+            # migrated) never leaves a half-applied transaction behind.
             snap = ref_doc.get(transaction=transaction)
             if not snap.exists:
                 return None
-            access = (snap.to_dict() or {}).get("access_token")
+            data = snap.to_dict() or {}
+            # Pre-migration shape: `{"access_token": ...}` only, nothing of
+            # its own to validate against. Join through the access-token doc
+            # ONCE to backfill a real record — rotation always writes the new
+            # shape, so a given token only ever takes this branch once.
+            migrating = "refresh_expires_at" not in data
+            access = data.get("access_token") or ""
+            access_doc = self._col("oauth_tokens").document(access) if access else None
+            access_snap = access_doc.get(transaction=transaction) if access_doc else None
+
+            if migrating:
+                if access_snap is None or not access_snap.exists:
+                    transaction.delete(ref_doc)
+                    return None
+                tok = access_snap.to_dict() or {}
+                record = RefreshRecord(
+                    refresh_token=refresh_token, access_token=access,
+                    client_id=tok.get("client_id", ""), scope=tok.get("scope", ""),
+                    resource=tok.get("resource", ""),
+                    refresh_expires_at=tok.get("refresh_expires_at", ""),
+                )
+            else:
+                record = RefreshRecord(**data)
+
+            if record.expired():
+                transaction.delete(ref_doc)
+                if access_snap is not None and access_snap.exists:
+                    transaction.delete(access_doc)
+                return None
+            if client_id and record.client_id != client_id:
+                return None  # not consumed — still valid for its own client
+
             transaction.delete(ref_doc)
-            if not access:
-                return None
-            tok_doc = self._col("oauth_tokens").document(access)
-            tok_snap = tok_doc.get(transaction=transaction)
-            if not tok_snap.exists:
-                return None
-            token = Token(**(tok_snap.to_dict() or {}))
-            transaction.delete(tok_doc)
-            return None if token.refresh_expired() else token
+            if access_snap is not None and access_snap.exists:
+                transaction.delete(access_doc)
+            return record
 
         return _txn(self._client.transaction())
 

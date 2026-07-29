@@ -561,6 +561,13 @@ class PipelineRequest(BaseModel):
     # means constrain. Reconciliation itself always runs — the flags decide
     # what evidence it is handed, not whether it happens.
     scope: Optional[AnalysisScopeRequest] = None
+    # Force the deterministic caches (MIR, discovery) to recompute and
+    # overwrite. The caches key on everything that can change an answer, so
+    # this is only needed for the one change a key cannot see: an engine
+    # upgraded IN PLACE without its id changing. Orthogonal to `scope` —
+    # `scope.listen=false` means "don't listen at all", this means "listen
+    # again for real".
+    refreshCache: bool = False
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
@@ -587,6 +594,7 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             guidance=req.guidance,
             prior_song=req.priorSong,
             scope=req.scope.to_scope() if req.scope is not None else None,
+            refresh_cache=req.refreshCache,
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
@@ -602,6 +610,9 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
         "steps": report.steps,
         "storedVersion": report.stored_version,
         "runId": report.run_id,  # fetch the step trace at /v1/runs/{runId}
+        # What this run reused vs recomputed (see manifest.py). Descriptive
+        # only — the admin UI renders it; no client should branch on it.
+        "evidenceManifest": report.evidence_manifest,
         **_reconcile_response(report.reconcile),
     }
 

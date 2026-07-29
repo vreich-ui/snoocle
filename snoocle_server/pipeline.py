@@ -46,8 +46,11 @@ from .audio.acquire import (
 )
 from .config import settings
 from .discovery import CandidateSource, discover_sources
+from .discovery.cache import DiscoveryCacheInfo, discover_cached
 from .identity import IdentityError, SongIdentity, resolve_identity
+from .manifest import build_evidence_manifest, lrc_block
 from .mir import MirAnalysis, analyze_audio
+from .mir.cache import MirCacheInfo, analyze_cached
 from .reconcile import ReconcileResult, provider_preflight, reconcile
 from .reconcile.depth import resolve_depth
 from .reconcile.trace import TraceRecorder, start_run
@@ -98,6 +101,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _cache_suffix(status: str) -> str:
+    """Append the cache outcome to a step's text — and ONLY when it is
+    something other than a plain recomputation, so a run with a cold cache
+    reports exactly the text it always did."""
+    return f" (cache {status})" if status in ("hit", "refresh") else ""
+
+
 @dataclass
 class PipelineReport:
     song_id: str
@@ -110,6 +120,12 @@ class PipelineReport:
     stored_timestamp: str | None = None
     error_code: str | None = None  # machine-readable cause from a failed step
     run_id: str | None = None  # id of this run's persisted step trace
+    # What this run reused vs recomputed, and how good the evidence was. Purely
+    # descriptive — see manifest.py. Surfaced in the analyze response and on the
+    # run trace so the admin UI can show it; nothing branches on it.
+    evidence_manifest: dict = field(default_factory=dict)
+    mir_cache: MirCacheInfo | None = None
+    discovery_cache: DiscoveryCacheInfo | None = None
 
 
 def get_store() -> SongRepository:
@@ -137,8 +153,19 @@ def _step_resolve(youtube_url_or_id: str) -> tuple[ResolvedMeta, SongIdentity]:
     return meta, identity
 
 
-def _step_discover(title: str, artist: str, max_candidates: int | None) -> list[CandidateSource]:
-    return discover_sources(title, artist, max_candidates=max_candidates)
+def _step_discover(
+    title: str, artist: str, max_candidates: int | None, refresh: bool = False
+) -> tuple[list[CandidateSource], DiscoveryCacheInfo]:
+    # `discover_sources` stays the thing that searches — the cache wraps the
+    # call rather than replacing the name, so every existing seam (and every
+    # test that monkeypatches this module's `discover_sources`) is untouched.
+    resolved_max = max_candidates or settings.search_max_candidates
+    return discover_cached(
+        title, artist,
+        max_candidates=resolved_max,
+        discover=lambda: discover_sources(title, artist, max_candidates=max_candidates),
+        refresh=refresh,
+    )
 
 
 def _step_acquire(
@@ -147,8 +174,16 @@ def _step_acquire(
     return acquire(title=title, artist=artist, video_url_or_id=youtube_url_or_id)
 
 
-def _step_mir(audio_path: str, accuracy: str) -> MirAnalysis:
-    return analyze_audio(audio_path, accuracy=accuracy)
+def _step_mir(
+    audio_path: str, accuracy: str, refresh: bool = False
+) -> tuple[MirAnalysis, MirCacheInfo]:
+    # Same shape as _step_discover: `analyze_audio` remains what computes.
+    return analyze_cached(
+        audio_path,
+        accuracy=accuracy,
+        compute=lambda: analyze_audio(audio_path, accuracy=accuracy),
+        refresh=refresh,
+    )
 
 
 def _step_reconcile(
@@ -167,6 +202,8 @@ def _step_reconcile(
     prior_song: dict | None = None,
     depth=None,
     scope: AnalysisScope | None = None,
+    evidence_manifest: dict | None = None,
+    mir_cache: MirCacheInfo | None = None,
 ) -> ReconcileResult:
     return reconcile(
         title,
@@ -185,6 +222,8 @@ def _step_reconcile(
         prior_song=prior_song,
         depth=depth,
         scope=scope,
+        evidence_manifest=evidence_manifest,
+        mir_cache=mir_cache,
     )
 
 
@@ -253,6 +292,7 @@ async def run_pipeline_async(
     guidance: str | None = None,
     prior_song: dict | None = None,
     scope: AnalysisScope | None = None,
+    refresh_cache: bool = False,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
     # Scope constrains ONLY when it was explicitly supplied. `None` means the
@@ -341,12 +381,15 @@ async def run_pipeline_async(
         report.steps["discover"] = "skipped (mock: offline deterministic reconciler)"
     else:
         try:
-            report.candidates = await _timed_step(
+            report.candidates, report.discovery_cache = await _timed_step(
                 "discover",
-                lambda: _step_discover(title, artist, max_candidates),
+                lambda: _step_discover(title, artist, max_candidates, refresh_cache),
                 settings.discover_timeout_seconds,
             )
-            report.steps["discover"] = f"ok: {len(report.candidates)} candidate source(s)"
+            report.steps["discover"] = (
+                f"ok: {len(report.candidates)} candidate source(s)"
+                + _cache_suffix(report.discovery_cache.status)
+            )
         except Exception as e:  # noqa: BLE001 — best-effort (incl. timeout)
             report.steps["discover"] = _fail_text(e, settings.discover_timeout_seconds)
 
@@ -373,10 +416,15 @@ async def run_pipeline_async(
         if report.audio is not None:
             audio_path = report.audio.path
             try:
-                report.mir = await _timed_step(
-                    "mir", lambda: _step_mir(audio_path, accuracy), settings.mir_timeout_seconds
+                report.mir, report.mir_cache = await _timed_step(
+                    "mir",
+                    lambda: _step_mir(audio_path, accuracy, refresh_cache),
+                    settings.mir_timeout_seconds,
                 )
-                report.steps["mir"] = "ok: engines=" + str(report.mir.engines)
+                report.steps["mir"] = (
+                    "ok: engines=" + str(report.mir.engines)
+                    + _cache_suffix(report.mir_cache.status)
+                )
             except Exception as e:  # noqa: BLE001 — best-effort (incl. timeout)
                 report.steps["mir"] = _fail_text(e, settings.mir_timeout_seconds)
         else:
@@ -385,6 +433,22 @@ async def run_pipeline_async(
     # 5. reconciliation (FATAL) — uses ALL candidates + the MIR timeline. The
     # run's step trace is recorded live and persisted for later replay in the
     # GUI (the agent's logic, tool calls, and repair rounds).
+    #
+    # The evidence manifest is assembled here, once every input's state is
+    # known, and handed to the reconciler alongside the evidence itself: an
+    # agent that can see "this MIR is a cache hit from three weeks ago and
+    # these 3 sources are current" behaves differently from one left to guess
+    # whether gathering failed. Purely descriptive — see manifest.py.
+    report.evidence_manifest = build_evidence_manifest(
+        mir=report.mir,
+        mir_cache=report.mir_cache,
+        candidates=report.candidates,
+        discovery_cache=report.discovery_cache,
+        prior_song=prior_song,
+        scope=scope,
+        guidance=guidance,
+        guidance_origin=guidance_origin,
+    )
     recorder = start_run(song_id, resolved_provider, depth.name)
     report.run_id = recorder.trace.run_id
     try:
@@ -395,6 +459,8 @@ async def run_pipeline_async(
                 provider, model, attach_audio, report.audio,
                 trace=recorder, guidance=guidance, guidance_origin=guidance_origin,
                 prior_song=prior_song, depth=depth, scope=scope,
+                evidence_manifest=report.evidence_manifest,
+                mir_cache=report.mir_cache,
             ),
             settings.reconcile_timeout_seconds,
         )
@@ -474,6 +540,7 @@ async def run_pipeline_async(
     # deterministic path and must make ZERO external calls of any kind.
     if resolved_provider == "mock":
         report.steps["lrc"] = "skipped (mock: offline deterministic reconciler)"
+        report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
     else:
         try:
             duration = (
@@ -486,14 +553,22 @@ async def run_pipeline_async(
                 if matches:
                     result.song = apply_lrc(result.song, report.mir, matches)
                     report.steps["lrc"] = f"ok: {len(matches)}/{len(result.song.lines)} line(s) matched"
+                    report.evidence_manifest["lrcAlign"] = lrc_block(
+                        "hit", len(matches), len(result.song.lines)
+                    )
                 else:
                     report.steps["lrc"] = "ok: no line matched closely enough"
+                    report.evidence_manifest["lrcAlign"] = lrc_block(
+                        "miss", 0, len(result.song.lines)
+                    )
             else:
                 report.steps["lrc"] = (
                     "skipped (no LRCLIB match)" if settings.lrclib_enabled else "skipped (disabled)"
                 )
+                report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
         except Exception as e:  # noqa: BLE001 — best-effort, never fatal
             report.steps["lrc"] = f"failed: {e}"
+            report.evidence_manifest["lrcAlign"] = lrc_block("failed")
             log.warning("pipeline.step error step=lrc err=%s", e)
 
     # 5d. per-chord agreement scoring (best-effort). Must run LAST of this
@@ -509,6 +584,11 @@ async def run_pipeline_async(
     except Exception as e:  # noqa: BLE001 — best-effort, never fatal
         report.steps["confidence"] = f"failed: {e}"
         log.warning("pipeline.step error step=confidence err=%s", e)
+
+    # Record the manifest on the trace only NOW: 5c is what resolves its
+    # lrcAlign block from "pending" to what actually happened, so attaching it
+    # before this point would durably store a half-answered manifest.
+    recorder.set_evidence_manifest(report.evidence_manifest)
 
     # Persist the trace now that timing/lrc/confidence (5b/5c/5d) have had
     # their chance to attach a review queue -- persisting right after
@@ -599,6 +679,7 @@ def run_pipeline(
     guidance: str | None = None,
     prior_song: dict | None = None,
     scope: AnalysisScope | None = None,
+    refresh_cache: bool = False,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -620,5 +701,6 @@ def run_pipeline(
             guidance=guidance,
             prior_song=prior_song,
             scope=scope,
+            refresh_cache=refresh_cache,
         )
     )

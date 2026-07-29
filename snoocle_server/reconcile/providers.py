@@ -330,6 +330,10 @@ class AgentMcpProvider(LLMProvider):
             "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
             "songSchema": ctx["song_schema"],
         }
+        # Descriptive context (see manifest.py): tells the remote agent what
+        # was reused vs recomputed. Never a source of song content.
+        if ctx.get("evidence_manifest"):
+            request["evidenceManifest"] = ctx["evidence_manifest"]
         args: dict = {"request": request}
         # Repair round: turns are [user, assistant, repair-user, ...] — hand the
         # agent its previous output and the validation errors verbatim.

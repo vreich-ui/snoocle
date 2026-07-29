@@ -72,6 +72,7 @@ def build_user_prompt(
     prior_song: dict | None = None,
     time_align: bool = False,
     scope: AnalysisScope | None = None,
+    evidence_manifest: dict | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append(
@@ -79,6 +80,20 @@ def build_user_prompt(
         f"Use song id {song_id!r}"
         + (f" and audio.youtubeVideoId {youtube_video_id!r}." if youtube_video_id else ".")
     )
+    # The manifest is the general form of the scope banner below: rather than
+    # leaving the model to infer evidence quality from what happens to be
+    # present, state it. It is DESCRIPTIVE — nothing is parsed back out of the
+    # response and nothing downstream depends on it.
+    if evidence_manifest:
+        parts.append(
+            "## Evidence manifest (what you are being handed, and where it came from)\n"
+            "Context only — the evidence itself is below. Cached evidence is as"
+            " valid as freshly gathered evidence: a cache hit means this exact"
+            " work was already done, not that it is stale or second-hand. Use"
+            " this to judge what is worth re-deriving, never as a source of"
+            " song content.\n"
+            + json.dumps({"evidenceManifest": evidence_manifest}, indent=1)
+        )
     # The scope banner goes FIRST, before the schema and the (possibly empty)
     # evidence sections. A model that reads "Candidate text sources (0 found —
     # use ALL of them)" and no MIR with no explanation concludes the evidence

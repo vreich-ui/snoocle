@@ -80,13 +80,42 @@ timeline and music theory — NOT by more searching. When you have enough \
 information to act, act: produce the Song instead of continuing to verify. \
 Two agreeing sources plus the provided MIR is always enough."""
 
-# NON-EDITABLE. Always the last section of the system prompt.
+# NON-EDITABLE. Always the last section of the system prompt. The lyric
+# protocol lives here rather than in an editable section on purpose: it is
+# enforced by lyric_refs.splice_lyrics, so an operator who edited it away
+# would only be making every run fail a rule the model was no longer told.
 _OUTPUT_CONTRACT = """\
 Output contract:
 - Your FINAL message must be EXACTLY ONE JSON object — the Song — that \
 validates against the provided songSchema. No markdown fences, no commentary, \
 no prose before or after. The schema is strict: only its keys are allowed. \
-Set id, title, artist, and youtubeVideoId from the request."""
+Set id, title, artist, and youtubeVideoId from the request.
+
+Lyric reference protocol (non-negotiable):
+- You do NOT write out the song's words. For each line you say WHERE its \
+words are, and the server substitutes them verbatim. Each line carries \
+exactly ONE of:
+  * "lyricRef": {"sourceId": <id of a source in this request>, "line": \
+<lineIndex within that source>} — the normal case, every line that has words.
+  * "lyricOverride": <text> plus "lyricOverrideReason": <why> — rare, only \
+when no single source line is right (merging two partial sources, fixing an \
+obvious source typo, a line no source covers). Each one is recorded in the \
+song's provenance, and too many fail the run.
+  * "lyrics": "" — an instrumental line, which has no words. Empty string, \
+and no lyricRef.
+- Worked example of two lines:
+  {"lineIndex": 7, "lyricRef": {"sourceId": "web-2", "line": 12}, \
+"chordPlacements": [{"charIndex": 0, "chord": "F"}, {"charIndex": 18, \
+"chord": "C"}]}
+  {"lineIndex": 8, "lyrics": "", "chordPlacements": [{"charIndex": 0, \
+"chord": "Am"}, {"charIndex": 1, "chord": "G"}]}
+- Referenceable sourceIds are the candidates in this request, "prior-song" \
+when one is given, and any sheet you fetch with fetch_chord_sheet (it \
+returns the sourceId to use). A ref to anything else, or to a line outside \
+that source, FAILS the run — it is not repaired and it does not fall back \
+to your own recollection of the song.
+- charIndex is an index into the REFERENCED line's text as it appears in \
+that source. Count characters there; do not estimate."""
 
 
 def build_system_blocks(cfg=None) -> list[dict]:
@@ -153,12 +182,20 @@ def _classify_api_error(e: Exception) -> ProviderError:
     msg = str(e)
     lowered = msg.lower()
     if "content filtering" in lowered or "content_filter" in lowered:
+        # The old copy blamed "no chord/lyric sources were found". The two
+        # live failures that motivated the lyric-reference protocol both had
+        # FOUR sources successfully fetched, so that claim was not just
+        # unhelpful, it pointed at the wrong thing. The cause is what the
+        # model was asked to WRITE — see reconcile/lyric_refs.py.
         return ContentFilterError(
-            "anthropic-agent: the reconciled output was blocked by Anthropic's "
-            "content-filtering policy for this song. This is most likely when no "
-            "chord/lyric sources were found and the model reproduces long verbatim "
-            "lyrics. Try re-running (the filter is not always deterministic), a "
-            "different source/upload, or a lower analysis depth."
+            "anthropic-agent: the model's output was blocked by Anthropic's "
+            "content-filtering policy for this song. This happens when the "
+            "response reproduces long verbatim lyrics, independently of how "
+            "many sources the run gathered. Reconciliation normally emits "
+            "lyric REFERENCES instead of lyric text (the server splices them "
+            "in), so a block here usually means the model wrote lyrics out "
+            "anyway — retrying often clears it, since the filter is not "
+            "deterministic. A lower analysis depth also helps."
         )
     return ProviderError(f"anthropic-agent: model API error: {msg}")
 
@@ -247,6 +284,7 @@ class AnthropicAgentProvider(LLMProvider):
     default_model = "claude-opus-4-8"
     supports_audio = False  # audio is reached through analyze_audio_window, not attached
     wants_context = True
+    emits_lyric_refs = True  # see _OUTPUT_CONTRACT and reconcile/lyric_refs.py
 
     # engine.py injects the structured inputs (incl. audio_path) here before complete()
     context: dict | None = None
@@ -281,6 +319,14 @@ class AnthropicAgentProvider(LLMProvider):
             "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
             "songSchema": ctx.get("song_schema"),
         }
+        # Exactly which ids a lyricRef may name, and how many lines each has.
+        # Stated rather than left to be inferred from `candidates`, because an
+        # unresolvable ref fails the run outright (lyric_refs.py rule 3).
+        ref_index = ctx.get("ref_index")
+        if ref_index is not None:
+            payload["referenceableLyricSources"] = {
+                source_id: {"lines": len(lines)} for source_id, lines in ref_index.items()
+            }
         # Descriptive context: what this run reused vs recomputed, and how good
         # each input is. See manifest.py — never a source of song content.
         if ctx.get("evidence_manifest"):
@@ -323,14 +369,35 @@ class AnthropicAgentProvider(LLMProvider):
                 )
         return {"role": "user", "content": json.dumps(payload)}
 
+    def _register_ref_source(self, source_id: str, fetched: dict) -> None:
+        """Make a just-fetched sheet addressable by ``lyricRef``.
+
+        The index is the engine's dict (injected via context) — mutating it
+        here is deliberate: "what the model can see" and "what the server can
+        resolve" must be the same set at every moment of the run.
+        """
+        index = (self.context or {}).get("ref_index")
+        if index is None or "error" in fetched:
+            return
+        lines = fetched.get("lines")
+        if isinstance(lines, list):
+            index[source_id] = [
+                str(line.get("lyrics", "")) if isinstance(line, dict) else ""
+                for line in lines
+            ]
+
     def _run_tool(self, block) -> dict:
         name = block.name
         tool_input = block.input or {}
         if name == "fetch_chord_sheet":
             self._fetch_count += 1
-            result = fetch_chord_sheet(
-                tool_input.get("url", ""), source_id=f"agent-{self._fetch_count}"
-            )
+            source_id = f"agent-{self._fetch_count}"
+            result = fetch_chord_sheet(tool_input.get("url", ""), source_id=source_id)
+            # A sheet fetched mid-run is evidence like any other, so its lines
+            # have to become REFERENCEABLE — otherwise the agent finds a better
+            # source than the ones it was handed and then cannot point at it,
+            # and an unresolvable ref fails the run (lyric_refs.py rule 3).
+            self._register_ref_source(source_id, result)
         elif name == "analyze_audio_window":
             audio_path = (self.context or {}).get("audio_path")
             result = analyze_audio_window(

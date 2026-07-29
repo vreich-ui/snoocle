@@ -29,7 +29,7 @@ from snoocle_server.reconcile.anthropic_agent import (
 from snoocle_server.reconcile.trace import start_run
 from snoocle_server.store.agent_config import InMemoryAgentConfigStore, reset_agent_config_store
 from snoocle_server.store.memory import InMemorySongRepository
-from tests.fake_agent_mcp import _SONG
+from tests.fake_agent_mcp import _SONG_DRAFT
 
 
 # --- config model -----------------------------------------------------------
@@ -104,7 +104,7 @@ def test_config_overrides_reach_the_request(monkeypatch):
             captured["kwargs"] = kwargs
             return types.SimpleNamespace(
                 stop_reason="end_turn",
-                content=[types.SimpleNamespace(type="text", text=json.dumps(_SONG))],
+                content=[types.SimpleNamespace(type="text", text=json.dumps(_SONG_DRAFT))],
                 usage=types.SimpleNamespace(input_tokens=1, output_tokens=1, cache_read_input_tokens=0),
             )
 

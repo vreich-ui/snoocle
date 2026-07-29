@@ -27,8 +27,9 @@ from snoocle_server.reconcile import anthropic_agent as agent_mod
 from snoocle_server.reconcile.anthropic_agent import AnthropicAgentProvider
 from snoocle_server.reconcile.providers import ProviderError, provider_capabilities
 
-# The canonical valid Song document (same fixture the MCP-agent tests use).
-from tests.fake_agent_mcp import _SONG
+# The canonical valid Song DRAFT: the reference-protocol shape this provider
+# must now emit (no lyric text). See snoocle_server/reconcile/lyric_refs.py.
+from tests.fake_agent_mcp import _SONG_DRAFT
 
 _FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -124,6 +125,22 @@ def _tool_result_user_messages(msgs: list) -> list:
 # --- scenario 1: happy path -------------------------------------------------
 
 
+def _referencing_draft(source_id: str, line: int = 0) -> dict:
+    """The `_SONG_DRAFT` shape with its first line pointing at a source
+    instead of being instrumental — the normal case of the protocol."""
+    draft = json.loads(json.dumps(_SONG_DRAFT))
+    draft["lines"][0] = {
+        "lineIndex": 0,
+        "lyricRef": {"sourceId": source_id, "line": line},
+        "chordPlacements": [
+            {"charIndex": 0, "chord": "C"},
+            {"charIndex": 15, "chord": "G"},
+            {"charIndex": 32, "chord": "Am"},
+        ],
+    }
+    return draft
+
+
 def test_happy_path_tool_call_then_valid_song(monkeypatch):
     # fetch_chord_sheet reaches no network: fetch_page returns a real fixture
     # sheet, then the real extract/parse turn it into a candidate.
@@ -138,7 +155,9 @@ def test_happy_path_tool_call_then_valid_song(monkeypatch):
 
     queue = [
         _response("tool_use", [_tool_use("t1", "fetch_chord_sheet", {"url": "https://ex/let-it-be"})]),
-        _response("end_turn", [_text(json.dumps(_SONG))]),
+        # The agent references the sheet it just fetched — mid-run sources are
+        # registered as referenceable, or this would fail the run.
+        _response("end_turn", [_text(json.dumps(_referencing_draft("agent-1")))]),
     ]
     captured = _install(monkeypatch, queue)
 
@@ -157,6 +176,9 @@ def test_happy_path_tool_call_then_valid_song(monkeypatch):
     assert result.song.metadata.title == "Let It Be"
     # accumulated token usage surfaced from response.usage
     assert result.usage.get("input_tokens", 0) > 0
+
+    # the lyric the model never wrote: spliced from the sheet it fetched
+    assert result.song.lines[0].lyrics.strip() == "When I find myself in times of trouble"
 
     # the fetch tool was actually invoked with the model's URL
     assert fetched["url"] == "https://ex/let-it-be"
@@ -182,7 +204,7 @@ def test_repair_round_continues_same_conversation(monkeypatch):
     queue = [
         _response("tool_use", [_tool_use("t1", "analyze_audio_window", {"start_seconds": 5, "end_seconds": 15})]),
         _response("end_turn", [_text(json.dumps({"bad": True}))]),  # attempt 1: invalid
-        _response("end_turn", [_text(json.dumps(_SONG))]),          # attempt 2 (repair): valid
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),          # attempt 2 (repair): valid
     ]
     captured = _install(monkeypatch, queue)
 
@@ -212,7 +234,7 @@ def test_repair_round_continues_same_conversation(monkeypatch):
 def test_analyze_audio_window_without_audio_is_error_but_completes(monkeypatch):
     queue = [
         _response("tool_use", [_tool_use("t1", "analyze_audio_window", {"start_seconds": 10, "end_seconds": 20})]),
-        _response("end_turn", [_text(json.dumps(_SONG))]),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
     ]
     captured = _install(monkeypatch, queue)
 
@@ -331,7 +353,7 @@ def test_container_id_is_carried_into_every_later_turn(monkeypatch):
                   container_id="ctr_abc123"),
         # turn 2 asks for another tool; no container echoed back this time
         _response("tool_use", [_tool_use("t2", "fetch_chord_sheet", {"url": "https://ex/b"})]),
-        _response("end_turn", [_text(json.dumps(_SONG))]),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
     ]
     captured = _install_recording(monkeypatch, queue)
 
@@ -350,7 +372,7 @@ def test_container_id_is_carried_into_every_later_turn(monkeypatch):
 def test_no_container_key_is_sent_when_none_was_allocated(monkeypatch):
     """An explicit null is not the same as an absent field: the parameter is
     typed Optional[str] and sending None would be a different request."""
-    queue = [_response("end_turn", [_text(json.dumps(_SONG))])]
+    queue = [_response("end_turn", [_text(json.dumps(_SONG_DRAFT))])]
     captured = _install_recording(monkeypatch, queue)
 
     reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
@@ -388,7 +410,7 @@ def test_listen_off_removes_the_audio_window_tool(monkeypatch):
 
     captured = _reconcile_with_scope(
         monkeypatch, AnalysisScope(listen=False, reconcile=True),
-        [_response("end_turn", [_text(json.dumps(_SONG))])],
+        [_response("end_turn", [_text(json.dumps(_SONG_DRAFT))])],
     )
     names = _tool_names(captured)
     assert "analyze_audio_window" not in names, "listening was switched off"
@@ -400,7 +422,7 @@ def test_reconcile_off_removes_every_source_gathering_tool(monkeypatch):
 
     captured = _reconcile_with_scope(
         monkeypatch, AnalysisScope(listen=True, reconcile=False),
-        [_response("end_turn", [_text(json.dumps(_SONG))])],
+        [_response("end_turn", [_text(json.dumps(_SONG_DRAFT))])],
     )
     names = _tool_names(captured)
     for gone in ("web_search", "web_fetch", "fetch_chord_sheet"):
@@ -414,14 +436,14 @@ def test_notes_only_sends_no_tools_key_at_all(monkeypatch):
 
     captured = _reconcile_with_scope(
         monkeypatch, AnalysisScope(listen=False, reconcile=False),
-        [_response("end_turn", [_text(json.dumps(_SONG))])],
+        [_response("end_turn", [_text(json.dumps(_SONG_DRAFT))])],
     )
     call = _create_kwargs(captured)[0]
     assert "tools" not in call
 
 
 def test_absent_scope_leaves_every_tool_declared(monkeypatch):
-    captured = _install_recording(monkeypatch, [_response("end_turn", [_text(json.dumps(_SONG))])])
+    captured = _install_recording(monkeypatch, [_response("end_turn", [_text(json.dumps(_SONG_DRAFT))])])
     reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
               provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
     names = _tool_names(captured)

@@ -56,6 +56,55 @@ _SONG = {
 }
 
 
+#: The same document as a provider on the LYRIC REFERENCE PROTOCOL must emit
+#: it (snoocle_server/reconcile/lyric_refs.py): no lyric text, only pointers
+#: into sources the run already has. Both lines are instrumental here because
+#: the tests that use this fixture pass NO candidate sources — there is
+#: nothing to point at — and what they exercise is the agent loop (tools,
+#: repair rounds, scope, tracing), not lyric resolution. Tests that do care
+#: about resolution build their own refs; see test_anthropic_agent.py.
+#:
+#: `_SONG` above stays as it is: the external "agent" MCP provider is a
+#: third-party workspace that has not adopted the protocol, so its fake must
+#: keep returning what a real one returns today.
+_SONG_DRAFT = {
+    "id": "the-beatles--let-it-be",
+    "metadata": {"title": "Let It Be", "artist": "The Beatles"},
+    "audio": {
+        "youtubeVideoId": "QDYfEBY9NM4",
+        "syncMap": [{"lineIndex": 0, "time": 13.2}, {"lineIndex": 1, "time": 18.9}],
+    },
+    "sections": [
+        {
+            "sectionIndex": 0,
+            "name": "Intro",
+            "kind": "intro",
+            "startLineIndex": 0,
+            "endLineIndex": 1,
+            "startTime": 13.0,
+            "endTime": 25.0,
+        }
+    ],
+    "lines": [
+        {
+            "lineIndex": 0,
+            "lyrics": "",
+            "chordPlacements": [
+                {"charIndex": 0, "chord": "C"},
+                {"charIndex": 1, "chord": "G"},
+                {"charIndex": 2, "chord": "Am"},
+            ],
+        },
+        {
+            "lineIndex": 1,
+            "lyrics": "",
+            "chordPlacements": [{"charIndex": 0, "chord": "F"}],
+        },
+    ],
+    "provenance": [],
+}
+
+
 @mcp.tool()
 def reconcile_song(
     request: dict,

@@ -229,6 +229,21 @@ def test_check_snap_match_fails_when_neither_notes_nor_confidence_parse(acc):
     assert not r.passed
 
 
+def test_check_snap_match_accepts_a_carry_forward_entry(acc):
+    """A run that reused the prior version's audio analysis (scope.listen=off)
+    records `timing-carry-forward` instead of `timing-snap`. The check is about
+    whether the placements ended up timed, not which pass timed them — and the
+    real pass's real notes must parse, so this builds one rather than
+    hand-writing the string."""
+    from snoocle_server.timing.carry_forward import carry_forward_timing
+    from tests.test_timing_carry_forward import _gold_song, _reconciled_without_timing
+
+    carried, _ = carry_forward_timing(_reconciled_without_timing(), _gold_song())
+    r = acc.check_snap_match(carried.model_dump(mode="json"))
+    assert r.passed, r.detail
+    assert "10/13" in r.detail
+
+
 def test_check_snap_match_uses_the_last_entry_when_several_exist(acc):
     """A song re-analyzed more than once accumulates provenance across runs
     (see pipeline._step_store) — only the most recent snap pass counts."""

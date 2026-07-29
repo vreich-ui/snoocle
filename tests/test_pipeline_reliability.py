@@ -416,9 +416,15 @@ def test_scope_listen_off_skips_acquire_and_mir(monkeypatch):
     recorder = _Recorder()
     monkeypatch.setattr(pipeline_mod, "reconcile", recorder)
 
+    # listen=off means "reuse the existing audio analysis", so the run needs
+    # one to reuse — see tests/test_timing_carry_forward.py for the pass that
+    # carries it forward and for the failure when there is nothing to carry.
     r = client.post(
         "/v1/songs/analyze",
-        json=_no_scope_analyze_body(scope={"listen": False, "reconcile": True}),
+        json=_no_scope_analyze_body(
+            scope={"listen": False, "reconcile": True},
+            priorSong=_fake_song().model_dump(mode="json"),
+        ),
     )
     assert r.status_code == 200, r.text
     steps = r.json()["steps"]
@@ -476,7 +482,10 @@ def test_partial_scope_object_only_turns_off_what_it_names(monkeypatch):
 
     r = client.post(
         "/v1/songs/analyze",
-        json=_no_scope_analyze_body(scope={"listen": False}),
+        json=_no_scope_analyze_body(
+            scope={"listen": False},
+            priorSong=_fake_song().model_dump(mode="json"),  # listen=off needs one
+        ),
     )
     assert r.status_code == 200, r.text
     assert ran == ["discover"]
@@ -493,6 +502,9 @@ def test_scope_is_recorded_in_the_reconcile_provenance():
         json={
             "title": "Scoped", "artist": "Tester", "provider": "mock",
             "scope": {"listen": False, "reconcile": True},
+            # listen=off reuses the prior version's audio analysis, so it needs
+            # one to reuse (tests/test_timing_carry_forward.py).
+            "priorSong": _fake_song("tester--scoped").model_dump(mode="json"),
         },
     )
     assert r.status_code == 200, r.text

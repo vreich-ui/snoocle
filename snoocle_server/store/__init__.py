@@ -10,6 +10,7 @@ import threading
 
 from ..config import settings
 from .base import (  # noqa: F401
+    CorruptSongError,
     SaveResult,
     SongRepository,
     SongSummary,

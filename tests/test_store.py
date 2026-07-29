@@ -150,6 +150,131 @@ def test_get_missing_song_raises(repo):
     assert repo.current_version("nope--nothing") is None
 
 
+def _seed_raw(repo, song_id: str, raw_song: dict, version: str = "legacy0000") -> None:
+    """Inject a raw (unvalidated) song blob straight into the backend, the
+    way a document written before the Song schema existed -- or before some
+    invariant was added -- would already sit in the database. `save()` always
+    takes a validated `Song`, so it can't produce this state; real legacy rows
+    can.
+    """
+    from snoocle_server.store.memory import InMemorySongRepository, _Record, _Version
+
+    if isinstance(repo, InMemorySongRepository):
+        repo._songs[song_id] = _Record(
+            title=raw_song.get("metadata", {}).get("title", ""),
+            artist=raw_song.get("metadata", {}).get("artist", ""),
+            latest_version=version,
+            updated_at="2026-01-01T00:00:00+00:00",
+            versions={version: _Version(song=raw_song, message="legacy seed", timestamp="2026-01-01T00:00:00+00:00", parent=None)},
+            order=[version],
+        )
+        return
+    # Firestore: write the same shape save() writes, skipping Song validation.
+    ts = "2026-01-01T00:00:00+00:00"
+    repo._version_ref(song_id, version).set(
+        {"song": raw_song, "message": "legacy seed", "timestamp": ts, "parent": None}
+    )
+    repo._song_ref(song_id).set(
+        {
+            "song": raw_song,
+            "title": raw_song.get("metadata", {}).get("title", ""),
+            "artist": raw_song.get("metadata", {}).get("artist", ""),
+            "latestVersion": version,
+            "updatedAt": ts,
+            "youtubeVideoId": raw_song.get("audio", {}).get("youtubeVideoId"),
+            "hasTiming": False,
+        }
+    )
+
+
+# A v1-era document exactly as it would have sat in Firestore before schema
+# v2 existed: no `schemaVersion` key, none of the v2-only optional fields
+# (ChordPlacement.timeSeconds/confidence/beat/voicingHint, Line.timeSeconds/
+# confidence, AudioInfo.analyzedVideoId/videoOffsets/beats) present at all.
+_V1_ERA_DOC = {
+    "id": "bob-marley--three-little-birds",
+    "metadata": {"title": "Three Little Birds", "artist": "Bob Marley"},
+    "displayPreferences": {"capo": 0, "tuning": "standard"},
+    "audio": {"youtubeVideoId": "HHYSSSAKfMU", "durationSeconds": 180.0, "syncMap": []},
+    "sections": [],
+    "lines": [
+        {
+            "lineIndex": 0,
+            "lyrics": "Don't worry about a thing",
+            "chordPlacements": [{"charIndex": 0, "chord": "A"}],
+        }
+    ],
+    "provenance": [
+        {
+            "timestamp": "2025-01-01T00:00:00Z",
+            "actor": "snoocle-server/0.1.0",
+            "action": "reconciled",
+            "sources": [],
+            "confidence": 0.9,
+        }
+    ],
+}
+
+
+def test_v1_era_document_round_trips_through_read_path(repo):
+    """A stored document from before schema v2 existed -- no schemaVersion,
+    none of the v2-only fields -- must still come back from get() exactly
+    like any other song. This is the read path get_song/list_songs actually
+    use, not just Song.model_validate() in isolation."""
+    _seed_raw(repo, "bob-marley--three-little-birds", _V1_ERA_DOC)
+
+    assert "bob-marley--three-little-birds" in repo.list_songs()
+
+    got = repo.get("bob-marley--three-little-birds")
+    assert got.metadata.title == "Three Little Birds"
+    assert got.metadata.artist == "Bob Marley"
+    assert got.lines[0].lyrics == "Don't worry about a thing"
+    assert got.lines[0].chordPlacements[0].chord == "A"
+    # v2-only fields fill in their defaults for a v1-era document.
+    assert got.schemaVersion == 2
+    assert got.audio.beats == []
+    assert got.audio.videoOffsets == {}
+    assert got.lines[0].timeSeconds is None
+
+
+def test_genuinely_invalid_document_reports_clearly_without_being_rewritten(repo):
+    """A stored document that predates the sounding-harmony chord rule (e.g.
+    an old "N.C." no-chord placeholder -- see docs/ARCHITECTURE.md's N.C.
+    policy) is genuinely invalid under the current schema. get() must not
+    crash with a bare pydantic ValidationError, and must not silently drop
+    or rewrite the bad placement -- it should raise a clear, typed error
+    naming the song so an operator can decide what to do with it."""
+    bad_doc = {
+        "id": "guns-n-roses--don-t-cry",
+        "metadata": {"title": "Don't Cry", "artist": "Guns N' Roses"},
+        "lines": [
+            {
+                "lineIndex": 0,
+                "lyrics": "Talk to me softly",
+                "chordPlacements": [{"charIndex": 0, "chord": "N.C."}],
+            }
+        ],
+        "provenance": [],
+    }
+    _seed_raw(repo, "guns-n-roses--don-t-cry", bad_doc)
+
+    # list_songs / list_song_summaries never fully validate, so the id still
+    # shows up there even though the document itself can't be read.
+    assert "guns-n-roses--don-t-cry" in repo.list_songs()
+
+    from snoocle_server.store import CorruptSongError
+
+    with pytest.raises(CorruptSongError, match="guns-n-roses--don-t-cry"):
+        repo.get("guns-n-roses--don-t-cry")
+
+    # The stored document itself is untouched -- no auto-migration.
+    if hasattr(repo, "_songs"):
+        raw = repo._songs["guns-n-roses--don-t-cry"].versions["legacy0000"].song
+    else:
+        raw = repo._version_ref("guns-n-roses--don-t-cry", "legacy0000").get().to_dict()["song"]
+    assert raw["lines"][0]["chordPlacements"][0]["chord"] == "N.C."
+
+
 def test_youtube_cookies_persist(repo):
     assert repo.youtube_cookies_status() is None
     assert repo.get_youtube_cookies_txt() is None

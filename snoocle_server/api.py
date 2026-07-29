@@ -61,6 +61,7 @@ from .oauth import authenticate_bearer, resource_metadata_url
 from .oauth import router as oauth_router
 from .oauth.protocol import www_authenticate as oauth_www_authenticate
 from .store import (
+    CorruptSongError,
     StoreError,
     StoreUnavailableError,
     VersionConflictError,
@@ -223,6 +224,19 @@ async def _store_unavailable_handler(request, exc: StoreUnavailableError) -> JSO
     # doesn't exist). 503, not a bare 500 — and never 404, which would falsely
     # read as "song not found".
     return JSONResponse({"detail": f"store unavailable: {exc}"}, status_code=503)
+
+
+def _store_error_response(e: StoreError, not_found_status: int = 404) -> HTTPException:
+    """Map a StoreError to the right HTTP status.
+
+    A CorruptSongError means the document exists but fails validation against
+    the current schema -- distinct from "not found" (the common case these
+    call sites otherwise assume), so it gets its own 500 with the validation
+    detail rather than being reported as a 404.
+    """
+    if isinstance(e, CorruptSongError):
+        return HTTPException(status_code=500, detail=str(e))
+    return HTTPException(status_code=not_found_status, detail=str(e))
 
 
 def _asdict(obj: Any) -> Any:
@@ -711,7 +725,7 @@ def put_gold(song_id: str, req: GoldRequest) -> dict:
     try:
         get_store().get(song_id, version=req.version)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
     get_eval_store().set_gold(song_id, req.version)
     return {"songId": song_id, "goldVersion": req.version}
 
@@ -737,7 +751,7 @@ def get_score(song_id: str, candidate: Optional[str] = None) -> dict:
         gold = store.get(song_id, version=gold_version)
         cand = store.get(song_id, version=candidate)  # None -> current
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
     return {
         "songId": song_id,
         "goldVersion": gold_version,
@@ -963,7 +977,7 @@ def post_song_stems(song_id: str, model: str = stems.DEFAULT_MODEL,
     try:
         song = get_store().get(song_id)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
 
     # Separate the upload the song's times were measured against, not whatever
     # video happens to be linked — stems whose timeline disagrees with the
@@ -1030,7 +1044,7 @@ def post_song_align(song_id: str, language: str = "en") -> dict:
     try:
         song = get_store().get(song_id)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
 
     if not any((line.lyrics or "").strip() for line in song.lines):
         raise HTTPException(
@@ -1128,7 +1142,7 @@ def get_song(song_id: str, version: Optional[str] = None) -> dict:
     try:
         song = get_store().get(song_id, version=version)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
     return song.model_dump()
 
 
@@ -1145,7 +1159,7 @@ def get_song_diff(song_id: str, a: str, b: str) -> str:
     try:
         return get_store().diff(song_id, a, b)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
 
 
 # --- export (master plan B6) ------------------------------------------------
@@ -1167,7 +1181,7 @@ def get_song_export(song_id: str, format: Literal["chordpro", "txt", "json"] = "
     try:
         song = get_store().get(song_id)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
 
     if format == "json":
         body: Any = song.model_dump()
@@ -1225,7 +1239,7 @@ async def post_video_offset(song_id: str, req: VideoOffsetRequest) -> dict:
     try:
         song = get_store().get(song_id)
     except StoreError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise _store_error_response(e) from e
 
     if req.offsetSeconds is not None:
         offset_seconds = req.offsetSeconds

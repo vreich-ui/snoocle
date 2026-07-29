@@ -13,24 +13,64 @@ Modes:
               Live YouTube/LLM calls are still ATTEMPTED so the report
               records the real blocking reasons.
   (default)   live mode: real web search, real YouTube, configured providers.
+  --audio-fixtures PATH
+              online real-audio per-song verification (see below) instead of
+              the 7-step brief run above — a DIFFERENT report, not an addition
+              to it.
 
 Re-run later with real keys:  SNOOCLE_ANTHROPIC_API_KEY=... \
     .venv/bin/python scripts/acceptance.py --providers anthropic,gemini
+
+--- Online audio fixtures mode ---
+
+Runs the FULL pipeline (POST /v1/songs/analyze with only a youtubeUrlOrId, at
+the server's current default config — no analysisDepth/provider override) for
+each of a supplied list of (youtube_url, expected_title, expected_artist)
+fixtures, and asserts, per song:
+
+  - resolve produced the expected id (slugify_song_id(artist, title))
+  - MIR ran with the primary chord engine (chord-cnn-lstm, not the chroma
+    fallback) and produced a non-empty chord timeline
+  - reconcile produced a Song that validates against the schema
+  - snap_chords matched >= 50% of chord placements to the MIR timeline (read
+    from the timing-snap provenance entry's notes/confidence)
+  - the stored version is fetchable via the `get_song` MCP tool (the same
+    /mcp endpoint embedded in this service, not just the REST GET)
+
+Prints a per-song, per-step report with wall-clock and reconcile token usage,
+and exits non-zero if any fixture fails any check.
+
+Runnable against a locally-spawned server (default) or an already-running one,
+local or deployed:
+
+    .venv/bin/python scripts/acceptance.py --audio-fixtures fixtures.json
+
+    .venv/bin/python scripts/acceptance.py --audio-fixtures fixtures.json \\
+        --base-url https://snoocle-xyz.run.app --token "$(gcloud auth print-identity-token)"
+
+Fixtures file: a JSON array of {"url", "title", "artist"} objects — see
+scripts/audio_fixtures.example.json. This mode needs real network egress to
+YouTube, ffmpeg, the chord-cnn-lstm model weights (scripts/setup_chord_model.sh),
+and a configured LLM provider on whichever server it targets — it is NOT
+hermetic, unlike --offline.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import http.server
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,8 +94,16 @@ def curl(*args: str, timeout: int = 900) -> tuple[int, str]:
     return proc.returncode, proc.stdout if proc.returncode == 0 else proc.stderr
 
 
-def curl_json(method: str, url: str, body: dict | None = None, timeout: int = 900) -> tuple[int, dict | str]:
+def curl_json(
+    method: str,
+    url: str,
+    body: dict | None = None,
+    timeout: int = 900,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict | str]:
     args = ["-X", method, url, "-w", "\n%{http_code}"]
+    for k, v in (headers or {}).items():
+        args += ["-H", f"{k}: {v}"]
     if body is not None:
         args += ["-H", "Content-Type: application/json", "-d", json.dumps(body)]
     rc, out = curl(*args, timeout=timeout)
@@ -126,14 +174,355 @@ def wait_healthy(base: str, proc: subprocess.Popen, tries: int = 60) -> dict:
     raise RuntimeError("server never became healthy")
 
 
-def main() -> int:
+# =============================================================================
+# Online audio fixtures mode — real YouTube audio through the full pipeline.
+# See the module docstring for the assertions and CLI flags.
+# =============================================================================
+
+_PLACEHOLDER_MARKERS = ("REPLACE_ME", "REPLACE_WITH")
+_REQUIRED_FIXTURE_FIELDS = ("url", "title", "artist")
+_MIN_SNAP_MATCH_RATIO = 0.5
+_SNAP_NOTES_RE = re.compile(r"matched (\d+)/(\d+) chord placement")
+
+
+def load_audio_fixtures(path: Path) -> list[dict]:
+    """Load and validate the fixtures file; raises SystemExit with a clear
+    message on any problem (bad JSON, missing fields, un-edited placeholder
+    URLs) rather than failing deep inside the run."""
+    if not path.exists():
+        raise SystemExit(f"fixtures file not found: {path}")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"fixtures file is not valid JSON: {path}: {e}") from e
+    if not isinstance(data, list) or not data:
+        raise SystemExit(f"fixtures file must be a non-empty JSON array: {path}")
+
+    fixtures: list[dict] = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise SystemExit(f"fixtures[{i}] must be an object, got {type(entry).__name__}")
+        missing = [k for k in _REQUIRED_FIXTURE_FIELDS if not str(entry.get(k) or "").strip()]
+        if missing:
+            raise SystemExit(f"fixtures[{i}] missing required non-empty field(s): {missing}")
+        url = str(entry["url"])
+        if any(marker in url for marker in _PLACEHOLDER_MARKERS):
+            raise SystemExit(
+                f"fixtures[{i}].url is still the example placeholder ({url!r}) — "
+                f"edit {path} with real YouTube URLs before running"
+            )
+        fixtures.append({"url": url, "title": str(entry["title"]), "artist": str(entry["artist"])})
+    return fixtures
+
+
+@dataclass
+class StepResult:
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass
+class SongReport:
+    fixture: dict
+    http_ok: bool
+    analyze_seconds: float = 0.0
+    run_seconds: float = 0.0
+    mcp_seconds: float = 0.0
+    token_usage: dict = field(default_factory=dict)
+    # {"label": str, "durationSeconds": float | None} for the reconcile-phase
+    # steps on the run trace — the only sub-steps with server-recorded timing;
+    # acquire/mir/discover run inside one HTTP call and aren't broken out.
+    reconcile_steps: list[dict] = field(default_factory=list)
+    checks: list[StepResult] = field(default_factory=list)
+    song_id: str | None = None
+    stored_version: str | None = None
+    error: str | None = None  # set when the analyze call itself failed
+
+    @property
+    def passed(self) -> bool:
+        return self.http_ok and bool(self.checks) and all(c.passed for c in self.checks)
+
+    @property
+    def total_seconds(self) -> float:
+        return self.analyze_seconds + self.run_seconds + self.mcp_seconds
+
+
+def check_resolve_id(fixture: dict, analyze_body: dict) -> StepResult:
+    from snoocle_server.schema.song import slugify_song_id
+
+    expected_id = slugify_song_id(fixture["artist"], fixture["title"])
+    actual_id = analyze_body.get("songId")
+    resolve_step_text = (analyze_body.get("steps") or {}).get("resolve", "")
+    ok = actual_id == expected_id
+    return StepResult(
+        "resolve_id", ok,
+        f"expected id={expected_id!r}, actual id={actual_id!r}; resolve step: {resolve_step_text}",
+    )
+
+
+def check_mir(run_fetch_ok: bool, run_trace: dict | None) -> StepResult:
+    if not run_fetch_ok:
+        return StepResult(
+            "mir", False,
+            "could not fetch the run trace (GET /v1/runs/{id} failed) — "
+            "cannot verify the chord engine or chord timeline",
+        )
+    mir = (run_trace or {}).get("mir")
+    if not mir:
+        return StepResult(
+            "mir", False,
+            "run trace has no MIR snapshot — the (best-effort) MIR step did not "
+            "run, e.g. audio acquisition failed",
+        )
+    engine = (mir.get("engines") or {}).get("chords")
+    timeline = mir.get("chordTimeline") or []
+    engine_ok = engine == "chord-cnn-lstm"
+    nonempty_ok = len(timeline) > 0
+    detail = (
+        f"chords engine={engine!r} ({'primary' if engine_ok else 'FALLBACK'}); "
+        f"chordTimeline has {len(timeline)} segment(s); engines={mir.get('engines')}"
+    )
+    return StepResult("mir", engine_ok and nonempty_ok, detail)
+
+
+def check_song_valid(song: dict) -> StepResult:
+    from snoocle_server.schema import Song
+
+    try:
+        validated = Song.model_validate(song)
+    except Exception as e:  # noqa: BLE001 — any validation failure is a FAIL, not a crash
+        return StepResult("song_valid", False, f"Song.model_validate failed: {str(e)[:400]}")
+    return StepResult(
+        "song_valid", True,
+        f"schemaVersion={validated.schemaVersion}, {len(validated.lines)} line(s), "
+        f"{sum(len(l.chordPlacements) for l in validated.lines)} chord placement(s)",
+    )
+
+
+def check_snap_match(song: dict, min_ratio: float = _MIN_SNAP_MATCH_RATIO) -> StepResult:
+    """Read the LAST `action == "timing-snap"` provenance entry (there may be
+    older ones from a prior analysis of the same song id) and assert its
+    match ratio. Parses the human-readable notes first, per the brief; falls
+    back to the entry's `confidence` field (set to the identical ratio by
+    snap_chords) only if the notes don't parse."""
+    entries = [p for p in (song.get("provenance") or []) if p.get("action") == "timing-snap"]
+    if not entries:
+        return StepResult(
+            "snap_match", False,
+            "no timing-snap provenance entry — MIR did not run, or snap_chords "
+            "had no song to snap",
+        )
+    notes = entries[-1].get("notes") or ""
+    m = _SNAP_NOTES_RE.search(notes)
+    if m:
+        matched, total = int(m.group(1)), int(m.group(2))
+        ratio = (matched / total) if total else 0.0
+        ratio_text = f"{matched}/{total} ({ratio:.0%})"
+    else:
+        confidence = entries[-1].get("confidence")
+        if confidence is None:
+            return StepResult(
+                "snap_match", False,
+                f"could not parse a match ratio from the provenance notes "
+                f"({notes!r}) and confidence is null",
+            )
+        ratio = float(confidence)
+        ratio_text = f"{ratio:.0%} (from provenance confidence; notes unparsed: {notes!r})"
+    ok = ratio >= min_ratio
+    return StepResult("snap_match", ok, f"{ratio_text} >= {min_ratio:.0%} required — notes: {notes!r}")
+
+
+async def _get_song_via_mcp(
+    base: str, song_id: str | None, version: str | None, headers: dict[str, str]
+) -> tuple[bool, str]:
+    """Round-trip the stored song through the real `get_song` MCP tool, over
+    the SAME /mcp endpoint this service embeds alongside its REST API (see
+    api.py's combined-app mount) — local or deployed, this is the actual tool
+    an MCP client would call, not just the REST GET that happens to share
+    logic with it."""
+    if not song_id:
+        return False, "no songId to look up (the analyze call didn't return one)"
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    tool_args: dict = {"song_id": song_id}
+    if version:
+        tool_args["version"] = version
+    try:
+        async with streamablehttp_client(f"{base}/mcp", headers=headers or None) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool("get_song", tool_args)
+                text = result.content[0].text if result.content else ""
+                if result.isError:
+                    return False, f"get_song tool returned an error: {text[:300]}"
+                data = json.loads(text)
+    except Exception as e:  # noqa: BLE001 — report as a failed check, don't crash the run
+        return False, f"MCP get_song round-trip failed: {e}"
+    ok = data.get("id") == song_id
+    return ok, f"get_song via MCP: id={data.get('id')!r} schemaVersion={data.get('schemaVersion')!r}"
+
+
+def run_one_fixture(base: str, headers: dict[str, str], fixture: dict, timeout: float) -> SongReport:
+    print(f"\n>>> {fixture['artist']} — {fixture['title']}  ({fixture['url']})", flush=True)
+
+    t0 = time.monotonic()
+    code, body = curl_json(
+        "POST", f"{base}/v1/songs/analyze", {"youtubeUrlOrId": fixture["url"]},
+        timeout=timeout, headers=headers,
+    )
+    analyze_seconds = time.monotonic() - t0
+    if code != 200 or not isinstance(body, dict):
+        return SongReport(
+            fixture=fixture, http_ok=False, analyze_seconds=analyze_seconds,
+            error=f"POST /v1/songs/analyze: HTTP {code}: {str(body)[:500]}",
+        )
+
+    song = body.get("song") or {}
+    song_id = body.get("songId")
+    stored_version = body.get("storedVersion")
+    run_id = body.get("runId")
+
+    t1 = time.monotonic()
+    if run_id:
+        run_code, run_body = curl_json("GET", f"{base}/v1/runs/{run_id}", timeout=60, headers=headers)
+    else:
+        run_code, run_body = -1, None
+    run_seconds = time.monotonic() - t1
+    run_fetch_ok = run_code == 200 and isinstance(run_body, dict)
+    run_trace = run_body if run_fetch_ok else None
+
+    t2 = time.monotonic()
+    mcp_ok, mcp_detail = asyncio.run(_get_song_via_mcp(base, song_id, stored_version, headers))
+    mcp_seconds = time.monotonic() - t2
+
+    checks = [
+        check_resolve_id(fixture, body),
+        check_mir(run_fetch_ok, run_trace),
+        check_song_valid(song),
+        check_snap_match(song),
+        StepResult("get_song", mcp_ok, mcp_detail),
+    ]
+    reconcile_steps = [
+        {"label": s.get("label"), "durationSeconds": s.get("durationSeconds")}
+        for s in (run_trace or {}).get("steps", [])
+    ]
+
+    return SongReport(
+        fixture=fixture, http_ok=True, analyze_seconds=analyze_seconds,
+        run_seconds=run_seconds, mcp_seconds=mcp_seconds,
+        token_usage=body.get("usage") or {}, reconcile_steps=reconcile_steps,
+        checks=checks, song_id=song_id, stored_version=stored_version,
+    )
+
+
+def print_audio_fixture_report(reports: list[SongReport]) -> None:
+    print("\n" + "=" * 78)
+    print("ONLINE AUDIO ACCEPTANCE REPORT")
+    print("=" * 78)
+    for r in reports:
+        f_ = r.fixture
+        print(f"\n--- {f_['artist']} — {f_['title']}  ({f_['url']})")
+        if not r.http_ok:
+            print(f"    PIPELINE CALL FAILED: {r.error}")
+            print(f"    wall-clock: analyze={r.analyze_seconds:.1f}s")
+            print("    RESULT: FAIL")
+            continue
+        print(f"    songId={r.song_id!r} storedVersion={str(r.stored_version)[:12]!r}")
+        print(
+            f"    wall-clock: analyze={r.analyze_seconds:.1f}s  "
+            f"get_run={r.run_seconds:.2f}s  get_song(mcp)={r.mcp_seconds:.2f}s  "
+            f"total={r.total_seconds:.1f}s"
+        )
+        if r.reconcile_steps:
+            print("    reconcile-phase step timings (from the run trace):")
+            for s in r.reconcile_steps:
+                dur = s["durationSeconds"]
+                dur_text = f"{dur:.2f}s" if dur is not None else "n/a"
+                print(f"      - {s['label']}: {dur_text}")
+        print(f"    token usage (reconcile, summed across attempts): {r.token_usage}")
+        print("    checks:")
+        for c in r.checks:
+            print(f"      [{'PASS' if c.passed else 'FAIL'}] {c.name}: {c.detail}")
+        print(f"    RESULT: {'PASS' if r.passed else 'FAIL'}")
+
+    passed = sum(1 for r in reports if r.passed)
+    print("\n" + "=" * 78)
+    print(f"SUMMARY: {passed}/{len(reports)} song(s) passed")
+    print("=" * 78)
+
+
+def run_audio_fixture_suite(args) -> int:
+    sys.path.insert(0, str(REPO))
+
+    fixtures = load_audio_fixtures(Path(args.audio_fixtures))
+
+    headers: dict[str, str] = {}
+    token = args.token or os.environ.get("SNOOCLE_API_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    server: subprocess.Popen | None = None
+    if args.base_url:
+        base = args.base_url.rstrip("/")
+        print(f"testing against an existing service: {base}")
+    else:
+        port = free_port()
+        base = f"http://127.0.0.1:{port}"
+        server = subprocess.Popen(
+            [PY, "-m", "uvicorn", "snoocle_server.api:app", "--host", "127.0.0.1", "--port", str(port)],
+            cwd=REPO, env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        wait_healthy(base, server)
+        print(f"spawned a local server at {base} (current default config — no env overrides)")
+
+    reports: list[SongReport] = []
+    try:
+        for fixture in fixtures:
+            reports.append(run_one_fixture(base, headers, fixture, args.timeout_seconds))
+    finally:
+        if server is not None:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+
+    print_audio_fixture_report(reports)
+    return 0 if all(r.passed for r in reports) else 1
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--providers", default="anthropic,gemini,openai",
                     help="providers to attempt live in step 2")
     ap.add_argument("--title", default="Let It Be")
     ap.add_argument("--artist", default="The Beatles")
-    args = ap.parse_args()
+    ap.add_argument("--audio-fixtures", default=None,
+                    help="path to a JSON fixtures file — switches to the online "
+                         "real-audio per-song verification mode (see module docstring) "
+                         "instead of the 7-step brief run above")
+    ap.add_argument("--base-url", default=None,
+                    help="[--audio-fixtures only] test against an already-running "
+                         "service (local or deployed) instead of spawning one")
+    ap.add_argument("--token", default=None,
+                    help="[--audio-fixtures only] bearer token sent on every REST and "
+                         "/mcp request (defaults to $SNOOCLE_API_TOKEN; for a deployed "
+                         "Cloud Run service this may instead need to be an identity "
+                         "token, e.g. `gcloud auth print-identity-token`)")
+    ap.add_argument("--timeout-seconds", type=float, default=1800.0,
+                    help="[--audio-fixtures only] per-song wall-clock budget for the "
+                         "full analyze call (acquire+MIR+reconcile can be slow)")
+    return ap
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
+
+    if args.audio_fixtures:
+        return run_audio_fixture_suite(args)
 
     work = Path(tempfile.mkdtemp(prefix="snoocle-acceptance-"))
     env = {**os.environ,

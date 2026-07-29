@@ -120,8 +120,14 @@ def _prior_song_block(prior_song: dict | None) -> dict:
     # recorded timing-snap ratio — the fraction of its chord placements that
     # were matched to the MIR timeline when it was built. It says "how
     # audio-grounded is the document you are being asked to correct", which is
-    # exactly the context that makes a prior song trustworthy or not.
-    snaps = [p for p in provenance if p.get("action") == "timing-snap"]
+    # exactly the context that makes a prior song trustworthy or not. A prior
+    # built by a run that reused an earlier audio analysis records the same
+    # ratio under `timing-carry-forward`, so both count — otherwise a song
+    # re-analyzed with listen=off would report no timing grounding at all.
+    snaps = [
+        p for p in provenance
+        if p.get("action") in ("timing-snap", "timing-carry-forward")
+    ]
     if snaps and snaps[-1].get("confidence") is not None:
         try:
             block["matchRatio"] = round(float(snaps[-1]["confidence"]), 3)

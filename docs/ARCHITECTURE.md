@@ -48,10 +48,14 @@ snoocle_server/
 │                    expected_version optimistic locking via a Firestore
 │                    transaction, append-only provenance, JSON diffs
 ├── timing/          Phase A/B deterministic timing: snap.py (MIR chord/line
-│                    time assignment), quantize.py (beat grid + snapping),
-│                    confidence.py (per-placement agreement scoring + the
-│                    review queue), lrc.py (LRCLIB synced lyrics),
-│                    offset.py (cross-video offset by cross-correlation)
+│                    time assignment), carry_forward.py (the same fields
+│                    carried from the PRIOR version when a run doesn't
+│                    listen, plus the guard that refuses to store a version
+│                    which drops audio-derived data), quantize.py (beat grid
+│                    + snapping), confidence.py (per-placement agreement
+│                    scoring + the review queue), lrc.py (LRCLIB synced
+│                    lyrics), offset.py (cross-video offset by
+│                    cross-correlation)
 ├── audio/stems.py   B4: demucs separation + ffmpeg-rendered practice mixes.
 │                    Separation needs torch and minutes of CPU, so it runs on a
 │                    worker; READING the cache needs nothing, which is what
@@ -203,6 +207,41 @@ not a placement whose chord is "no chord". The iOS app's older model treated
 client-side (see the iOS dev plan, task F1) in favor of rendering a gap
 glyph when a timed instrumental hole exceeds the scroll model's
 `maxGlideSeconds`. Do not reintroduce N.C. as a storable chord identity.
+
+## Timing survives a re-analysis that doesn't listen
+
+`snap_chords` is the only pass that fills timing, and it is a documented
+no-op when there is no MIR. A re-analysis with `scope.listen=false` has none
+by construction, so the reconciler's freshly-emitted document — correctly
+timing-less, since a post-pass normally fills it — used to store with
+`audio.beats` emptied, `metadata.bpm` nulled, every placement `beat`/
+`timeSeconds` gone and every section time gone. It validated and it stored.
+
+Three things now stand between that and the store, in the pipeline rather
+than in a prompt (a prompt can only ask):
+
+1. **Precondition.** `listen=false` means "reuse the existing audio
+   analysis", so the run must have one. The prior version (request
+   `priorSong`, else the stored latest) is resolved before any expensive
+   step; a run with neither fails at step `timing` instead of committing a
+   timing-less document.
+2. **Carry-forward** (`timing/carry_forward.py`) runs after reconcile and in
+   place of `snap_chords`. It copies `audio.beats`, `metadata.bpm` and
+   `audio.analyzedVideoId`, restores `timeSeconds`/`confidence`/`beat` for
+   every line and placement that MATCHES a prior one, carries section times
+   by index + line range, and REGENERATES `audio.syncMap` from the resulting
+   line times so the two cannot diverge. Matching tolerates the reconciler
+   legitimately adding material: placements pair on `(lineIndex, chord,
+   charIndex)` with a reading-order fallback within the line, and a
+   genuinely new placement keeps empty timing rather than stealing a
+   neighbour's. The pass records `action="timing-carry-forward"` provenance
+   in `timing-snap`'s notes shape, so the acceptance script and the evidence
+   manifest read either.
+3. **Guard**, independent of both: no run may store a version whose
+   `audio.beats` is empty or `metadata.bpm` null when the prior version had
+   them — whatever path produced it. `allowTimingLoss=true` (HTTP) /
+   `allow_timing_loss` (MCP) is the explicit opt-out, and also waives the
+   precondition in 1.
 
 ## Cross-video offset alignment (master plan B3)
 

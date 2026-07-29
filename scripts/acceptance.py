@@ -183,6 +183,10 @@ _PLACEHOLDER_MARKERS = ("REPLACE_ME", "REPLACE_WITH")
 _REQUIRED_FIXTURE_FIELDS = ("url", "title", "artist")
 _MIN_SNAP_MATCH_RATIO = 0.5
 _SNAP_NOTES_RE = re.compile(r"matched (\d+)/(\d+) chord placement")
+#: The two deterministic timing passes. Exactly one runs per analysis
+#: (snap when the run listened, carry-forward when it reused the prior
+#: version's audio analysis) and both report the same notes shape.
+_TIMING_ACTIONS = ("timing-snap", "timing-carry-forward")
 
 
 def load_audio_fixtures(path: Path) -> list[dict]:
@@ -301,12 +305,17 @@ def check_song_valid(song: dict) -> StepResult:
 
 
 def check_snap_match(song: dict, min_ratio: float = _MIN_SNAP_MATCH_RATIO) -> StepResult:
-    """Read the LAST `action == "timing-snap"` provenance entry (there may be
-    older ones from a prior analysis of the same song id) and assert its
-    match ratio. Parses the human-readable notes first, per the brief; falls
-    back to the entry's `confidence` field (set to the identical ratio by
-    snap_chords) only if the notes don't parse."""
-    entries = [p for p in (song.get("provenance") or []) if p.get("action") == "timing-snap"]
+    """Read the LAST timing-pass provenance entry (there may be older ones from
+    a prior analysis of the same song id) and assert its match ratio.
+
+    Either pass counts: `timing-snap` (matched to the MIR timeline) or
+    `timing-carry-forward` (matched to the prior version's timeline, on a run
+    that deliberately didn't listen). Both write the same notes shape and set
+    `confidence` to the same ratio, so the parsing below is identical — what
+    is being checked is "the placements ended up timed", not which pass did
+    it. Parses the human-readable notes first, per the brief; falls back to
+    the entry's `confidence` field only if the notes don't parse."""
+    entries = [p for p in (song.get("provenance") or []) if p.get("action") in _TIMING_ACTIONS]
     if not entries:
         return StepResult(
             "snap_match", False,

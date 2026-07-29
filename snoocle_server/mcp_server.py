@@ -201,6 +201,7 @@ async def analyze_and_store_song(
     expected_version: Optional[str] = None,
     accuracy: Optional[str] = None,
     scope: Optional[dict] = None,
+    allow_timing_loss: bool = False,
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
@@ -215,7 +216,14 @@ async def analyze_and_store_song(
     run may do. listen=false reuses the existing audio analysis instead of
     re-downloading and re-analyzing; reconcile=false skips web source
     discovery. Both false means "apply the notes to the prior song and gather
-    nothing". OMIT it for the full pipeline (the default)."""
+    nothing". OMIT it for the full pipeline (the default).
+
+    listen=false carries the prior version's timing (beat grid, bpm, chord and
+    line times, section times) forward onto the new document, and fails if
+    there is no prior version to carry it from. allow_timing_loss=true opts
+    out of that and of the guard that refuses to store a version which drops
+    audio-derived data the prior one had — only pass it when losing that data
+    is the actual intent."""
     report = await run_pipeline_async(
         title,
         artist,
@@ -228,6 +236,7 @@ async def analyze_and_store_song(
         # None in -> None out: an omitted scope must stay omitted all the way
         # down, or every MCP caller silently starts getting a "scope" step.
         scope=AnalysisScope.parse(scope),
+        allow_timing_loss=allow_timing_loss,
     )
     assert report.reconcile is not None
     return {

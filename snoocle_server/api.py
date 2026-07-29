@@ -568,6 +568,12 @@ class PipelineRequest(BaseModel):
     # `scope.listen=false` means "don't listen at all", this means "listen
     # again for real".
     refreshCache: bool = False
+    # Opt OUT of the audio-data guard: allow this run to store a version that
+    # empties audio.beats / nulls metadata.bpm relative to the prior one, and
+    # allow a listen=false run with no prior version to carry timing forward
+    # from. Both are silent-data-loss shapes, so they are refused by default
+    # and only ever happen when a caller says explicitly that it means it.
+    allowTimingLoss: bool = False
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
@@ -595,6 +601,7 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             prior_song=req.priorSong,
             scope=req.scope.to_scope() if req.scope is not None else None,
             refresh_cache=req.refreshCache,
+            allow_timing_loss=req.allowTimingLoss,
         )
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e

@@ -31,6 +31,7 @@ from .base import (
     now_iso,
     song_has_timing,
     unified_song_diff,
+    validate_stored_song,
     version_sha,
 )
 
@@ -116,11 +117,11 @@ class InMemorySongRepository(SongRepository):
             if rec is None:
                 raise StoreError(f"song {song_id!r} not found")
             if version is None:
-                return Song.model_validate(rec.versions[rec.latest_version].song)
+                return validate_stored_song(song_id, None, rec.versions[rec.latest_version].song)
             snap = rec.versions.get(version)
             if snap is None:
                 raise StoreError(f"song {song_id!r} at version {version!r} not found")
-            return Song.model_validate(snap.song)
+            return validate_stored_song(song_id, version, snap.song)
 
     def versions(self, song_id: str) -> list[SongVersion]:
         with self._lock:

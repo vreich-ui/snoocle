@@ -39,6 +39,7 @@ from .base import (
     summarize_song,
     summary_from_record,
     unified_song_diff,
+    validate_stored_song,
     version_sha,
 )
 
@@ -177,11 +178,11 @@ class FirestoreSongRepository(SongRepository):
             data = self._song_ref(song_id).get().to_dict()
             if not data:
                 raise StoreError(f"song {song_id!r} not found")
-            return Song.model_validate(data["song"])
+            return validate_stored_song(song_id, None, data["song"])
         data = self._version_ref(song_id, version).get().to_dict()
         if not data:
             raise StoreError(f"song {song_id!r} at version {version!r} not found")
-        return Song.model_validate(data["song"])
+        return validate_stored_song(song_id, version, data["song"])
 
     @_translate_infra_errors
     def versions(self, song_id: str) -> list[SongVersion]:

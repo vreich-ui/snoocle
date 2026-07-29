@@ -26,6 +26,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from pydantic import ValidationError
+
 from ..schema import Song
 
 _EPSILON = timedelta(microseconds=1)
@@ -37,6 +39,29 @@ class StoreError(RuntimeError):
 
 class VersionConflictError(StoreError):
     """The record changed since the caller last read it (optimistic-lock miss)."""
+
+
+class CorruptSongError(StoreError):
+    """A stored song document exists but fails validation against the
+    current Song schema (e.g. a pre-schema import that used a chord
+    identity the sounding-harmony rule now rejects, such as "N.C.").
+
+    Deliberately distinct from a plain StoreError "not found": the document
+    is present, so callers (and operators) should be told exactly why it
+    can't be read instead of that being conflated with a 404, and the
+    document must NOT be silently rewritten to make the error go away —
+    surface it so a human can decide whether to fix or discard it.
+    """
+
+    def __init__(self, song_id: str, version: str | None, validation_error: Exception):
+        self.song_id = song_id
+        self.version = version
+        self.validation_error = validation_error
+        where = f"song {song_id!r}" + (f" at version {version!r}" if version else "")
+        super().__init__(
+            f"{where} is stored but no longer validates against the current Song "
+            f"schema (data is not automatically migrated or rewritten): {validation_error}"
+        )
 
 
 class StoreUnavailableError(RuntimeError):
@@ -188,6 +213,22 @@ def next_timestamp(previous_iso: str | None) -> str:
         if prev is not None and now <= prev:
             now = prev + _EPSILON
     return now.isoformat()
+
+
+def validate_stored_song(song_id: str, version: str | None, song_dict: dict) -> Song:
+    """Decode a stored song blob, raising :class:`CorruptSongError` (not a bare
+    pydantic ``ValidationError``) when it no longer validates.
+
+    Every backend's ``get()`` must route through this rather than calling
+    ``Song.model_validate`` directly, so a document that predates a schema
+    invariant (e.g. an old "N.C." chord placeholder the sounding-harmony rule
+    now rejects) surfaces as a clear, caller-facing error instead of an
+    unhandled crash — and the document itself is left untouched.
+    """
+    try:
+        return Song.model_validate(song_dict)
+    except ValidationError as e:
+        raise CorruptSongError(song_id, version, e) from e
 
 
 def check_provenance_append_only(old_song_dict: dict, new_song: Song) -> None:

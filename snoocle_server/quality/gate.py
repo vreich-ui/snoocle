@@ -74,5 +74,6 @@ def evaluate(
         searches_spent=searches_spent,
         can_search=can_search,
         can_retry=can_retry,
+        used_partial_accuracy=mir.analyzed_partially if mir is not None else False,
     )
     return QualityDecision(grade=grade, attribution=attribution, escalation=escalation)

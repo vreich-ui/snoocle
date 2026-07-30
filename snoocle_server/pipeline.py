@@ -901,6 +901,15 @@ async def run_pipeline_async(
                     recorder.finish("ok", model=result.model)
 
             entries = [grade_provenance_entry(grade, attribution=attribution)]
+            if escalation.reanalyze_full_accuracy:
+                # Reported, never acted on — same as the AUDIO-fault
+                # alternative-recording suggestion below: a full-accuracy
+                # re-analysis is a real second MIR pass, and paying for it is
+                # an explicit operator decision, not something this run makes
+                # for itself.
+                report.steps["accuracy-escalation"] = (
+                    "recommended: re-analyze at full accuracy — " + escalation.reason
+                )
             if escalation.mark_timing_unreliable:
                 entries.append(timing_unreliable_provenance_entry(attribution))
                 report.steps["timing-reliability"] = "marked unreliable (audio fault)"

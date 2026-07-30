@@ -5,7 +5,50 @@ from __future__ import annotations
 
 import pytest
 
+from snoocle_server.mir.base import AnalyzedWindow, MirAnalysis
 from snoocle_server.mir.pipeline import fast_windows
+
+
+# --- MirAnalysis.analyzed_partially ------------------------------------------
+#
+# The signal `quality.escalation` reads to tell a fast-accuracy (sampled
+# windows) analysis apart from a standard/thorough (single continuous pass)
+# one -- see issue #59 and quality/escalation.py's `used_partial_accuracy`.
+
+
+def test_a_single_window_covering_the_whole_track_is_not_partial():
+    mir = MirAnalysis(duration_seconds=60.0, analyzed_windows=[AnalyzedWindow(start=0.0, end=60.0)])
+    assert mir.analyzed_partially is False
+
+
+def test_a_single_window_covering_a_capped_duration_is_not_partial():
+    # standard/thorough with SNOOCLE_MIR_MAX_ANALYSIS_SECONDS: duration itself
+    # was reduced to the cap before the window was recorded, so a window
+    # spanning [0, duration] is still the full (reported) track.
+    mir = MirAnalysis(duration_seconds=120.0, analyzed_windows=[AnalyzedWindow(start=0.0, end=120.0)])
+    assert mir.analyzed_partially is False
+
+
+def test_multiple_sampled_windows_are_partial():
+    mir = MirAnalysis(
+        duration_seconds=300.0,
+        analyzed_windows=[
+            AnalyzedWindow(start=24.0, end=64.0),
+            AnalyzedWindow(start=126.0, end=166.0),
+            AnalyzedWindow(start=216.0, end=256.0),
+        ],
+    )
+    assert mir.analyzed_partially is True
+
+
+def test_a_single_window_short_of_the_full_duration_is_partial():
+    mir = MirAnalysis(duration_seconds=100.0, analyzed_windows=[AnalyzedWindow(start=10.0, end=100.0)])
+    assert mir.analyzed_partially is True
+
+
+def test_no_window_info_at_all_reads_as_full_track():
+    # Legacy analyses predate window tracking and were always full-track.
+    assert MirAnalysis(duration_seconds=60.0).analyzed_partially is False
 
 
 def test_fast_windows_spread_across_musical_span():

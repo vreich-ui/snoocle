@@ -69,6 +69,7 @@ from .scope import AnalysisScope
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
 from .timing.carry_forward import audio_data_lost, carry_forward_timing
+from .timing.collapse_guard import guard_against_collapsed_timing
 from .timing.confidence import build_review_queue, score_song
 from .timing.lrc import apply_lrc, fetch_lrc, match_lrc_to_lines
 from .timing.snap import snap_chords
@@ -716,14 +717,47 @@ async def run_pipeline_async(
             report.evidence_manifest["lrcAlign"] = lrc_block("failed")
             log.warning("pipeline.step error step=lrc err=%s", e)
 
+    # 5c2. timing collapse guard (best-effort). A generic safety net,
+    # independent of what upstream produced it: whatever path just set
+    # timeSeconds (snap, carry-forward, then possibly LRC), a run of 3+
+    # consecutive lines or in-line placements sharing one identical
+    # timestamp gets spread across the span to the next distinct time (on
+    # the beat grid when there is one); a collapse with nothing later to
+    # spread toward is left alone and reported as such. Runs BEFORE 5d so
+    # confidence scoring judges the corrected times, not the collapsed
+    # ones. Skipped for a patch, same as 5b/5c: nothing was regenerated.
+    any_line_timed = any(line.timeSeconds is not None for line in result.song.lines)
+    if patched:
+        report.steps["timing-collapse-guard"] = "skipped (patch: nothing was regenerated)"
+    elif not any_line_timed:
+        # Nothing was ever timed (no MIR, no carry-forward, no LRC match) --
+        # there is no collapse to guard against and no coverage worth
+        # reporting, so stay silent rather than add a provenance entry to a
+        # song this pipeline never attempted to time.
+        report.steps["timing-collapse-guard"] = "skipped (no line timings to guard)"
+    else:
+        try:
+            duration = (
+                (report.mir.duration_seconds if report.mir else None)
+                or (report.audio.duration_seconds if report.audio else None)
+                or result.song.audio.durationSeconds
+            )
+            guarded_song, guard_entry = guard_against_collapsed_timing(result.song, duration)
+            result.song = guarded_song
+            report.steps["timing-collapse-guard"] = f"ok: {guard_entry.notes}"
+        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+            report.steps["timing-collapse-guard"] = f"failed: {e}"
+            log.warning("pipeline.step error step=timing-collapse-guard err=%s", e)
+
     # 5d. per-chord agreement scoring (best-effort). Must run LAST of this
     # group: the MIR-agreement signal reads placement.timeSeconds, which 5b
-    # (or 5c, if LRC overrode it) is what populates. Refines confidence when
-    # both a source and MIR signal exist, and records a compact "check these
-    # first" queue on the run trace. Skipped for a patch: with no candidates
-    # and no MIR it would only ever touch placements with NO confidence yet
-    # (a freshly inserted chord) by inventing the neutral default 0.5 for
-    # them — exactly the kind of un-named change this path exists to refuse.
+    # (or 5c, if LRC overrode it, or 5c2, if the collapse guard touched it)
+    # is what populates. Refines confidence when both a source and MIR
+    # signal exist, and records a compact "check these first" queue on the
+    # run trace. Skipped for a patch: with no candidates and no MIR it would
+    # only ever touch placements with NO confidence yet (a freshly inserted
+    # chord) by inventing the neutral default 0.5 for them — exactly the
+    # kind of un-named change this path exists to refuse.
     if patched:
         report.steps["confidence"] = "skipped (patch: nothing to re-score)"
     else:

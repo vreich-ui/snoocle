@@ -301,6 +301,39 @@ new evidence. The end of the continued grid also becomes the closing anchor
 collapsing; when nothing was continued, they hold the last matched time
 exactly as before.
 
+## A generic guard against collapsed timing, independent of cause
+
+The fade-out above is one specific cause of one specific symptom: several
+consecutive lines or in-line chord placements ending up at the exact same
+`timeSeconds`. A second, unrelated cause produces the identical symptom: a
+1966 live recording too lo-fi for the chord recognizer, whose MIR chord
+timeline dies at 86.5s of a 220.6s track — lines 17-20 all end up at
+`86.51755102040816`, and nothing flagged it; the scorecard's similarity
+metrics scored the document as merely mediocre, and 39% timing coverage
+went unreported.
+
+`timing/collapse_guard.py::guard_against_collapsed_timing` is the safety
+net for the NEXT cause nobody has found yet: it runs after every
+timing-setting pass (snap, carry-forward, LRC — 5c2 in `pipeline.py`,
+before the confidence-scoring step so it judges the corrected times) and
+looks only at the final song, not at why it got that way. A run of 3+
+consecutive lines, or consecutive placements within one line, sharing an
+identical time gets spread across the open interval to the next DIFFERENT
+time found later in that sequence — onto the beat grid when there is one,
+evenly divided otherwise — while the run's own first entry (the genuine
+anchor the rest piled onto) is left untouched. When no later time exists to
+spread toward — the collapse sits at or past the last thing this song ever
+measured, the Paint It Black shape above — nothing is invented; the guard
+leaves the entries exactly as found and says so in provenance. This is a
+guard, not a fix: it never re-derives WHY the collapse happened, so a rising
+intervention rate stays visible rather than quietly disappearing behind it.
+
+The same pass reports `timing_coverage` — the fraction of track duration
+spanned by line timings — in its `timing-collapse-guard` provenance entry
+on every run that timed anything at all, whether or not a collapse fired,
+so "39% coverage" is now a number every run surfaces instead of one this
+repo had to notice by hand.
+
 ## Timing survives a re-analysis that doesn't listen
 
 `snap_chords` is the only pass that fills timing, and it is a documented

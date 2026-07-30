@@ -146,7 +146,10 @@ def mir_cache_key(
 ) -> str:
     """A hex key over every input that can change the analysis."""
     components = {
-        "v": 1,  # key-scheme version: bump to invalidate everything at once
+        # key-scheme version: bump to invalidate everything at once. v2 = beats
+        # carry `detected` (grid continued over fade-outs), so entries written
+        # before it would decode as an all-measured grid that never was.
+        "v": 2,
         "audio": audio_hash,
         "engines": engine_fingerprint(engines),
         "accuracy": accuracy,

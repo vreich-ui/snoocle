@@ -35,6 +35,8 @@ Schema v2 additions (all OPTIONAL — v1 documents keep decoding unchanged):
 - AudioInfo.videoOffsets: videoId -> seconds to ADD to every stored time when
   that specific video is the one playing.
 - AudioInfo.beats: a downbeat/beat grid, MIR-derived, for metronome/snapping.
+  BeatMark.detected distinguishes a beat heard in the audio from one the grid
+  was continued through at the established tempo (fade-outs, quiet intros).
 """
 
 from __future__ import annotations
@@ -168,6 +170,11 @@ class BeatMark(_Model):
     time: float = Field(ge=0)
     measure: int = Field(ge=1)
     beatInMeasure: int = Field(ge=1)
+    # False when the beat tracker never heard this beat: it lost lock (a
+    # fade-out, a near-silent intro) and the grid was continued at the
+    # established tempo. Defaults True so pre-existing documents — whose
+    # beats were all measured — decode unchanged.
+    detected: bool = True
 
 
 class AudioInfo(_Model):

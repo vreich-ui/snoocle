@@ -64,3 +64,12 @@ def test_snap_time_empty_grid_is_noop():
     t, ref = snap_time(1.23, [])
     assert t == 1.23
     assert ref is None
+
+
+def test_build_beat_grid_carries_the_detected_flag_through():
+    beats = [Beat(time=0.0, position=1), Beat(time=0.5, position=2)]
+    beats += [Beat(time=1.0, position=3, detected=False)]
+    grid = build_beat_grid(_mir(beats))
+    assert [b.detected for b in grid] == [True, True, False]
+    # measure/beat numbering does not care where the beat came from
+    assert [(b.measure, b.beatInMeasure) for b in grid] == [(1, 1), (1, 2), (1, 3)]

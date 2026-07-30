@@ -8,12 +8,34 @@ implementation actually ran, and that lands in the song's provenance.
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
+
+_TIME_SIGNATURE_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+DEFAULT_BEATS_PER_MEASURE = 4
+
+
+def beats_per_measure(time_signature: str | None, default: int = DEFAULT_BEATS_PER_MEASURE) -> int:
+    """Numerator of a "n/d" time signature, or `default` when absent/unparseable."""
+    if time_signature:
+        m = _TIME_SIGNATURE_RE.match(time_signature)
+        if m:
+            numerator = int(m.group(1))
+            if numerator > 0:
+                return numerator
+    return default
 
 
 class Beat(BaseModel):
     time: float  # seconds
     position: int = 0  # beat within bar (1 = downbeat); 0 = unknown
+    # False when this beat was never heard in the audio: the tracker lost lock
+    # (a fade-out, a near-silent intro) and the grid was continued at the
+    # established tempo instead — see mir.beats.extend_beat_grid. An inferred
+    # beat must never be presented as a measurement; everything downstream
+    # (the schema's BeatMark, snap.py, provenance) carries the flag through.
+    detected: bool = True
 
 
 class ChordSegment(BaseModel):
@@ -49,6 +71,15 @@ class MirAnalysis(BaseModel):
     # unknown/legacy (treat as full-track).
     analyzed_windows: list[AnalyzedWindow] = Field(default_factory=list)
 
+    @property
+    def detected_beat_count(self) -> int:
+        """Beats actually heard in the audio (as opposed to tempo-continued)."""
+        return sum(1 for b in self.beats if b.detected)
+
+    @property
+    def inferred_beat_count(self) -> int:
+        return len(self.beats) - self.detected_beat_count
+
     def to_prompt_payload(self, max_beats: int = 64) -> dict:
         """Compact JSON for the reconciliation prompt: full chord/section
         timeline, beats summarized (they matter as tempo/downbeat evidence,
@@ -63,8 +94,11 @@ class MirAnalysis(BaseModel):
             "timeSignature": self.time_signature,
             "estimatedKey": self.key,
             "beatCount": len(beats),
+            "beatsDetected": self.detected_beat_count,
+            "beatsInferred": self.inferred_beat_count,
             "beatsSampled": [
-                {"time": round(b.time, 2), "position": b.position} for b in beats[::stride]
+                {"time": round(b.time, 2), "position": b.position, "detected": b.detected}
+                for b in beats[::stride]
             ],
             "chordTimeline": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}
@@ -101,8 +135,11 @@ class MirAnalysis(BaseModel):
             "timeSignature": self.time_signature,
             "estimatedKey": self.key,
             "beatCount": len(self.beats),
+            "beatsDetected": self.detected_beat_count,
+            "beatsInferred": self.inferred_beat_count,
             "beatsSampled": [
-                {"time": round(b.time, 2), "position": b.position} for b in beats
+                {"time": round(b.time, 2), "position": b.position, "detected": b.detected}
+                for b in beats
             ],
             "chordTimeline": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}

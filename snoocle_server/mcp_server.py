@@ -257,6 +257,75 @@ async def analyze_and_store_song(
     }
 
 
+@mcp.tool()
+async def realign_song_to_recording(
+    song_id: str,
+    video_id: str,
+    source_version: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    analysis_depth: Optional[str] = None,
+    expected_version: Optional[str] = None,
+    allow_same_recording: bool = False,
+    allow_timing_loss: bool = False,
+) -> dict:
+    """Mode B — "analyze <video_id> as the timing reference for <song_id>".
+
+    Re-times an EXISTING song document to a DIFFERENT recording of the same
+    song: full MIR analysis of that video, then the document's own lyrics and
+    chord sequence re-snapped onto the new timeline. Lyrics and chord identities
+    carry over untouched; the transposition between the document's key and the
+    recording's is derived from the chord sequence and applied.
+
+    Stored as a new version of the SAME song id — this is the same song, timed
+    against different audio, and it records which video supplied the timing.
+
+    Mostly deterministic and normally free of model tokens: a model is consulted
+    ONLY when a structural comparison finds a difference the stored document
+    cannot explain (an extra chorus, a truncated outro). Use it when a version's
+    timing came out unreliable on a poor recording (see get_song's provenance for
+    a "timing-unreliable" entry, and `suggest_better_recordings` for candidates).
+
+    Refuses (and says so) when the given video turns out to be the SAME recording
+    the song is already timed against: that case wants one cross-correlation via
+    the video-offset endpoint, not a full analysis. allow_same_recording=true
+    overrides."""
+    from .realign import realign_song_async
+
+    report = await realign_song_async(
+        song_id,
+        video_id,
+        provider=provider,
+        model=model,
+        analysis_depth=analysis_depth,
+        expected_version=expected_version,
+        source_version=source_version,
+        allow_same_recording=allow_same_recording,
+        allow_timing_loss=allow_timing_loss,
+    )
+    return report.to_dict()
+
+
+@mcp.tool()
+def suggest_better_recordings(song_id: str, limit: int = 5) -> dict:
+    """Ranked alternative recordings of a song. REPORTS ONLY — never analyzes.
+
+    For a song whose timing came out unreliable because its recording is poor
+    (a lo-fi live video, a broadcast rip): a better recording is the fix, and
+    this finds candidates — official/studio audio preferred, covers and lessons
+    ranked down, the recording the song is already timed against excluded.
+
+    Nothing is downloaded or analyzed. Each suggestion carries the exact action
+    that would spend, which is `realign_song_to_recording(song_id, video_id)`:
+    that is a full analysis of a second track, so it stays an explicit choice."""
+    from .recordings import suggest_recordings
+
+    song = get_store().get(song_id)
+    return suggest_recordings(
+        song, reason="requested for this song", limit=max(1, min(limit, 10))
+    ).to_dict()
+
+
 # --- versioned store ---------------------------------------------------------
 
 

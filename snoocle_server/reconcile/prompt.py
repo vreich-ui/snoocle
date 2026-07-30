@@ -131,6 +131,7 @@ def build_user_prompt(
     evidence_manifest: dict | None = None,
     ref_index: dict[str, list[str]] | None = None,
     quality_feedback: str | None = None,
+    structure_feedback: str | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append(
@@ -244,6 +245,14 @@ def build_user_prompt(
     # retry this run allows is worth nothing if it only says "try harder".
     if quality_feedback:
         parts.append(quality_feedback)
+    # The one thing that can make Mode B (realign.py) spend model tokens: a
+    # deterministic comparison found a structural difference between the stored
+    # document and the recording it is being re-timed to. Its own channel for
+    # the same reason as above — it is a measurement, not a human instruction —
+    # and a narrow one: the words and chords are settled, only the repeats are
+    # open. See realign._structure_feedback.
+    if structure_feedback:
+        parts.append(structure_feedback)
     if time_align:
         parts.append(
             "## Time alignment (thorough analysis)\n"

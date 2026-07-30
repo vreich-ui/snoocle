@@ -626,6 +626,13 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
         # What this run reused vs recomputed (see manifest.py). Descriptive
         # only — the admin UI renders it; no client should branch on it.
         "evidenceManifest": report.evidence_manifest,
+        # Present only when this recording graded as an audio fault: better
+        # recordings to re-align to, found but NOT analyzed (see recordings.py).
+        **(
+            {"recordingSuggestions": report.recording_suggestions.to_dict()}
+            if report.recording_suggestions is not None
+            else {}
+        ),
         **_reconcile_response(report.reconcile),
     }
 
@@ -1341,6 +1348,95 @@ async def post_video_offset(song_id: str, req: VideoOffsetRequest) -> dict:
         "confidence": confidence,
         "version": saved.version,
     }
+
+
+# --- Mode B: re-align a document to a DIFFERENT recording ---------------------
+# The cross-video offset above handles the SAME recording re-uploaded with
+# different padding: one constant shift, found by cross-correlation. Two
+# different PERFORMANCES have no constant shift between them (different tempo,
+# different fills, different repeat counts), so re-timing to one of those means
+# a fresh audio analysis and a re-snap — which is what Mode B is. See
+# realign.py; it refuses (409) and points back at the endpoint above when the
+# two videos turn out to be the same recording after all.
+
+
+class RealignRequest(BaseModel):
+    videoId: str
+    # Re-align a SPECIFIC stored version rather than the latest — the operator
+    # may want the human-reviewed one as the source document.
+    sourceVersion: Optional[str] = None
+    expectedVersion: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    analysisDepth: Optional[str] = None
+    # Re-align even when the pre-check says this is the same recording (the
+    # cheap video-offset path). Deliberate, explicit spend.
+    allowSameRecording: bool = False
+    # Store even if the new recording yields less audio-derived data than the
+    # version being re-timed (see realign.py's timing guard).
+    allowTimingLoss: bool = False
+    refreshCache: bool = False
+
+
+@app.post("/v1/songs/{song_id}/realign")
+async def post_song_realign(song_id: str, req: RealignRequest) -> Any:
+    """Re-time `song_id`'s document to the recording in `videoId` (Mode B).
+
+    Stores a new version of the SAME song — the lyrics and chord sequence are
+    the ones already in the library, timed against different audio.
+    """
+    from .realign import realign_song_async
+
+    try:
+        report = await realign_song_async(
+            song_id,
+            req.videoId,
+            provider=req.provider,
+            model=req.model,
+            analysis_depth=req.analysisDepth,
+            expected_version=req.expectedVersion,
+            source_version=req.sourceVersion,
+            allow_timing_loss=req.allowTimingLoss,
+            allow_same_recording=req.allowSameRecording,
+            refresh_cache=req.refreshCache,
+        )
+    except VersionConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except PipelineStepError as e:
+        # 404 for a song that isn't there, 409 for the two "you asked for the
+        # wrong tool / this would lose data" refusals — both are conditions the
+        # caller can fix — and 502 for a step that genuinely failed.
+        status = {
+            "song_not_found": 404,
+            "same_recording_use_video_offset": 409,
+            "timing_data_loss": 409,
+        }.get(e.error_code or "", 502)
+        return _error_response(status, str(e), e.error_code)
+    return report.to_dict()
+
+
+@app.get("/v1/songs/{song_id}/recording-suggestions")
+async def get_recording_suggestions(song_id: str, limit: int = 5) -> dict:
+    """Alternative recordings of `song_id`, ranked. Reports only — never analyzes.
+
+    A GET on purpose: it changes nothing. Each suggestion carries the action
+    that WOULD spend (POST .../realign with that videoId), because a second
+    track is a download plus a full MIR pass and that is the operator's call.
+    """
+    from .recordings import suggest_recordings
+
+    try:
+        song = get_store().get(song_id)
+    except StoreError as e:
+        raise _store_error_response(e) from e
+    suggestions = await run_in_threadpool(
+        lambda: suggest_recordings(
+            song,
+            reason="requested for this song",
+            limit=max(1, min(limit, 10)),
+        )
+    )
+    return suggestions.to_dict()
 
 
 # --- YouTube acquisition cookies (in-app sign-in / manual upload) -------------

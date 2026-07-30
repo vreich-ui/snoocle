@@ -259,6 +259,16 @@ def _cache_hit(video_id: str) -> Path | None:
     return None
 
 
+def cached_audio_path(video_id: str) -> Path | None:
+    """The locally cached audio for `video_id`, or None.
+
+    Public because "is this already on disk?" decides whether an optional
+    check is free or expensive: ``realign.same_recording_check`` only runs its
+    cross-correlation when both files are already here (see that function).
+    """
+    return _cache_hit(video_id)
+
+
 def search_video(title: str, artist: str, max_results: int = 5) -> list[dict]:
     """Search YouTube for candidate videos; returns yt-dlp flat entries."""
     import yt_dlp
@@ -276,26 +286,38 @@ def search_video(title: str, artist: str, max_results: int = 5) -> list[dict]:
     return entries
 
 
+_BAD_WORDS = ("cover", "lesson", "tutorial", "karaoke", "how to play", "reaction", "drum")
+_GOOD_WORDS = ("official", "audio", "remaster", "album", "lyric")
+
+
+def score_video(entry: dict, title: str, artist: str) -> float:
+    """How plausibly this search result is a studio recording of `title`.
+
+    Public because "which recording should we use?" is asked in two places
+    now: acquisition picks the single best, and
+    :mod:`snoocle_server.recordings` ranks alternatives for an operator to
+    choose from (a song whose timing came out unreliable needs a BETTER
+    recording, and that is the same judgement).
+    """
+    t = (entry.get("title") or "").lower()
+    s = 0.0
+    if title.lower() in t:
+        s += 2.0
+    if artist.lower() in t or artist.lower() in (
+        entry.get("channel") or entry.get("uploader") or ""
+    ).lower():
+        s += 2.0
+    s += sum(0.5 for w in _GOOD_WORDS if w in t)
+    s -= sum(1.5 for w in _BAD_WORDS if w in t)
+    dur = entry.get("duration") or 0
+    if dur and not (60 <= dur <= 15 * 60):  # implausible song length
+        s -= 2.0
+    return s
+
+
 def pick_best_video(entries: list[dict], title: str, artist: str) -> dict:
     """Prefer plausible studio recordings over covers/lessons/live cuts."""
-    bad_words = ("cover", "lesson", "tutorial", "karaoke", "how to play", "reaction", "drum")
-    good_words = ("official", "audio", "remaster", "album", "lyric")
-
-    def score(e: dict) -> float:
-        t = (e.get("title") or "").lower()
-        s = 0.0
-        if title.lower() in t:
-            s += 2.0
-        if artist.lower() in t or artist.lower() in (e.get("channel") or e.get("uploader") or "").lower():
-            s += 2.0
-        s += sum(0.5 for w in good_words if w in t)
-        s -= sum(1.5 for w in bad_words if w in t)
-        dur = e.get("duration") or 0
-        if dur and not (60 <= dur <= 15 * 60):  # implausible song length
-            s -= 2.0
-        return s
-
-    return max(entries, key=score)
+    return max(entries, key=lambda e: score_video(e, title, artist))
 
 
 def download_audio(video_id: str) -> AcquiredAudio:

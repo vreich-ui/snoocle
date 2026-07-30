@@ -272,6 +272,13 @@ class Settings(BaseSettings):
     # keep the grade (still recorded, still acted on for AUDIO/SOURCE) without
     # ever paying for a second attempt.
     quality_retry_enabled: bool = True
+    # An AUDIO fault means no re-alignment or re-prompting of THIS recording can
+    # help (see quality/attribution.py), so the run searches for an alternative
+    # recording and REPORTS it — one cheap yt-dlp query, no download, no
+    # analysis. Acting on a suggestion is an explicit operator action (Mode B,
+    # see realign.py) because a second track is real spend. Set false to skip
+    # the search entirely.
+    quality_suggest_recordings: bool = True
 
     # --- pipeline reliability ---
     # Per-step wall-clock ceilings (seconds) for POST /v1/songs/analyze so no

@@ -202,12 +202,20 @@ def attribute_fault(
     *,
     thresholds: Optional[AttributionThresholds] = None,
     scores: Optional[Sequence[CandidateScore]] = None,
+    sources_expected: bool = True,
 ) -> Attribution:
     """Attribute `grade` to the model, the audio, or the sources.
 
     Pure and deterministic. `scores` may be passed in when the caller already
     computed them (the pipeline does, for the manifest) — otherwise they are
     computed here.
+
+    `sources_expected=False` says this run never gathered text sources and was
+    not supposed to (Mode B re-times a document that already exists — see
+    :mod:`snoocle_server.realign`). Without that, an empty candidate set reads
+    as "the sources failed", which would blame the wrong thing AND mask the
+    audio checks below — the ones that matter when a re-alignment lands on
+    another unusable recording.
     """
     t = thresholds or AttributionThresholds.from_settings()
 
@@ -257,10 +265,10 @@ def attribute_fault(
         "candidate_scores": resolved_scores,
     }
 
-    if not scored:
-        # No usable text evidence at all. Not the model's fault — it had
-        # nothing to reconcile from — and a retry would hand it the same
-        # nothing again.
+    if not scored and sources_expected:
+        # No usable text evidence in a run that should have had some. Not the
+        # model's fault — it had nothing to reconcile from — and a retry would
+        # hand it the same nothing again.
         return Attribution(
             fault=Fault.SOURCE,
             actionable=True,
@@ -291,6 +299,22 @@ def attribute_fault(
                 f"the MIR chord timeline spans only {coverage:.0%} of the track "
                 f"(< {t.mir_timeline_coverage:.0%}) — a lo-fi/live/broadcast source the "
                 f"analysis could not follow; a retry would fit the same partial timeline"
+            ),
+            **common,
+        )
+
+    if not scored:
+        # A run with no text sources by design (see `sources_expected`). The
+        # audio checks above still applied; the source and model comparisons
+        # below cannot, because both need something to compare the document
+        # against.
+        return Attribution(
+            fault=Fault.UNKNOWN,
+            actionable=False,
+            reason=(
+                "this run gathered no text sources by design, and the audio analysis "
+                "covers the track, so nothing here identifies what a second attempt "
+                "would do differently"
             ),
             **common,
         )

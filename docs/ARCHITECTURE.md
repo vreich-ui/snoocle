@@ -50,6 +50,13 @@ snoocle_server/
 │                    (memory.py, hermetic) backends; content-hash versions,
 │                    expected_version optimistic locking via a Firestore
 │                    transaction, append-only provenance, JSON diffs
+├── realign.py       Mode B: re-time an EXISTING document to a different
+│                    recording of the same song (fresh MIR + transposition +
+│                    re-snap; a model only when the arrangement differs).
+│                    timing/realign.py holds its deterministic core
+├── recordings.py    ranked alternative recordings for a song whose timing came
+│                    out unreliable. Reports only — analyzing one is an
+│                    explicit operator action, because it is real spend
 ├── quality/         step 5f: the deterministic grade (grader.py), fault
 │                    attribution — MODEL vs AUDIO vs SOURCE (attribution.py),
 │                    and the escalation decision with its one-retry ceiling
@@ -584,6 +591,112 @@ explicit `offsetSeconds` directly (stored at confidence 1.0, gate bypassed).
 If real-world usage shows the threshold needs retuning, re-run the
 calibration sweep described in `timing/offset.py`'s module docstring before
 changing the number.
+
+## Mode B — re-aligning a document to a different recording
+
+A song reconciled once carries the expensive part: the words and the chord
+sequence, agreed across sources and usually human-reviewed. A second recording
+of that song needs none of that repeated — it needs new TIMES, and times come
+from audio. `realign.py` is that path, and it is also the answer to the AUDIO
+verdict above: the 1966 live Paint It Black has correct lyrics and chords and a
+recording the chord recognizer cannot follow past 86.5s of 220.6s. No better
+alignment onto that audio exists. Borrowing timing from a recording the analysis
+CAN hear is the fix.
+
+`POST /v1/songs/{id}/realign {"videoId": ...}` (MCP:
+`realign_song_to_recording`) runs:
+
+1. **Same-recording pre-check** — see the sharing note below.
+2. **MIR on the new audio.** A cache miss by design (different bytes), and
+   FATAL here unlike in Mode A: the new timing is the entire deliverable, so a
+   run that cannot analyze the recording stores nothing rather than a document
+   with no times.
+3. **Transposition** (`timing/realign.py::derive_transposition`) —
+   `reconcile/match.py::score_candidate` over all twelve shifts, the same search
+   the grader uses, with the document passed in as a candidate source (which
+   works with no conversion, because `CandidateSource.lines` *is*
+   `schema.song.Line`). Below `MIN_TRANSPOSITION_SCORE` (0.5, the measured
+   coincidence floor) nothing is transposed and the run says why — moving every
+   chord on the strength of a coincidence would be pure damage. The two key
+   STRINGS are compared too and recorded when they disagree, but the chord
+   sequence wins: one key guess per recording against a whole sequence compared.
+4. **Clear the old recording's timing** (`clear_recording_timing`). The
+   load-bearing step. A placement that keeps its old time because nothing in the
+   new timeline matched it is a time from a different performance presented as
+   measured. `videoOffsets` go too — an offset is a correction relative to the
+   OLD reference. An honest empty is what the collapse guard and the grader are
+   built to read.
+5. **Structural comparison** (`compare_structure`) — the ONLY thing that can
+   spend model tokens, so the bar is a real difference: duration outside ±10%
+   (an extra chorus lengthens, a truncated outro shortens), or a gross
+   structure-segment/section count divergence. A small disagreement is expected
+   and ignored — the stored sections come from a human-named sheet, the segments
+   from SongFormer or a librosa novelty fallback. "Not comparable" is reported
+   and is explicitly NOT a difference: an unmeasurable comparison must never be
+   the reason a model gets called. A live version of a song already in the
+   library therefore normally costs **zero model tokens**, which
+   `tests/test_realign.py` asserts by installing a `reconcile` stand-in that
+   fails the test if it is called at all.
+6. **When there IS a difference**, one model call with the document as the prior
+   song, no new sources, and a narrow instruction (`structure_feedback`, its own
+   channel beside `quality_feedback` for the same reason: it is the server's own
+   measurement, not a human instruction): resolve the repeats, keep every word
+   and chord symbol, fill in no times.
+7. **The timing passes, exactly as any run gets them** — `snap_chords`, LRC
+   line alignment, the collapse guard, per-chord confidence — plus
+   `retime_sections`, which derives each section's span from the document's own
+   re-measured line times. That last one exists because nothing else puts a span
+   back on a section after step 4 emptied it: on Mode A the reconciler emits
+   section times, and a deterministic Mode B run has no reconciler.
+8. **The quality gate**, same standard as any run, with `can_retry=False` (Mode
+   B's answer to a bad grade is a different RECORDING, not another attempt at
+   this one) and `sources_expected=False` — a run that gathers no text sources
+   by design must not have an empty candidate list read as "the sources
+   failed", which would both blame the wrong thing and mask the AUDIO verdict
+   that matters here.
+9. **The audio-data guard**, then store — as a new version of the SAME song id,
+   with `audio.analyzedVideoId`/`youtubeVideoId` pointing at the recording that
+   supplied the timing and a `timing-realign` provenance entry naming the source
+   document version, the transposition, the structural verdict, and whether a
+   model was consulted.
+
+**Do Mode B and the cross-video offset above share machinery?** Mostly they
+cannot, and the reason is worth stating: `videoOffsets` corrects a CONSTANT
+lag, which exists only between two uploads of ONE recording. Two different
+performances have no constant lag — different tempo, different fills, different
+repeat counts — so no offset can align them, which is exactly why Mode B
+re-snaps against a fresh timeline instead of shifting stored times. Sharing the
+alignment logic would mean pretending one of those problems is the other.
+
+What they DO share is the boundary between them, and that is worth having:
+`realign.same_recording_check` runs `estimate_offset` first and refuses (409,
+`same_recording_use_video_offset`) when the two videos turn out to be the same
+recording, pointing at the endpoint that handles it for one cross-correlation
+instead of a download plus a full MIR pass. It runs only when both audio files
+are already in the local cache — a check that downloads the reference audio to
+decide whether to download the other one has inverted the saving it exists to
+make — and `allowSameRecording=true` overrides it. They also share
+`audio/acquire.py` and the meaning of `analyzedVideoId`: after a Mode B run,
+that field names the new reference, so a later re-upload of THAT recording gets
+a `videoOffsets` entry against it exactly as before.
+
+## Suggesting a better recording (never analyzing one)
+
+`recordings.py` closes the loop. When a run's grade comes back an AUDIO fault,
+the analyze pipeline searches for alternative recordings (one yt-dlp query, no
+download) and reports them in `recordingSuggestions` — ranked by
+`audio/acquire.py::score_video`, the same judgement acquisition uses to pick a
+video (official/audio/remaster up; cover/lesson/karaoke down; implausible
+lengths down), with the recording the song already uses excluded. Also
+available on demand: `GET /v1/songs/{id}/recording-suggestions` (MCP:
+`suggest_better_recordings`).
+
+It never analyzes. A second track is a download, a full MIR pass and possibly a
+model call, so every suggestion carries the exact action that would spend it —
+"analyze `<videoId>` as the timing reference for `<songId>`", i.e. the Mode B
+call above — and the report says `analyzed: false` in as many words. Search
+failure is reported in the result rather than raised: this hangs off a run that
+has already produced a storable document and must never be able to fail it.
 
 ## Export (master plan B6)
 

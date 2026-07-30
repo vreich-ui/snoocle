@@ -31,6 +31,11 @@ Reliability contract (POST /v1/songs/analyze):
   guard refuses to store a version that empties ``audio.beats`` or nulls
   ``metadata.bpm`` when the prior had them — whatever path got there.
   ``allow_timing_loss`` is the explicit opt-out for the rare intentional case.
+  This pipeline is also the caller that DECLARES which pass will time each
+  document (``TimingAuthority``, read off 5b's own branch conditions), so the
+  reconciler can clear the model's timing for that pass — and puts the cleared
+  fields back itself if the pass it named then skips or raises, keeping a
+  best-effort failure from becoming a fatal one.
 - **Offline mock.** ``provider="mock"`` never touches the network: discovery is
   skipped and the deterministic reconciler synthesizes a small Song, so the
   whole analyze -> persist -> fetch -> versions path runs in CI with no keys.
@@ -65,7 +70,13 @@ from .quality import Grade, QualityDecision, evaluate as evaluate_quality
 from .quality.escalation import build_retry_feedback, search_found_better
 from .quality.grader import grade_provenance_entry, timing_unreliable_provenance_entry
 from .recordings import RecordingSuggestions, suggest_recordings
-from .reconcile import ReconcileResult, provider_preflight, reconcile
+from .reconcile import (
+    ReconcileResult,
+    TimingAuthority,
+    provider_preflight,
+    reconcile,
+)
+from .reconcile.engine import TIMING_RESTORE_ACTION
 from .reconcile.match import score_candidates
 from .reconcile.depth import resolve_depth
 from .reconcile.trace import TraceRecorder, start_run
@@ -73,6 +84,7 @@ from .schema.song import ProvenanceEntry, Song, slugify_song_id
 from .scope import AnalysisScope
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
+from .store.song_notes import length_error as notes_length_error
 from .timing.carry_forward import audio_data_lost, carry_forward_timing
 from .timing.collapse_guard import guard_against_collapsed_timing
 from .timing.confidence import build_review_queue, score_song
@@ -220,6 +232,7 @@ def _step_reconcile(
     trace: TraceRecorder | None = None,
     guidance: str | None = None,
     guidance_origin: str | None = None,
+    guidance_withheld: str | None = None,
     prior_song: dict | None = None,
     depth=None,
     scope: AnalysisScope | None = None,
@@ -227,6 +240,7 @@ def _step_reconcile(
     mir_cache: MirCacheInfo | None = None,
     patch_ops_eligible: bool = False,
     quality_feedback: str | None = None,
+    timing_authority: TimingAuthority = TimingAuthority.NONE,
 ) -> ReconcileResult:
     return reconcile(
         title,
@@ -242,6 +256,7 @@ def _step_reconcile(
         trace=trace,
         guidance=guidance,
         guidance_origin=guidance_origin,
+        guidance_withheld=guidance_withheld,
         prior_song=prior_song,
         depth=depth,
         scope=scope,
@@ -249,6 +264,7 @@ def _step_reconcile(
         mir_cache=mir_cache,
         patch_ops_eligible=patch_ops_eligible,
         quality_feedback=quality_feedback,
+        timing_authority=timing_authority,
     )
 
 
@@ -337,6 +353,29 @@ async def run_pipeline_async(
     if problem:
         raise PipelineStepError("reconcile", problem, error_code="provider_not_configured")
 
+    # `guidance` becomes this song's stored CORRECTION (`_resolve_guidance`), so
+    # it is a notes write and is bounded by the same per-slot ceiling as a
+    # preference write. Checked HERE, at the pipeline's door, for two reasons:
+    #
+    # - it must be a request-validation rejection, not a store-level raise. The
+    #   store write happens inside `_resolve_guidance`'s deliberately
+    #   best-effort try/except (a notes-store outage may never fail an
+    #   analysis), so a `ValueError` from `set_correction` would be caught there
+    #   and the run would proceed on the over-cap text — enforcement that
+    #   enforces nothing.
+    # - it must be EARLY. `_resolve_guidance` runs after identity resolution,
+    #   which can be a model call, and a guided analyze that fails only after
+    #   paying for work is worse than one that never started. Nothing above this
+    #   line costs anything.
+    #
+    # The REST and MCP surfaces reject the same text with the same message
+    # before they ever get here (api.post_songs_analyze,
+    # mcp_server.analyze_and_store_song); this is the backstop that keeps a
+    # direct `run_pipeline_async` caller from smuggling one past them.
+    guidance_problem = notes_length_error(guidance)
+    if guidance_problem:
+        raise ValueError(guidance_problem)
+
     # 0. resolve identity: title+artist may be omitted when a media URL is
     # given — derive them from the media's own metadata (no download). FATAL:
     # without an identity there is nothing to analyze or store, and the id it
@@ -378,7 +417,24 @@ async def run_pipeline_async(
     # the API layer: when the caller gave only a media URL, the song id is not
     # known until the identity step above has run, and notes keyed by any other
     # id would silently never replay.
-    guidance, guidance_origin = _resolve_guidance(song_id, guidance)
+    #
+    # `resolved` reports each note lifetime SEPARATELY as well as combined
+    # (:class:`ResolvedGuidance`). `pending_correction` is the raw, unlabeled
+    # correction text (if any) this run's guidance is standing in for —
+    # distinct from `guidance` itself, which may be a preference+correction
+    # combination (see song_notes.combine_guidance). Two readers below need it
+    # un-combined: the single-shot consumption call after storing, which must
+    # compare-and-set against the correction's OWN stored text, and scope
+    # inference, which must route on what the caller said about THIS run and
+    # nothing replayed. `resolved.preference` has a third reader: the notes
+    # STEP, which states which halves were in force and may not infer that by
+    # comparing strings.
+    resolved = _resolve_guidance(song_id, guidance)
+    guidance, guidance_origin = resolved.text, resolved.origin
+    pending_correction = resolved.correction
+    # Recorded here so the step keeps its place in the report's order, then
+    # REWRITTEN once the scope is settled below — what the model is actually
+    # shown is not decided until then (see `model_guidance`).
     if guidance:
         report.steps["notes"] = f"ok: guidance applied (from {guidance_origin})"
 
@@ -413,17 +469,61 @@ async def run_pipeline_async(
     # first-time analysis. `patch_eligible` is independent of how notes-only
     # was reached (inferred here, or given explicitly) — see reconcile.engine
     # for where it actually decides patch vs full notes-only reconcile.
+    #
+    # Guidance may only ROUTE a run when the caller attached it to THIS request.
+    # A note replayed from the store says nothing about what this run is for, and
+    # a request that sent no guidance at all must get the pipeline it asked for:
+    # inferring notes-only from a replayed note is how a full analysis silently
+    # became a re-application of a previous request's correction. Replayed
+    # guidance is still classified when an EXPLICIT notes-only scope makes
+    # `patch_eligible` readable below.
+    #
+    # A classification is computed ONLY where one of its two readers exists,
+    # because its fallback tier is a real blocking `provider.complete` (see
+    # correction_routing._llm_classify) and a run must not pay for an answer
+    # nothing looks at. Both readers need `scope is None or scope.notes_only`:
+    # inference is gated on `scope is None`, and `patch_ops_eligible` is gated
+    # on `scope.notes_only`. Under an EXPLICIT non-notes-only scope neither can
+    # fire, so an open-ended correction there (no deterministic rule matches,
+    # straight to the model tier) bought one extra synchronous model call per
+    # request for a result that was discarded.
+    #
+    # The same rule has to hold WITHIN one string, which is why routing reads
+    # `request_correction` and never `guidance`: `guidance` may be a standing
+    # preference combined with this request's correction, and
+    # `correction_routing._deterministic_signals` scans whatever text it is
+    # handed, so classifying the combination lets a preference's words route
+    # the run. A preference saying "the bridge is Bm, not D" would then send
+    # "double-check this against better sources" down the notes-only path —
+    # no discovery, no listening, a re-application of the document the caller
+    # asked to have re-verified — and, because a preference never expires, on
+    # every guided analyze from then on. Store content is not caller intent no
+    # matter which half of a string it arrives in.
     classification = None
     scope_was_inferred = False
-    if guidance and (stored_prior is not None or request_prior is not None):
-        classification = classify_correction(guidance)
-        if scope is None and classification.is_targeted_correction:
-            scope = AnalysisScope(listen=False, reconcile=False)
-            scope_was_inferred = True
-            log.info(
-                "pipeline.scope inferred notes-only for %s: %s",
-                song_id, classification.describe(),
-            )
+    guidance_from_this_request = guidance_origin == "this request"
+    # THIS request's own correction text, unlabeled and with nothing replayed
+    # combined in — the only text that expresses intent about this run.
+    request_correction = pending_correction if guidance_from_this_request else None
+    # What a notes-only run acts on, and (below) all it is shown: the correction
+    # alone when there is one, otherwise whatever replayed (a preference by
+    # itself, which is then the only instruction such a run has).
+    targeted_guidance = pending_correction or guidance
+    if stored_prior is not None or request_prior is not None:
+        if request_correction and (scope is None or scope.notes_only):
+            classification = classify_correction(request_correction)
+            if scope is None and classification.is_targeted_correction:
+                scope = AnalysisScope(listen=False, reconcile=False)
+                scope_was_inferred = True
+                log.info(
+                    "pipeline.scope inferred notes-only for %s: %s",
+                    song_id, classification.describe(),
+                )
+        elif scope is not None and scope.notes_only and targeted_guidance:
+            # Nothing to route (the caller already did), but patch eligibility
+            # is still read below — and it is read about the text this run
+            # applies, which is the same text the model sees.
+            classification = classify_correction(targeted_guidance)
 
     # Scope constrains ONLY when it is present (explicit OR just inferred
     # above). `None` means no opinion was ever formed, and gets exactly the
@@ -438,6 +538,52 @@ async def run_pipeline_async(
         report.steps["scope"] = scope.describe() + (
             f" (inferred: {classification.describe()})" if scope_was_inferred else ""
         )
+
+    # WHAT THE MODEL SEES, which is not always all of what is in force.
+    #
+    # A notes-only run is handed one contract, in the prompt and in the agent
+    # payload both: "return this document with these notes applied and nothing
+    # else changed" (reconcile/prompt.py, reconcile/anthropic_agent.py). A
+    # standing preference is not part of that ask — it is an instruction about
+    # how to BUILD this song, open-ended by nature ("capo-free voicings
+    # please"), and a run whose whole job is one chord has neither the licence
+    # to act on it nor, having gathered nothing, the evidence to. Handing it
+    # over anyway asks the model to do two contradictory things at once, and
+    # the patch path (a closed op set naming exact edits) has no way to express
+    # it at all. So on a notes-only run the model sees the CORRECTION alone.
+    #
+    # Two things this deliberately is not:
+    #   - not a regression: before the preference/correction split a preference
+    #     only ever entered runs that supplied no guidance of their own, so a
+    #     targeted correction never carried one. This restores that, it does
+    #     not narrow it.
+    #   - not "notes-only drops the preference": when a notes-only run has NO
+    #     correction (an explicit `scope` plus a stored preference), the
+    #     preference is the only instruction the run has and it stands alone,
+    #     exactly as it always did — `targeted_guidance` falls back to it.
+    #
+    # A FULL run still sees both. There the preference is squarely in scope:
+    # the document is being rebuilt from evidence, which is the moment a
+    # standing instruction about how to build it applies.
+    notes_only_run = scope is not None and scope.notes_only
+    model_guidance = targeted_guidance if notes_only_run else guidance
+    # The two halves are read from what `_resolve_guidance` says was IN FORCE,
+    # never recovered by comparing `model_guidance`/`guidance`/
+    # `pending_correction` against each other. String equality cannot tell "a
+    # preference was combined in" from "there was no preference and the one
+    # correction came back unchanged", and asserting the first when the second
+    # is true puts a standing instruction into a report for a song that has
+    # never had one.
+    both_in_force = bool(resolved.preference and resolved.correction)
+    withheld_preference = resolved.preference if (both_in_force and notes_only_run) else None
+    if guidance:
+        if withheld_preference:
+            detail = " (correction only; standing preference held back on a notes-only run)"
+        elif both_in_force:
+            detail = " (preference + correction combined)"
+        else:
+            detail = ""
+        report.steps["notes"] = f"ok: guidance applied (from {guidance_origin}){detail}"
 
     # A notes-only run needs SOMETHING to correct even when the caller didn't
     # attach one: the request's own priorSong wins when given (it's the exact
@@ -546,11 +692,34 @@ async def run_pipeline_async(
         discovery_cache=report.discovery_cache,
         prior_song=effective_prior_song,
         scope=scope,
-        guidance=guidance,
+        # `model_guidance`, not `guidance`: the manifest describes what this run
+        # HANDS the reconciler, and it is itself part of the agent payload — a
+        # manifest quoting guidance the run withheld would both misdescribe the
+        # run and smuggle the withheld half to the model through the back door.
+        guidance=model_guidance,
         guidance_origin=guidance_origin,
     )
     recorder = start_run(song_id, resolved_provider, depth.name)
     report.run_id = recorder.trace.run_id
+
+    # A withheld preference is a DECISION, and it has to outlive the HTTP
+    # response. `report.steps` is returned to the caller and then thrown away —
+    # nothing persists it — so on its own it said "a standing instruction was in
+    # force and this run deliberately did not apply it" to exactly one reader,
+    # once. reconcile/engine.py states the opposing rule for the applied case
+    # ("Guidance is never applied silently: a reader of the song's history must
+    # be able to see that a human instruction shaped this run"), and guidance
+    # deliberately NOT applied is the same claim about the same run. So it goes
+    # in both durable places: this run's persisted trace, and (via
+    # `guidance_withheld` below) the reconciled provenance entry that already
+    # names the guidance origin.
+    if withheld_preference:
+        recorder.step(
+            "inputs",
+            "notes:preference-withheld",
+            "standing preference held back: a notes-only run is shown the correction alone",
+            detail={"preference": withheld_preference, "correction": pending_correction},
+        )
 
     # What the quality gate (5f) has already spent. Threaded into
     # `plan_escalation`, which is what makes the one-retry ceiling structural
@@ -558,6 +727,35 @@ async def run_pipeline_async(
     # escalation cannot be planned. See quality/escalation.py.
     quality_retries_spent = 0
     quality_searches_spent = 0
+
+    # WHICH deterministic pass will time this run's document. The reconciler is
+    # TOLD this (reconcile/engine.py's TimingAuthority) instead of inferring it
+    # from "was a MIR handed in?", because a MIR in the inputs says nothing
+    # about whether anything is going to run afterwards.
+    #
+    # Read straight off 5b's own branch conditions below, and it has to stay
+    # that way — any drift means the reconciler clears fields for a pass that
+    # doesn't run:
+    #
+    #   `not want_listen and timing_prior is not None`  -> the carry-forward
+    #     branch, verbatim. The `timing_prior is not None` half is load-bearing:
+    #     `listen=off` with no prior and `allowTimingLoss=true` (the combination
+    #     the guard above tells callers to use) falls through to the else-branch,
+    #     where it has no MIR either — so nothing times that document and nothing
+    #     may be stripped from it.
+    #   `report.mir is not None`  -> the else-branch with something to snap to.
+    #     `snap_chords` is a documented no-op without a MIR (timing/snap.py:250),
+    #     so a MIR-less run through that branch is NONE, not SNAP.
+    #
+    # The patch path deliberately has no entry here: only the engine knows a
+    # patch happened, and it never strips — which matches 5b's `patched -> skip
+    # entirely`.
+    if not want_listen and timing_prior is not None:
+        timing_authority = TimingAuthority.CARRY_FORWARD
+    elif report.mir is not None:
+        timing_authority = TimingAuthority.SNAP
+    else:
+        timing_authority = TimingAuthority.NONE
 
     # Steps 5-5d run as ONE unit because the quality gate (5f) may run them a
     # SECOND time: a reconciliation and every deterministic pass that reads
@@ -582,7 +780,8 @@ async def run_pipeline_async(
                 lambda: _step_reconcile(
                     title, artist, song_id, report.candidates, report.mir,
                     provider, model, attach_audio, report.audio,
-                    trace=recorder, guidance=guidance, guidance_origin=guidance_origin,
+                    trace=recorder, guidance=model_guidance, guidance_origin=guidance_origin,
+                    guidance_withheld=withheld_preference,
                     prior_song=effective_prior_song, depth=depth, scope=scope,
                     evidence_manifest=report.evidence_manifest,
                     mir_cache=report.mir_cache,
@@ -592,6 +791,7 @@ async def run_pipeline_async(
                         else False
                     ),
                     quality_feedback=quality_feedback,
+                    timing_authority=timing_authority,
                 ),
                 settings.reconcile_timeout_seconds,
             )
@@ -663,6 +863,13 @@ async def run_pipeline_async(
         #     a failure here must never block storing an otherwise-good song; the
         #     pipeline continues with whatever timing the reconciler produced,
         #     which today is none). A no-op when MIR didn't run.
+        #
+        # These conditions are also what `timing_authority` above was derived
+        # from, and the two must not drift: the reconciler cleared the model's
+        # timing on the strength of that declaration. Where a branch can end
+        # without the declared pass having written anything, this block puts back
+        # what was cleared (`TimingStrip.restore`) rather than leaving a
+        # best-effort failure to be re-reported as a fatal loss by 5e.
         carried_forward = False
         if patched:
             report.steps["timing"] = (
@@ -687,6 +894,32 @@ async def run_pipeline_async(
                 ) from e
             carried_forward = True
             report.steps["timing"] = f"ok: {carry_stats.describe()}"
+            # What the strip COST, reported rather than left for the grade to
+            # imply. The reconciler's own times are gone (the model is not the
+            # authority on timing — reconcile/engine.py), a line it added or
+            # reworded has no partner in the prior version to carry from, and
+            # LRC is skipped on this path (5c below), so these elements reach
+            # the store with no time at all. That is the right answer — "could
+            # not time this region" beats fabricated spacing, see
+            # quality/escalation.py — but the operator has to be able to read it
+            # here instead of discovering it as a timingCoverage drop.
+            if carry_stats.lines_empty or carry_stats.placements_empty:
+                untimed = (
+                    f"{carry_stats.lines_empty} line(s) and "
+                    f"{carry_stats.placements_empty} placement(s) left untimed "
+                    f"(no match in the prior version, and nothing else times "
+                    f"them on this path)"
+                )
+                report.steps["timing"] += f"; {untimed}"
+                recorder.step(
+                    "timing", "left-untimed", untimed,
+                    detail={
+                        "linesUntimed": carry_stats.lines_empty,
+                        "placementsUntimed": carry_stats.placements_empty,
+                        "linesTotal": carry_stats.lines_total,
+                        "placementsTotal": carry_stats.placements_total,
+                    },
+                )
         else:
             try:
                 timed_song = snap_chords(result.song, report.mir)
@@ -703,6 +936,32 @@ async def run_pipeline_async(
             except Exception as e:  # noqa: BLE001 — best-effort, never fatal
                 report.steps["timing"] = f"failed: {e}"
                 log.warning("pipeline.step error step=timing err=%s", e)
+                # This pass is documented non-fatal, and it must stay that way.
+                # The reconciler cleared audio.beats/metadata.bpm/audio.syncMap
+                # on the promise that THIS call would rewrite them; it raised, so
+                # the promise is void and the strip is undone here — otherwise a
+                # best-effort failure would empty fields the prior version had
+                # and trip the FATAL pre-store guard (5e) instead.
+                if result.timing_strip is not None:
+                    try:
+                        result.song, restored = result.timing_strip.restore(
+                            result.song, reason=f"timing.snap failed: {e}"
+                        )
+                    except Exception as undo_error:  # noqa: BLE001 — same promise
+                        log.warning(
+                            "pipeline.step error step=timing-restore err=%s", undo_error
+                        )
+                        restored = []
+                    if restored:
+                        report.steps["timing"] += (
+                            f"; restored {', '.join(restored)} the failed pass owed"
+                        )
+                        recorder.step(
+                            "timing", TIMING_RESTORE_ACTION,
+                            f"timing.snap failed, so the fields stripped for it were "
+                            f"put back as the model supplied them: {', '.join(restored)}",
+                            detail={"restored": restored, "reason": str(e)[:500]},
+                        )
 
         # 5c. LRCLIB synced-lyrics overlay (best-effort, network-dependent). LRC
         # is better LINE-timing evidence than MIR chord matching, so when it
@@ -911,26 +1170,45 @@ async def run_pipeline_async(
                     "recommended: re-analyze at full accuracy — " + escalation.reason
                 )
             if escalation.mark_timing_unreliable:
-                entries.append(timing_unreliable_provenance_entry(attribution))
-                report.steps["timing-reliability"] = "marked unreliable (audio fault)"
-                # This recording cannot be timed reliably, so the fix is a
-                # different recording (Mode B, realign.py). Look for one and
-                # REPORT it: one search, no download, no analysis. Skipped for
-                # the mock provider, which is the fully-offline path and must
-                # make zero external calls of any kind.
-                if settings.quality_suggest_recordings and resolved_provider != "mock":
-                    report.recording_suggestions = await run_in_threadpool(
-                        lambda: suggest_recordings(
-                            result.song,
-                            reason=(
-                                f"{song_id!r} graded as an audio fault on its current "
-                                f"recording: {attribution.reason}"
-                            ),
-                        )
+                # The marker states the escalation's OWN reason: two different
+                # situations write it (an unusable recording, or a collapse run
+                # the guard could not spread) and the fault attribution only
+                # describes the first. See `timing_unreliable_provenance_entry`.
+                entries.append(
+                    timing_unreliable_provenance_entry(
+                        attribution, reason=escalation.reason
                     )
-                    report.steps["recording-suggestions"] = (
-                        report.recording_suggestions.describe()
+                )
+                report.steps["timing-reliability"] = (
+                    f"marked unreliable ({escalation.mark_cause})"
+                    if escalation.mark_cause
+                    else "marked unreliable"
+                )
+            # Separate from the marker above, and gated on its own flag: only an
+            # unusable RECORDING is fixed by a different recording. A surviving
+            # collapse run marks the timing unreliable too, and searching for
+            # another recording of the same song would spend a network call on a
+            # region no recording this run had could time (see
+            # quality/escalation.py). One search, no download, no analysis, and
+            # skipped for the mock provider, which is the fully-offline path and
+            # must make zero external calls of any kind.
+            if (
+                escalation.suggest_alternative_recording
+                and settings.quality_suggest_recordings
+                and resolved_provider != "mock"
+            ):
+                report.recording_suggestions = await run_in_threadpool(
+                    lambda: suggest_recordings(
+                        result.song,
+                        reason=(
+                            f"{song_id!r} graded as an audio fault on its current "
+                            f"recording: {attribution.reason}"
+                        ),
                     )
+                )
+                report.steps["recording-suggestions"] = (
+                    report.recording_suggestions.describe()
+                )
             result.song = result.song.model_copy(
                 update={"provenance": list(result.song.provenance) + entries}
             )
@@ -1004,6 +1282,19 @@ async def run_pipeline_async(
     report.stored_version = saved.version
     report.stored_timestamp = saved.timestamp
     report.steps["store"] = f"ok: version {saved.version}"
+
+    # The guidance this run applied is now IN a stored version, so a pending
+    # correction has done its job exactly once. Deliberately AFTER the store:
+    # a run that dies earlier leaves the note unconsumed and it replays into the
+    # retry, which is the reason _resolve_guidance persists it up front.
+    #
+    # `pending_correction`, NOT `guidance`: `guidance` may be a preference
+    # combined with the correction (see song_notes.combine_guidance), and the
+    # store's compare-and-set stamps a correction by matching its OWN stored
+    # text exactly — comparing the combined string would never match, and a
+    # correction that can never be marked applied would replay forever.
+    if pending_correction:
+        _consume_applied_correction(song_id, pending_correction, saved.version)
     return report
 
 
@@ -1080,31 +1371,143 @@ async def _quality_targeted_search(
     return build_retry_feedback(grade, attribution)
 
 
-def _resolve_guidance(song_id: str, guidance: str | None) -> tuple[str | None, str | None]:
-    """Decide this run's reconciler guidance and where it came from.
+@dataclass(frozen=True)
+class ResolvedGuidance:
+    """What was actually in force for one run, half by half.
+
+    Each half is reported SEPARATELY rather than left to be recovered by
+    comparing ``text`` against ``correction``: a report line that says "a
+    standing preference was combined in" or "a standing preference was held
+    back" is a claim about the store's state, and reconstructing it from string
+    equality made it claim a preference existed on a song that had never had
+    one.
+    """
+
+    #: Everything in force, as one string — a bare half, or both combined
+    #: (``song_notes.combine_guidance``). Not necessarily what the model is
+    #: shown; the caller decides that once the scope is settled
+    #: (:func:`run_pipeline_async`'s ``model_guidance``).
+    text: str | None
+    #: ``"this request"`` | ``"stored notes"`` | ``None``.
+    origin: str | None
+    #: The standing preference in force, or ``None`` when the song has none
+    #: (or the store could not be read).
+    preference: str | None
+    #: The pending correction's OWN unlabeled text, or ``None``.
+    correction: str | None
+
+
+def _resolve_guidance(song_id: str, guidance: str | None) -> ResolvedGuidance:
+    """Decide this run's reconciler guidance, where it came from, and which of
+    the song's two note lifetimes were actually in force.
+
+    ``text`` is everything in force for this run, and may be a durable
+    PREFERENCE and a pending CORRECTION combined into one string (see
+    ``song_notes.combine_guidance`` for the combination rule and why both being
+    in force is legitimate).
+
+    ``correction`` is that correction's OWN unlabeled text with nothing
+    combined in, and has TWO readers that both need it un-combined:
+
+    - :func:`_consume_applied_correction`, because the store stamps a
+      correction by matching its stored text exactly and a combined string
+      would never match it; and
+    - scope inference, because a preference's words are not a statement about
+      what THIS run is for. Classifying the combined string is what let a
+      standing "the bridge is Bm, not D" route an open-ended re-verification
+      request to the notes-only path.
 
     Request guidance wins and is persisted as the song's notes BEFORE any
     expensive step runs — a user's typed instruction must survive a run that
     dies at acquire or reconcile, otherwise a flaky analysis silently eats it.
-    With no request guidance, stored notes replay. Store trouble degrades to
-    "no guidance": notes are an assist, never a reason to fail an analysis.
+    It is persisted as a single-shot CORRECTION: it replays into a retry that
+    supplies none (the whole reason for storing it early) and stops replaying
+    once :func:`_consume_applied_correction` records the version it landed in.
+    Persisting it never disturbs a standing preference already on file — they
+    live in independent fields of the same record — so it is combined with
+    one, if present, for THIS run's guidance.
+
+    With no request guidance, a stored note replays via
+    ``song_notes.replay_guidance``: a durable preference always does, a
+    pending correction only until it has been applied, and both combine when
+    both are in force. Store trouble degrades to "no guidance": notes are an
+    assist, never a reason to fail an analysis. ``preference`` is ``None`` on
+    that degraded path too — not "unknown": no preference was in force for this
+    run, because none could be read, and the report must not claim one.
+
+    ``guidance`` is assumed already length-checked by the caller
+    (:func:`run_pipeline_async`, before anything expensive) — see
+    ``song_notes.MAX_NOTES_CHARS``.
     """
-    from .store.song_notes import get_song_notes_store
+    from .store.song_notes import (
+        combine_guidance,
+        get_song_notes_store,
+        preference_text,
+        replay_guidance,
+    )
 
     text = (guidance or "").strip()
     try:
         store = get_song_notes_store()
         if text:
-            store.set(song_id, text)
-            return text, "this request"
-        stored = (store.get(song_id) or "").strip()
-        if stored:
-            return stored, "stored notes"
+            # Read the standing preference BEFORE writing the correction (the
+            # write never touches it anyway — independent fields — but this
+            # keeps the two calls in the obvious order): a fresh correction
+            # from this request still combines with whatever preference is
+            # already on file, exactly as a replayed one would.
+            preference = preference_text(store.get_record(song_id))
+            store.set_correction(song_id, text)
+            return ResolvedGuidance(
+                text=combine_guidance(preference, text),
+                origin="this request",
+                preference=preference,
+                correction=text,
+            )
+        record = store.get_record(song_id)
+        combined, pending_correction = replay_guidance(record)
+        if combined:
+            return ResolvedGuidance(
+                text=combined,
+                origin="stored notes",
+                preference=preference_text(record),
+                correction=pending_correction,
+            )
     except Exception as e:  # noqa: BLE001 — best-effort, never fatal
         log.warning("song notes unavailable for %s (continuing): %s", song_id, e)
-        if text:
-            return text, "this request"
-    return (text or None), ("this request" if text else None)
+    return ResolvedGuidance(
+        text=(text or None),
+        origin=("this request" if text else None),
+        preference=None,
+        correction=(text or None),
+    )
+
+
+def _consume_applied_correction(song_id: str, correction_notes: str, version: str) -> None:
+    """Record that the song's PENDING CORRECTION landed in ``version``.
+
+    This is what makes a correction single-shot. It is in the document the next
+    run starts from now, so replaying it into a run that asked for nothing would
+    silently re-apply a previous request's instruction — and (before the origin
+    check at the scope-inference step) reclassify that run as notes-only.
+
+    ``correction_notes`` must be the correction's OWN raw text — never a
+    preference, and never the preference+correction combination
+    ``_resolve_guidance`` may have handed the reconciler — because the store
+    stamps a correction by matching its stored text exactly; a combined
+    string would never match and the correction would replay forever instead
+    of ever being marked applied.
+
+    A no-op when there is no pending correction (a durable preference alone
+    is never consumed) or when the caller replaced it mid-run. Best-effort:
+    the run has already stored, and a failed bookkeeping write must not turn
+    a successful analysis into an error.
+    """
+    from .store.song_notes import get_song_notes_store
+
+    try:
+        get_song_notes_store().mark_applied(song_id, correction_notes, version)
+    except Exception as e:  # noqa: BLE001 — never fatal
+        log.warning("could not mark notes applied for %s (continuing): %s", song_id, e)
 
 
 def _load_stored_song(

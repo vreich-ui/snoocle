@@ -219,13 +219,22 @@ def attribute_fault(
     """
     t = thresholds or AttributionThresholds.from_settings()
 
-    if grade.verdict in ("pass", "warn"):
+    if grade.verdict == "pass":
         return Attribution(
             fault=Fault.NONE,
             actionable=False,
-            reason=f"the grade is {grade.verdict}; nothing to attribute",
+            reason="the grade is pass; nothing to attribute",
             document_mir_agreement=grade.value("chordMatchRatio"),
         )
+    # `warn` is deliberately NOT short-circuited here. A `warn` grade still
+    # carries at least one failing metric (see `grade_song`) — it only means
+    # nothing HARD-gated tripped and the weighted overall held. That failing
+    # metric deserves a real, named fault (MODEL/AUDIO/SOURCE/UNKNOWN) from
+    # the same comparison logic a `fail` gets, not a blanket NONE that reads
+    # as "nothing is wrong" when something measurably is. Whatever this finds
+    # falls through to `quality.escalation`, which only acts on
+    # `grade.verdict == "fail"` — so a `warn`'s fault is recorded honestly
+    # without ever spending a retry or a search on it.
     if grade.verdict == "unknown":
         return Attribution(
             fault=Fault.UNKNOWN,
@@ -244,7 +253,7 @@ def attribute_fault(
             actionable=False,
             reason=(
                 "no audio analysis in this run, so the document cannot be compared "
-                "against the recording — nothing to attribute a failing grade to"
+                "against the recording — nothing to attribute this grade to"
             ),
             document_mir_agreement=doc_vs_mir,
         )
@@ -349,9 +358,9 @@ def attribute_fault(
         fault=Fault.UNKNOWN,
         actionable=False,
         reason=(
-            "the grade is failing but sources, audio and document all agree with each "
-            "other as well as they ever do — no retry, since nothing identifies what "
-            "a second attempt would do differently"
+            "this grade has failing metrics but sources, audio and document all agree "
+            "with each other as well as they ever do — no retry, since nothing "
+            "identifies what a second attempt would do differently"
         ),
         **common,
     )

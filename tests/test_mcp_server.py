@@ -34,6 +34,10 @@ EXPECTED_TOOLS = {
     "list_song_versions",
     "diff_song_versions",
     "save_song",
+    # per-song reconciliation notes (the guidance an analyze replays)
+    "get_song_notes",
+    "set_song_notes",
+    "clear_song_notes",
     "convert_audio",
     "trim_audio",
     "normalize_audio",

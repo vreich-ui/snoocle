@@ -45,6 +45,95 @@ def _tool_use(tool_id: str, name: str, tool_input: dict):
     return types.SimpleNamespace(type="tool_use", id=tool_id, name=name, input=tool_input)
 
 
+def _server_tool_use(tool_id: str, name: str = "web_search", block_type: str = "server_tool_use"):
+    """A tool use the API runs itself (ids prefixed `srvtoolu_`).
+
+    web_search / web_fetch execute in an API-managed code-execution container,
+    so a turn can also carry that container's own blocks — block types with
+    `code_execution` in them, e.g. `text_editor_code_execution`. Only the API
+    can emit the matching `*_tool_result`, which is why an open one has to be
+    dropped rather than answered.
+    """
+    return types.SimpleNamespace(type=block_type, id=tool_id, name=name, input={})
+
+
+def _server_tool_result(tool_use_id: str, block_type: str = "web_search_tool_result"):
+    """The API's own result for a server tool use. The loop treats these as
+    arriving INLINE in an assistant turn — the same turn, or the turn that
+    resumes a paused one."""
+    return types.SimpleNamespace(type=block_type, tool_use_id=tool_use_id, content=[])
+
+
+def _field(block, key: str, default=None):
+    """Blocks are SimpleNamespace when scripted and dicts when the provider
+    wrote them; read either shape."""
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _unpaired_tool_use_ids(messages: list) -> list:
+    """Tool-use ids in an outgoing request that no `*_tool_result` answers.
+
+    The API rejects the WHOLE request in that case — the live 400 was
+    "text_editor_code_execution tool use with id srvtoolu_... was found without
+    a corresponding text_editor_code_execution_tool_result block". A SERVER tool
+    use in the TRAILING assistant message is exempt: that is the pause_turn
+    shape, where re-sending the still-pending block is how the work resumes.
+    """
+    answered: set = set()
+    uses: list = []
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        trailing_assistant = i == len(messages) - 1 and message.get("role") == "assistant"
+        for block in content:
+            btype = str(_field(block, "type", ""))
+            if btype == "tool_result" or btype.endswith("_tool_result"):
+                answered.add(_field(block, "tool_use_id"))
+            elif btype == "tool_use":
+                uses.append(_field(block, "id"))
+            elif btype == "server_tool_use" or "code_execution" in btype:
+                if not trailing_assistant:
+                    uses.append(_field(block, "id"))
+    return [tool_use_id for tool_use_id in uses if tool_use_id not in answered]
+
+
+def _orphaned_tool_result_ids(messages: list) -> list:
+    """`*_tool_result` blocks in an outgoing request that answer no tool use.
+
+    The other direction of the same break, and the API rejects it too. Dropping
+    an unpairable server tool use from a NON-trailing assistant turn is what can
+    create one: the client `tool_use` that followed it goes with it, and the
+    `tool_result` in a later message that answered THAT use is left naming
+    nothing.
+    """
+    uses: set = set()
+    orphans: list = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        for block in content:
+            btype = str(_field(block, "type", ""))
+            if btype == "tool_result" or btype.endswith("_tool_result"):
+                if _field(block, "tool_use_id") not in uses:
+                    orphans.append(_field(block, "tool_use_id"))
+            elif btype == "tool_use" or btype == "server_tool_use" or "code_execution" in btype:
+                uses.add(_field(block, "id"))
+    return orphans
+
+
+def _assert_pairable(messages: list) -> None:
+    """Both directions of the tool-use/tool_result pairing, asserted on an
+    outgoing request. Either break is a 400 that kills the whole run."""
+    unpaired = _unpaired_tool_use_ids(messages)
+    assert not unpaired, f"outgoing request carries unpaired tool-use id(s): {unpaired}"
+    orphaned = _orphaned_tool_result_ids(messages)
+    assert not orphaned, f"outgoing request carries orphaned tool_result id(s): {orphaned}"
+
+
 def _response(stop_reason: str, content: list, in_tok: int = 100, out_tok: int = 40,
               container_id: str | None = None):
     return types.SimpleNamespace(
@@ -71,7 +160,12 @@ class _FakeClient:
         self.messages = self  # so client.messages.create(...) resolves here
 
     def create(self, **kwargs):
-        self._captured.setdefault("calls", []).append(list(kwargs.get("messages") or []))
+        messages = list(kwargs.get("messages") or [])
+        # Invariant on EVERY request, in every scenario: the API 400s on an
+        # assistant turn whose tool use nothing answers — and on a tool_result
+        # that answers no tool use — so no scripted flow may ever produce one.
+        _assert_pairable(messages)
+        self._captured.setdefault("calls", []).append(messages)
         self._captured["last_kwargs"] = kwargs
         if not self._queue:
             raise AssertionError("fake Anthropic client ran out of scripted responses")
@@ -276,6 +370,7 @@ class _AlwaysToolUse:
         self.messages = self
 
     def create(self, **kwargs):
+        _assert_pairable(list(kwargs.get("messages") or []))
         # never emits a final answer — always asks for another tool call
         return _response(
             "tool_use",
@@ -440,6 +535,321 @@ def test_notes_only_sends_no_tools_key_at_all(monkeypatch):
     )
     call = _create_kwargs(captured)[0]
     assert "tools" not in call
+
+
+# --- a turn the API cut short must not be carried open -------------------------
+#
+# stop_reason "max_tokens" ends a turn MID-generation: the model may already have
+# emitted a tool-use block whose result will never exist. Committing that turn to
+# history and then appending the engine's repair prompt after it produced a live
+# 400 — "text_editor_code_execution tool use with id srvtoolu_... was found
+# without a corresponding text_editor_code_execution_tool_result block" — at
+# messages.1, i.e. the first assistant turn of the first attempt.
+#
+# messages.1 is not the LAST assistant turn once anything follows it, so every
+# assistant message has to be checked, not just the last. The single exemption is
+# a server tool use in a genuinely trailing turn: that is the pause_turn resume
+# shape, where re-sending the open block is how the paused work continues.
+
+
+def test_truncated_turn_is_not_carried_open_into_the_repair_round(monkeypatch):
+    queue = [
+        # attempt 1: cut off mid-JSON, on a server-side tool use with no result
+        _response(
+            "max_tokens",
+            [
+                _text('{"lines": ['),
+                _server_tool_use(
+                    "srvtoolu_1", "text_editor_code_execution",
+                    block_type="text_editor_code_execution",
+                ),
+            ],
+        ),
+        # attempt 2 (the engine's repair round): a complete Song
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
+    ]
+    captured = _install(monkeypatch, queue)
+
+    result = reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+                       provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+
+    # truncation is repaired, not fatal: the repair round produced the Song
+    assert result.attempts == 2
+    for msgs in captured["calls"]:
+        assert not _unpaired_tool_use_ids(msgs)
+
+    stored = captured["provider"]._messages
+    truncated_turn = [m for m in stored if m.get("role") == "assistant"][0]
+    # the partial text survives (it is the engine's diagnostic); the block only
+    # the API could have answered is gone
+    assert [_field(b, "type") for b in truncated_turn["content"]] == ["text"]
+
+
+def test_truncated_turn_with_an_open_client_tool_use_is_answered_not_dropped(monkeypatch):
+    """A LOCAL tool use is ours to answer, so the block stays and gets a
+    tool_result — dropping it would throw away the model's reasoning."""
+    queue = [
+        _response(
+            "max_tokens",
+            [
+                _text('{"lines": ['),
+                _tool_use("t1", "analyze_audio_window", {"start_seconds": 0, "end_seconds": 5}),
+            ],
+        ),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
+    ]
+    captured = _install(monkeypatch, queue)
+
+    result = reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+                       provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+
+    assert result.attempts == 2
+    for msgs in captured["calls"]:
+        assert not _unpaired_tool_use_ids(msgs)
+
+    stored = captured["provider"]._messages
+    truncated_turn = [m for m in stored if m.get("role") == "assistant"][0]
+    assert [_field(b, "type") for b in truncated_turn["content"]] == ["text", "tool_use"]
+    stubs = [
+        b for m in stored if isinstance(m.get("content"), list)
+        for b in m["content"] if _field(b, "type") == "tool_result"
+    ]
+    assert [b["tool_use_id"] for b in stubs] == ["t1"]
+    assert stubs[0]["is_error"] is True
+    assert "cut off" in stubs[0]["content"]
+    # results lead the user turn they answer; the repair prompt joins it as text
+    answering_turn = stored[stored.index(truncated_turn) + 1]
+    assert answering_turn["role"] == "user"
+    assert [_field(b, "type") for b in answering_turn["content"]] == ["tool_result", "text"]
+
+
+def test_an_open_client_use_is_answered_inside_the_user_turn_that_follows_it():
+    """A stub result has to LEAD the user turn that answers its assistant
+    message — including when that turn is a plain-text one (the engine's repair
+    prompt), which becomes a text block rather than a second user message."""
+    provider = AnthropicAgentProvider()
+    provider._messages = [
+        {"role": "user", "content": "{}"},
+        {
+            "role": "assistant",
+            "content": [
+                _text("partial"),
+                _tool_use("t1", "analyze_audio_window", {"start_seconds": 0, "end_seconds": 5}),
+            ],
+        },
+        {"role": "user", "content": "that JSON failed validation; send the whole Song"},
+    ]
+
+    provider._close_open_assistant_turn()
+
+    assert len(provider._messages) == 3, "no second user message was opened"
+    assert [_field(b, "type") for b in provider._messages[2]["content"]] == [
+        "tool_result", "text",
+    ]
+    assert not _unpaired_tool_use_ids(provider._messages)
+
+
+def test_closing_an_open_turn_is_inert_on_a_clean_conversation(monkeypatch):
+    """Nothing was left open, so the stored history must come out identical —
+    same dicts, same lists, same bytes — however many times it runs."""
+    sheet = (_FIXTURES / "sheet_over_lyrics.txt").read_text()
+    monkeypatch.setattr(agent_mod, "fetch_page", lambda url: sheet)
+    queue = [
+        _response("tool_use", [_tool_use("t1", "fetch_chord_sheet", {"url": "https://ex/a"})]),
+        _response("end_turn", [_text(json.dumps(_referencing_draft("agent-1")))]),
+    ]
+    captured = _install(monkeypatch, queue)
+
+    reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+              provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+
+    provider = captured["provider"]
+    before = repr(provider._messages)
+    identities = [(id(m), id(m["content"])) for m in provider._messages]
+
+    provider._close_open_assistant_turn()
+    provider._close_open_assistant_turn()  # idempotent
+
+    assert repr(provider._messages) == before
+    assert [(id(m), id(m["content"])) for m in provider._messages] == identities
+
+
+def test_a_server_tool_use_answered_inline_is_left_alone():
+    """The drop rule is keyed on PAIRING, not on the block being server-side:
+    web_search's result comes back inline in the same assistant turn."""
+    provider = AnthropicAgentProvider()
+    provider._messages = [
+        {"role": "user", "content": "{}"},
+        {
+            "role": "assistant",
+            "content": [
+                _server_tool_use("srvtoolu_1", "web_search"),
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                _text("...and here is the Song"),
+            ],
+        },
+    ]
+    before = repr(provider._messages)
+
+    provider._close_open_assistant_turn()
+
+    assert repr(provider._messages) == before
+
+
+def test_a_turn_that_was_only_an_open_server_block_keeps_a_marker():
+    """Dropping the block must not leave empty assistant content, which the API
+    also rejects. The turn is followed by the engine's repair prompt here, which
+    is what makes its open block unpairable — the same block in a TRAILING turn
+    is the pause_turn shape and is kept (next test)."""
+    provider = AnthropicAgentProvider()
+    provider._messages = [
+        {"role": "user", "content": "{}"},
+        {"role": "assistant", "content": [_server_tool_use("srvtoolu_1", "web_fetch")]},
+        {"role": "user", "content": "that JSON failed validation; send the whole Song"},
+    ]
+
+    provider._close_open_assistant_turn()
+
+    assert provider._messages[1]["content"] == [
+        {"type": "text", "text": agent_mod._TRUNCATED_TURN_NOTE}
+    ]
+    assert not _unpaired_tool_use_ids(provider._messages)
+
+
+def test_a_pending_server_block_in_the_trailing_turn_is_kept_for_the_resume():
+    """The one legitimately pending block. A pause_turn turn is committed with
+    its server tool use still open and re-sent AS IS — that is how the API
+    resumes the work — so nothing may drop it while it is still trailing."""
+    provider = AnthropicAgentProvider()
+    provider._messages = [
+        {"role": "user", "content": "{}"},
+        {"role": "assistant", "content": [_server_tool_use("srvtoolu_1", "web_search")]},
+    ]
+    before = repr(provider._messages)
+
+    provider._close_open_assistant_turn()
+
+    assert repr(provider._messages) == before
+
+
+def test_a_paused_turn_is_resumed_and_its_inline_result_keeps_it_paired(monkeypatch):
+    """End to end: the paused turn goes back out with its open block, and when
+    the resumption answers it inline — the shape this loop assumes — the turn is
+    still paired once it is no longer trailing, so the paused work is kept
+    rather than dropped."""
+    queue = [
+        _response("pause_turn", [_server_tool_use("srvtoolu_1", "web_search")],
+                  container_id="ctr_1"),
+        _response(
+            "end_turn",
+            [_server_tool_result("srvtoolu_1"), _text(json.dumps(_SONG_DRAFT))],
+        ),
+    ]
+    captured = _install(monkeypatch, queue)
+
+    result = reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+                       provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+
+    assert result.attempts == 1
+    # the resume request re-sent the still-open block
+    resume = captured["calls"][1]
+    assert [_field(b, "id") for b in resume[1]["content"]] == ["srvtoolu_1"]
+    for msgs in captured["calls"]:
+        _assert_pairable(msgs)
+    # and the paused turn survives in the history, block intact
+    stored = captured["provider"]._messages
+    assert [_field(b, "type") for b in stored[1]["content"]] == ["server_tool_use"]
+
+
+def test_a_paused_turn_left_open_by_a_truncated_resumption_is_closed(monkeypatch):
+    """The reported incident's shape. The paused turn is committed with an open
+    server block, the RESUMPTION is cut at the token cap before the container's
+    result arrives, and the repair round then re-sends the paused turn as
+    messages.1 — where it is neither trailing nor answerable."""
+    queue = [
+        _response("pause_turn", [_server_tool_use("srvtoolu_1", "web_search")],
+                  container_id="ctr_1"),
+        _response("max_tokens", [_text('{"lines": [')]),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
+    ]
+    captured = _install(monkeypatch, queue)
+
+    result = reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+                       provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+
+    assert result.attempts == 2
+    assert len(captured["calls"]) == 3
+    # the repair request really does carry the paused turn at messages.1
+    assert captured["calls"][2][1]["role"] == "assistant"
+    for msgs in captured["calls"]:
+        _assert_pairable(msgs)
+    stored = captured["provider"]._messages
+    assert stored[1]["content"] == [{"type": "text", "text": agent_mod._TRUNCATED_TURN_NOTE}]
+
+
+def test_an_open_server_block_on_a_tool_use_turn_is_closed_before_the_next_send(monkeypatch):
+    """A turn can stop with `tool_use` while ALSO carrying an open server block.
+    The loop appends that turn and then the client results, so it stops being
+    trailing immediately and no later step revisits it — the next request has to
+    be the one that is already clean."""
+    queue = [
+        _response(
+            "tool_use",
+            [
+                _server_tool_use("srvtoolu_9", "text_editor_code_execution",
+                                 block_type="text_editor_code_execution"),
+                _tool_use("t1", "analyze_audio_window", {"start_seconds": 0, "end_seconds": 5}),
+            ],
+        ),
+        _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
+    ]
+    captured = _install(monkeypatch, queue)
+
+    result = reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
+                       provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
+
+    assert result.song.id == "the-beatles--let-it-be"
+    for msgs in captured["calls"]:
+        _assert_pairable(msgs)
+    stored = captured["provider"]._messages
+    # the open server block took the client tool_use after it — and that use's
+    # result, which would otherwise name a tool_use the request no longer has
+    assert stored[1]["content"] == [{"type": "text", "text": agent_mod._TRUNCATED_TURN_NOTE}]
+    assert stored[2]["content"] == [{"type": "text", "text": agent_mod._ORPHANED_RESULT_NOTE}]
+
+
+def test_truncating_a_non_trailing_turn_drops_only_the_results_it_orphans():
+    """Truncating a turn in the MIDDLE of the history changes what follows it:
+    a tool_result answering a client tool_use inside the dropped region becomes
+    an orphan in the other direction. Results for kept uses stay."""
+    provider = AnthropicAgentProvider()
+    provider._messages = [
+        {"role": "user", "content": "{}"},
+        {
+            "role": "assistant",
+            "content": [
+                _text("partial"),
+                _tool_use("t0", "fetch_chord_sheet", {"url": "https://ex/a"}),
+                _server_tool_use("srvtoolu_1", "web_search"),
+                _tool_use("t1", "analyze_audio_window", {"start_seconds": 0, "end_seconds": 5}),
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t0", "content": "{}"},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "{}"},
+            ],
+        },
+        {"role": "assistant", "content": [_text("...")]},
+    ]
+
+    provider._close_open_assistant_turn()
+
+    assert [_field(b, "type") for b in provider._messages[1]["content"]] == ["text", "tool_use"]
+    assert [b["tool_use_id"] for b in provider._messages[2]["content"]] == ["t0"]
+    assert not _unpaired_tool_use_ids(provider._messages)
+    assert not _orphaned_tool_result_ids(provider._messages)
 
 
 def test_absent_scope_leaves_every_tool_declared(monkeypatch):

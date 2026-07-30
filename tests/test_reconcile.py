@@ -81,13 +81,18 @@ def test_mock_reconcile_end_to_end(candidates, mir):
     song = result.song
     assert result.provider == "mock"
     assert song.id == "the-beatles--let-it-be"
-    assert song.metadata.bpm == 72.0
     assert song.metadata.key  # from sheet or MIR
     assert song.audio.youtubeVideoId == "QDYfEBY9NM4"
     assert song.lines and song.lines[0].chordPlacements
     # sections derived from sheet headers, timestamps from MIR
     assert song.sections
     assert song.sections[0].startTime is not None
+    # A bare `reconcile()` declares no timing authority, so nothing is stripped:
+    # this caller runs no deterministic pass afterwards, and a MIR in its inputs
+    # is evidence for the reconciliation, not a promise that something will
+    # re-time the result. See tests/test_model_timing_authority.py for the
+    # declared-authority matrix.
+    assert song.metadata.bpm == 72.0
     assert song.audio.syncMap
     # provenance appended server-side: discovery + mir + reconcile
     actions = [p.action for p in song.provenance]

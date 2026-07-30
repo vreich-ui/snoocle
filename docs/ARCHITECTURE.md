@@ -410,9 +410,13 @@ single retry only if the new sheets agree with the audio materially better
 than the ones already judged contradictory. **Never more than one retry per
 grade**, enforced structurally — `pipeline.py` threads the real spent counts
 into `plan_escalation`, so a second escalation cannot be planned. Collapse
-runs are deliberately not an escalation path at all: the collapse guard
-already spread what could honestly be spread, and a run that reaches the
-grader is one where "could not time this region" beats fabricated spacing.
+runs never earn a retry or a search: the collapse guard already spread what
+could honestly be spread, and a run that reaches the grader is one where
+"could not time this region" beats fabricated spacing. A collapse *is* a
+hard-gate failure, so it does reach the `fail` verdict, and the one action it
+plans is marking the version `timing-unreliable` — which is why
+`mark_timing_unreliable` and `suggest_alternative_recording` are separate
+flags: only an unusable recording is fixed by a different recording.
 
 In `pipeline.py` this is step 5f, which is why steps 5-5d live in one
 re-runnable unit (`_reconcile_and_time`): a retry that re-reconciled without

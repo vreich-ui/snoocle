@@ -258,6 +258,15 @@ class Settings(BaseSettings):
     quality_interpolation_share: float = 0.5  # MAXIMUM
     quality_collapse_runs: int = 0  # MAXIMUM
     quality_section_coverage: float = 0.75
+    # Whether a failing `sectionCoverage` metric forces the verdict to `fail`
+    # outright, the same unconditional way `collapseRuns` already does (see
+    # `quality/grader.py`'s `Metric.hard_gate` / `GradeThresholds.
+    # section_coverage_gated`). OFF by default: Mode A has no section timer
+    # yet — only Mode B (`realign.py`) calls `timing/realign.py`'s
+    # `retime_sections` — so `sectionCoverage` fails on essentially every
+    # Mode A document today, and gating it now would hard-fail nearly every
+    # run. Switch this on once Mode A gains a section timer of its own.
+    quality_section_coverage_gated: bool = False
     quality_theory_validity: float = 0.85
     quality_lyric_completeness: float = 0.95
     quality_overall: float = 0.6
@@ -277,7 +286,11 @@ class Settings(BaseSettings):
     # recording and REPORTS it — one cheap yt-dlp query, no download, no
     # analysis. Acting on a suggestion is an explicit operator action (Mode B,
     # see realign.py) because a second track is real spend. Set false to skip
-    # the search entirely.
+    # the search entirely. Scoped to the AUDIO fault specifically
+    # (`Escalation.suggest_alternative_recording`), NOT to every version whose
+    # timing is marked unreliable: a collapse run that survived
+    # timing.collapse_guard marks the timing too, and no other recording of the
+    # song can supply the span that guard found none for.
     quality_suggest_recordings: bool = True
 
     # --- pipeline reliability ---

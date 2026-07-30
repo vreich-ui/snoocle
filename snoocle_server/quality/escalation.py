@@ -11,8 +11,9 @@ Given a grade and its :mod:`quality.attribution`:
 - **MODEL fault, failing grade** -> one retry, carrying
   :func:`build_retry_feedback`: the metric names, the measured values, and the
   offending line/placement indexes. Not "try harder".
-- **AUDIO fault** -> store it, mark the version timing-unreliable, do not
-  retry. The document is as good as this recording allows.
+- **AUDIO fault** -> store it, mark the version timing-unreliable, report an
+  alternative recording (``suggest_alternative_recording``), do not retry. The
+  document is as good as this recording allows.
 - **SOURCE fault** -> allow one targeted search. If it turns up materially
   better evidence, that one retry may use it; if it doesn't, store with the
   grade. The retry budget is one either way.
@@ -34,7 +35,7 @@ operator decision. It is a distinct remedy from a model retry: it never sets
 ``retry`` and never reads or increments the retry budget, so it can neither
 consume it nor be blocked by it having already been spent.
 
-Collapse runs are deliberately NOT an escalation path. They are already
+Collapse runs are deliberately NOT a retry or a search path. They are already
 handled deterministically, before grading, by
 ``timing.collapse_guard``: a run gets spread over the span to the next distinct
 time using the beat grid where one exists, and a run with no span to spread
@@ -42,6 +43,40 @@ into is left exactly as found and recorded as such. A run that reaches the
 grader is therefore one nothing could honestly fix — "could not time this
 region" beats fabricated spacing, and asking a model to invent the spacing
 instead is the worst of both.
+
+That used to need no code here, because a surviving collapse could only ever
+grade ``warn`` and this module short-circuits on any verdict but ``fail``.
+``collapseRuns`` is now a hard gate (``Metric.hard_gate``) and fails a grade on
+its own, which is right — a surviving collapse IS a defect and grading it
+``warn`` hid a production incident — but it puts collapse-only failures in
+front of the fault branches below, where a MODEL attribution would spend the
+retry asking for exactly the invented spacing the guard refused to invent, and
+an AUDIO one would spend a live recording search. So the rule above is now
+stated as a branch: a grade whose ONLY reason to fail is the collapse gate
+takes it, spends no retry and no search, and marks the timing unreliable
+instead — the one honest action, and the one a later carry-forward can read to
+keep from inheriting that region's times.
+
+That branch requires TWO things, not one. :meth:`Grade.fails_only_on_hard_gate`
+answers "is the gate the only fail ROUTE" — which stays useful on its own (a
+caller asking "would this have graded warn without this one gate" gets an
+honest answer from it, and other code may still want exactly that). But a fail
+ROUTE is not the same thing as a failing METRIC: ``_fail_routes`` only adds
+``FAIL_ROUTE_FAILING_MAJORITY`` once HALF of the measured metrics fail, so a
+document with, say, seven measured metrics can have a second one genuinely
+failing — below its own threshold, on its own defect — without that reaching
+``half_of_measured`` or dragging ``overall`` under its line either. Take the
+gate route alone as license to mark-and-stop and that second failure vanishes
+silently: no retry plans for it (the correct remedy for, say, a genuine
+``timingCoverage`` shortfall), and the mark-timing-unreliable reason claims the
+collapse is "the only thing failing this grade" when it demonstrably is not —
+a false claim written into stored provenance. So the branch below additionally
+requires the collapse to be the grade's ONLY failing metric
+(:attr:`Grade.failing`), not merely its only fail route. A document that fails
+for its own reasons and also carries a collapse takes its fault branch
+instead, and gets that branch's one retry (or search, or mark) — which is
+correct: the module docstring above forbids retrying *for* the collapse
+itself, not retrying a document that is broken elsewhere too.
 """
 
 from __future__ import annotations
@@ -77,6 +112,19 @@ class Escalation:
     # module docstring — reported the same way an AUDIO fault's alternative-
     # recording suggestion is, and never combined with `retry`.
     reanalyze_full_accuracy: bool = False
+    #: Look for a DIFFERENT recording of this song and report what it finds
+    #: (``recordings.suggest_recordings``: one search, no download, no
+    #: analysis). Deliberately its OWN flag rather than something a caller
+    #: infers from `mark_timing_unreliable`: "this recording cannot be timed"
+    #: (AUDIO fault) does imply looking for another one, but "this one region
+    #: could not be timed on any recording this run had" (a collapse run that
+    #: survived ``timing.collapse_guard``) does not — a different recording
+    #: cannot supply a span the guard found no span for, and searching for one
+    #: spends a network call on a defect it cannot address.
+    suggest_alternative_recording: bool = False
+    #: A few words naming what made the timing unreliable, for the step text
+    #: and the provenance marker. Empty unless `mark_timing_unreliable` is set.
+    mark_cause: str = ""
 
     @property
     def acts(self) -> bool:
@@ -85,6 +133,7 @@ class Escalation:
             or self.search
             or self.mark_timing_unreliable
             or self.reanalyze_full_accuracy
+            or self.suggest_alternative_recording
         )
 
     def describe(self) -> str:
@@ -94,6 +143,7 @@ class Escalation:
                 ("retry", self.retry),
                 ("targeted-search", self.search),
                 ("mark-timing-unreliable", self.mark_timing_unreliable),
+                ("suggest-alternative-recording", self.suggest_alternative_recording),
                 ("recommend-full-accuracy-reanalysis", self.reanalyze_full_accuracy),
             )
             if on
@@ -105,8 +155,10 @@ class Escalation:
             "retry": self.retry,
             "search": self.search,
             "markTimingUnreliable": self.mark_timing_unreliable,
+            "suggestAlternativeRecording": self.suggest_alternative_recording,
             "reanalyzeFullAccuracy": self.reanalyze_full_accuracy,
             "reason": self.reason,
+            "markCause": self.mark_cause,
         }
 
 
@@ -132,6 +184,13 @@ def plan_escalation(
     ``timingCoverage`` metric on a partial analysis gets the full-accuracy
     reanalysis recommendation instead of whatever the fault-specific branches
     below would have planned — see the module docstring and issue #59.
+
+    Checked second, and also before fault attribution: a grade whose only
+    reason to fail is the ``collapseRuns`` hard gate AND whose only failing
+    metric is ``collapseRuns`` (see the module docstring — a fail ROUTE and a
+    failing METRIC are not the same test, and the branch needs both). Marks
+    the timing unreliable and does nothing else — no retry, no search — for
+    the reason the module docstring gives.
     """
     if grade.verdict != "fail":
         return Escalation(
@@ -154,9 +213,54 @@ def plan_escalation(
             ),
         )
 
+    # Checked before the fault branches for the reason the module docstring
+    # gives: a collapse run that survived `timing.collapse_guard` is not a
+    # defect any fault-specific remedy addresses, so it must not reach a branch
+    # that would spend one. Deliberately AFTER the partial-accuracy
+    # recommendation above, which supersedes it: a fast/windowed analysis has no
+    # beat grid at the edges the guard needed to spread into, so the
+    # full-accuracy re-analysis it recommends is the one remedy that can make
+    # the collapse itself go away — deterministically, with no model involved.
+    #
+    # `fails_only_on_hard_gate` alone is too broad: it answers "is the gate the
+    # only fail ROUTE", but `_fail_routes` only adds the failing-majority route
+    # once HALF of the measured metrics fail, so a second metric can fail on
+    # its own defect -- below its own threshold -- without ever reaching that
+    # route or dragging `overall` under its line. Requiring `grade.failing ==
+    # (collapse,)` on top closes that gap: this branch fires only when the
+    # collapse is the grade's one and only failing metric, not merely its one
+    # and only failing ROUTE. See the module docstring.
+    collapse = grade.metric("collapseRuns")
+    collapse_is_the_whole_defect = (
+        collapse is not None
+        and collapse.measured
+        and grade.fails_only_on_hard_gate("collapseRuns")
+        and grade.failing == (collapse,)
+    )
+    if collapse_is_the_whole_defect:
+        return Escalation(
+            retry=False, search=False, mark_timing_unreliable=True,
+            mark_cause="collapsed timing the guard could not spread",
+            reason=(
+                f"{collapse.value:.0f} collapsed timing run(s) survived "
+                "timing.collapse_guard and are the only thing failing this grade. The "
+                "guard already spread every run it had a later distinct time to spread "
+                "toward, using the beat grid where one existed; a run that reaches the "
+                "grader had none, so nothing could honestly fix it. No retry (asking a "
+                "model to space those entries is asking it to invent the spacing the "
+                "guard refused to invent) and no search (different sheets cannot supply "
+                "times the recording never gave) — the timing of that region is marked "
+                f"unreliable instead: {collapse.detail}"
+            ),
+        )
+
     if attribution.fault is Fault.AUDIO:
         return Escalation(
             retry=False, search=False, mark_timing_unreliable=True,
+            # The recording itself is what cannot be timed, so a DIFFERENT
+            # recording is the remedy — reported, never auto-run.
+            suggest_alternative_recording=True,
+            mark_cause="audio fault",
             reason=(
                 "audio fault: storing the document and marking its timing "
                 f"unreliable rather than retrying — {attribution.reason}"
@@ -216,6 +320,57 @@ def plan_escalation(
     )
 
 
+def _metric_headline(metric) -> str:
+    """The one line naming a failing metric: its value, what it needed, and
+    its detail.
+
+    `Metric.comparator`, not a list of names kept here: a MAXIMUM-style
+    threshold rendered with `>=` states a SATISFIED condition for the metric
+    that just failed ("collapseRuns = 1.00 (needs >= 0.0)"), which is worse
+    than saying nothing — the model would be asked to fix something the text
+    says is already fine. The same trap exists for any metric whose `ok` is a
+    COMPOUND test a single (comparator, threshold) pair cannot state truthfully
+    (`sectionCoverage`: coverage AND no untimed section AND no excess overlap).
+
+    `Metric.requirement` is where such a metric states its real, compound
+    requirement — used here in preference to reconstructing one. When it is
+    absent (most metrics: their `ok` really is just `value` against
+    `threshold`) this reconstructs the simple clause, but only after checking
+    it does not itself contradict `ok is False` — a metric whose `ok` turns
+    out to be compound WITHOUT declaring `requirement` must never have this
+    render a threshold that reads as already satisfied; it prints no
+    value/threshold at all in that case, `metric.detail` alone, rather than a
+    lie in either direction.
+
+    An UNMEASURED metric (`value is None`) takes that same detail-alone form,
+    for the same reason and one more: there is no number to print, and both
+    clause-building branches below format `value` with `:.2f`. Unreachable
+    today — `grade_song` gives every unmeasured metric `ok=None`, and
+    `Grade.failing` selects `ok is False` — so this is a guard against a future
+    metric that fails without a value, not a live bug. It is a REAL guard
+    rather than a `value is not None` conjunct in the reconstruction test:
+    that conjunct read as None-safety while routing `value=None, ok=False`
+    into `f"{metric.value:.2f}"` and a `TypeError`.
+    """
+    if metric.value is None:
+        return f"- **{metric.name}**: {metric.detail}"
+    if metric.requirement:
+        return (
+            f"- **{metric.name}** = {metric.value:.2f} (needs {metric.requirement}): "
+            f"{metric.detail}"
+        )
+    reconstructed_satisfied = (
+        metric.value <= metric.threshold if metric.maximum else metric.value >= metric.threshold
+    )
+    if reconstructed_satisfied:
+        return f"- **{metric.name}**: {metric.detail}"
+    return (
+        f"- **{metric.name}** = {metric.value:.2f} (needs "
+        f"{metric.comparator} {metric.threshold}): "
+        f"{metric.detail}"
+    )
+
+
 def build_retry_feedback(grade: Grade, attribution: Attribution) -> str:
     """The text a retry is given: named metrics, named indexes.
 
@@ -250,11 +405,7 @@ def build_retry_feedback(grade: Grade, attribution: Attribution) -> str:
     ]
     for metric in grade.failing:
         lines.append("")
-        lines.append(
-            f"- **{metric.name}** = {metric.value:.2f} (needs "
-            f"{'<=' if metric.name == 'interpolationShare' else '>='} {metric.threshold}): "
-            f"{metric.detail}"
-        )
+        lines.append(_metric_headline(metric))
         for offender in metric.offenders[:MAX_OFFENDERS]:
             lines.append(f"    - {_offender_text(offender)}")
         if len(metric.offenders) > MAX_OFFENDERS:

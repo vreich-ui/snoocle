@@ -57,7 +57,7 @@ from .pipeline import PipelineStepError, _fail_text, _persist_trace, _timed_step
 from .quality import QualityDecision, evaluate as evaluate_quality
 from .quality.grader import grade_provenance_entry, timing_unreliable_provenance_entry
 from .recordings import RecordingSuggestions, suggest_recordings
-from .reconcile import provider_preflight, reconcile
+from .reconcile import TimingAuthority, provider_preflight, reconcile
 from .reconcile.depth import resolve_depth
 from .reconcile.trace import start_run
 from .schema.song import ProvenanceEntry, Song
@@ -446,6 +446,13 @@ async def realign_song_async(
                     depth=depth,
                     scope=AnalysisScope(listen=True, reconcile=False),
                     structure_feedback=_structure_feedback(stored, comparison, video_id),
+                    # Mode B owns a timing pass and runs it unconditionally on
+                    # this MIR (step 8 below), where a failure is FATAL — so the
+                    # authority is real and the model's recording-level timing
+                    # must not sit in the fields it guards on. Belt and braces
+                    # either way: `clear_recording_timing` empties the same
+                    # fields immediately afterwards.
+                    timing_authority=TimingAuthority.SNAP,
                 ),
                 settings.reconcile_timeout_seconds,
             )
@@ -576,8 +583,21 @@ async def realign_song_async(
     report.steps["quality"] = decision.describe()
     entries = [grade_provenance_entry(decision.grade, attribution=decision.attribution)]
     if decision.escalation.mark_timing_unreliable:
-        entries.append(timing_unreliable_provenance_entry(decision.attribution))
-        report.steps["timing-reliability"] = "marked unreliable (audio fault)"
+        entries.append(
+            timing_unreliable_provenance_entry(
+                decision.attribution, reason=decision.escalation.reason
+            )
+        )
+        report.steps["timing-reliability"] = (
+            f"marked unreliable ({decision.escalation.mark_cause})"
+            if decision.escalation.mark_cause
+            else "marked unreliable"
+        )
+    # Only an unusable RECORDING is fixed by a different recording. A collapse
+    # the guard could not spread is a region no other recording supplies a span
+    # for, so marking the timing must not also spend a search here — same split
+    # as the analyze pipeline.
+    if decision.escalation.suggest_alternative_recording:
         report.suggestions = await asyncio.to_thread(
             suggest_recordings,
             document,

@@ -101,8 +101,16 @@ def test_agent_provider_calls_remote_mcp_and_returns_validated_song(tmp_path, mo
     assert result.attempts == 1
     # engine finalization applied on top of the agent's document
     assert result.song.id == "the-beatles--let-it-be"
-    assert result.song.provenance and result.song.provenance[-1].action == "reconciled"
-    assert "agent" in result.song.provenance[-1].actor
+    # Found by action, not by position: the reconcile summary is followed by
+    # whatever DETAIL entries the run produced (a lyric override, a patch op, a
+    # model-timing strip when the caller declared an authority — this one
+    # declares none, so its document keeps the agent's own timing).
+    reconciled = next(p for p in result.song.provenance if p.action == "reconciled")
+    assert "agent" in reconciled.actor
+    # This caller declares NO authority, so nothing is appended after the
+    # summary — keep asserting that too, or the by-action lookup would quietly
+    # tolerate a strip entry appearing on a path that must never strip.
+    assert result.song.provenance[-1].action == "reconciled"
 
     # the integration contract: what the agent workspace actually received
     sent = json.loads(capture.read_text())["request"]

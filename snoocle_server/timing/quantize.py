@@ -14,30 +14,17 @@ fallback otherwise -- see ``mir/beats.py``).
 from __future__ import annotations
 
 import bisect
-import re
 from typing import Optional
 
 from ..mir.base import Beat, MirAnalysis
+from ..mir.base import beats_per_measure as _beats_per_measure_from_signature
 from ..schema.song import BeatMark, BeatRef
-
-_DEFAULT_BEATS_PER_MEASURE = 4
-_TIME_SIGNATURE_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 
 # Default snap tolerance: half of a "no MIR beat is closer than this" pad --
 # chosen so a chord recognized ~a few frames off its true onset still snaps,
 # while genuinely off-grid material (rubato intros, freeform outros) doesn't
 # get artificially forced onto the beat.
 DEFAULT_SNAP_TOLERANCE_SECONDS = 0.35
-
-
-def _beats_per_measure_from_signature(time_signature: Optional[str]) -> int:
-    if time_signature:
-        m = _TIME_SIGNATURE_RE.match(time_signature)
-        if m:
-            numerator = int(m.group(1))
-            if numerator > 0:
-                return numerator
-    return _DEFAULT_BEATS_PER_MEASURE
 
 
 def build_beat_grid(
@@ -55,6 +42,11 @@ def build_beat_grid(
     ``metadata.timeSignature`` when given, else a 4/4 default. This is a
     best-effort approximation, not audio truth; it is still useful for a
     metronome click, just not authoritative for musical downbeat placement.
+
+    ``Beat.detected`` rides through onto ``BeatMark.detected``: a beat the
+    grid was continued through rather than heard (fade-out, quiet intro --
+    see ``mir.beats.extend_beat_grid``) stays distinguishable from a measured
+    one everywhere downstream.
     """
     beats: list[Beat] = list(mir.beats) if mir else []
     if not beats:
@@ -81,7 +73,14 @@ def build_beat_grid(
             if beat_in_measure > bpm_count:
                 measure += 1
                 beat_in_measure = 1
-        grid.append(BeatMark(time=b.time, measure=measure, beatInMeasure=beat_in_measure))
+        grid.append(
+            BeatMark(
+                time=b.time,
+                measure=measure,
+                beatInMeasure=beat_in_measure,
+                detected=b.detected,
+            )
+        )
     return grid
 
 

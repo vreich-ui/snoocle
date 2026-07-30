@@ -25,6 +25,15 @@ Algorithm, in order:
 3. Placements with no match interpolate linearly (by position in the
    reading-order sequence) between their nearest matched neighbors;
    confidence 0.3. A run with zero matches leaves timing untouched.
+   Placements after the LAST match normally have nothing to interpolate
+   toward and hold that match's time -- which is right when the timeline
+   genuinely ends there, and wrong when the beat tracker lost lock in a
+   fade-out and every trailing placement then piles onto one timestamp.
+   So when (and only when) the beat grid was continued past the audio the
+   tracker heard (``BeatMark.detected is False`` -- see
+   ``mir.beats.extend_beat_grid``), the end of that continued grid is used
+   as the closing anchor and the trailing placements spread across it.
+   Still confidence 0.3: interpolated, not measured.
 4. Every assigned time is snapped onto the MIR beat grid when within
    ``quantize.DEFAULT_SNAP_TOLERANCE_SECONDS`` (adds a BeatRef; never changes
    confidence).
@@ -49,7 +58,15 @@ from typing import NamedTuple, Optional
 
 from ..chords import ChordParseError, parse_chord
 from ..mir.base import ChordSegment, MirAnalysis
-from ..schema.song import AudioInfo, ChordPlacement, Line, ProvenanceEntry, Song, SyncPoint
+from ..schema.song import (
+    AudioInfo,
+    BeatMark,
+    ChordPlacement,
+    Line,
+    ProvenanceEntry,
+    Song,
+    SyncPoint,
+)
 from .quantize import DEFAULT_SNAP_TOLERANCE_SECONDS, build_beat_grid, snap_time
 
 # How many MIR segments ahead of the current search pointer we're willing to
@@ -125,18 +142,40 @@ def _match_chords_to_mir(
     return matches, matched_segments
 
 
+def _tail_anchor(grid: list[BeatMark], after: float) -> Optional[float]:
+    """The end of a beat grid that was CONTINUED past what the tracker heard,
+    when that end lies after `after`. None otherwise -- a grid whose last beat
+    was detected offers no knowledge beyond it, and trailing placements must
+    keep holding the last matched time rather than spreading over a guess."""
+    if not grid or grid[-1].detected or grid[-1].time <= after:
+        return None
+    return grid[-1].time
+
+
 def _interpolate_unmatched(
-    flat_len: int, matches: dict[int, tuple[float, float]]
+    flat_len: int,
+    matches: dict[int, tuple[float, float]],
+    tail_anchor: Optional[float] = None,
 ) -> dict[int, tuple[float, float]]:
     """Fill every unmatched position by linear interpolation (by position,
     not by time) between its nearest matched neighbors; confidence 0.3.
-    Positions before the first match or after the last reuse that match's
-    time (held constant -- never extrapolated past known data)."""
+    Positions before the first match reuse it (held constant -- never
+    extrapolated past known data), and so do positions after the last unless
+    `tail_anchor` gives a later time to spread toward (see the module
+    docstring: the continued beat grid over a fade-out)."""
     if not matches:
         return {}
 
     matched_positions = sorted(matches)
     result: dict[int, tuple[float, float]] = dict(matches)
+
+    last_matched = matched_positions[-1]
+    if tail_anchor is not None and last_matched < flat_len - 1:
+        t0 = matches[last_matched][0]
+        span = tail_anchor - t0
+        steps = flat_len - last_matched  # keeps the final placement short of the end
+        for i in range(last_matched + 1, flat_len):
+            result[i] = (t0 + span * (i - last_matched) / steps, 0.3)
 
     for i in range(flat_len):
         if i in result:
@@ -240,7 +279,12 @@ def snap_chords(song: Song, mir: Optional[MirAnalysis]) -> Song:
     beat_grid = build_beat_grid(mir)
 
     matches, _matched_segments = _match_chords_to_mir(flat, mir)
-    assigned = _interpolate_unmatched(len(flat), matches)
+    tail_anchor = (
+        _tail_anchor(beat_grid, after=max(t for t, _c in matches.values()))
+        if matches
+        else None
+    )
+    assigned = _interpolate_unmatched(len(flat), matches, tail_anchor)
 
     # Rebuild chordPlacements per line with times/confidence/beat filled in.
     new_lines: list[Line] = []
@@ -293,6 +337,14 @@ def snap_chords(song: Song, mir: Optional[MirAnalysis]) -> Song:
     total = len(flat)
     matched_count = len(matches)
     sources = [f"{slot}:{impl}" for slot, impl in sorted(mir.engines.items())]
+    # The measured/inferred split is reported for the grid this pass BUILT,
+    # whether or not it was written onto the song -- "the audio was only
+    # heard through 92% of the track" is the fact worth recording either way.
+    inferred_beats = sum(1 for b in beat_grid if not b.detected)
+    beats_note = (
+        f"beats={'filled' if 'beats' in audio_update else 'kept/empty'} "
+        f"({len(beat_grid) - inferred_beats} measured, {inferred_beats} inferred)"
+    )
     provenance_entry = ProvenanceEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
         actor="snoocle-server/timing",
@@ -302,7 +354,13 @@ def snap_chords(song: Song, mir: Optional[MirAnalysis]) -> Song:
         notes=(
             f"matched {matched_count}/{total} chord placement(s) to the MIR "
             f"timeline; {len(sync_map)}/{len(final_lines)} line(s) timed; "
-            f"beats={'filled' if 'beats' in audio_update else 'kept/empty'}"
+            + beats_note
+            + (
+                f"; {total - 1 - max(matches)} trailing placement(s) spread to "
+                f"the continued grid end at {tail_anchor:.2f}s"
+                if tail_anchor is not None and matches and max(matches) < total - 1
+                else ""
+            )
         ),
     )
 

@@ -11,7 +11,7 @@ from ..audio.utils import probe, to_analysis_wav, trim
 from ..chords import PITCH_CLASSES_SHARP, ChordParseError, parse_chord
 from ..config import settings
 from .base import AnalyzedWindow, Beat, ChordSegment, MirAnalysis
-from .beats import track_beats
+from .beats import extend_beat_grid, track_beats
 from .chordrec import recognize_chords
 from .structure import segment_structure
 
@@ -108,7 +108,12 @@ def _analyze_windows(
     """Run beats+chords per window, shifting results back into the original
     track's time coordinates so the timeline still aligns with the video.
     Structure segmentation is skipped — text sources carry section names, and
-    fragments would only produce misleading labels."""
+    fragments would only produce misleading labels.
+
+    The beat grid is NOT continued past what was detected here (unlike the
+    full-track path): a window's edges are where the trim fell, not where the
+    music did, and beats inferred beyond one would sit outside the span this
+    analysis actually covered."""
     all_beats: list[tuple[float, int]] = []
     all_chords: list[ChordSegment] = []
     bpms: list[tuple[int, float]] = []  # (beat count, bpm) per window
@@ -192,10 +197,24 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         wav = Path(td) / "analysis.wav"
         to_analysis_wav(src, wav)
 
-        beats, bpm, time_signature, beats_engine = track_beats(str(wav))
-        beat_times = [t for t, _ in beats]
+        raw_beats, bpm, time_signature, beats_engine = track_beats(str(wav))
+        # Chords and structure see the DETECTED beats only — continued beats
+        # are a timeline repair, not new evidence, and must not change what
+        # those engines are given to work with.
+        beat_times = [t for t, _ in raw_beats]
         chord_segments, chords_engine = recognize_chords(str(wav), beat_times)
         sections, structure_engine = segment_structure(str(wav), beat_times)
+
+    beats = extend_beat_grid(
+        [Beat(time=t, position=p) for t, p in raw_beats], duration, time_signature
+    )
+    inferred = sum(1 for b in beats if not b.detected)
+    if inferred:
+        log.info(
+            "beat grid continued at the established tempo: %d detected beat(s) "
+            "covering %.2f-%.2fs of a %.2fs track, %d inferred",
+            len(beats) - inferred, raw_beats[0][0], raw_beats[-1][0], duration, inferred,
+        )
 
     return MirAnalysis(
         engines={
@@ -207,7 +226,7 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         bpm=bpm,
         time_signature=time_signature,
         key=estimate_key(chord_segments),
-        beats=[Beat(time=t, position=p) for t, p in beats],
+        beats=beats,
         chords=chord_segments,
         sections=sections,
         # duration was already reduced to the cap when the clip was trimmed, so

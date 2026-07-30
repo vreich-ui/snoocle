@@ -267,6 +267,40 @@ into it — with Ultimate Guitar's ~23-character ids the dense case comes out
 slightly LARGER than before. Token reduction is a side effect here, not the
 point; the point is that no model-backed path can emit a lyric at all.
 
+## A beat grid that stops before the song does
+
+Beat tracking is onset-strength based (librosa is the engine the production
+image actually runs — madmom is excluded from the Docker build), and its
+backtrace ends at the last local maximum of the DP's cumulative score. A
+fade-out therefore truncates the beat list well before the audio ends:
+`bob-marley--three-little-birds` stored 440 beats ending at 177.31s of a
+192.18s track — 8% of the song with no beat data, while the structure engine
+had section times through the full 192s. Every chord placement past the last
+matched MIR segment then piled onto one timestamp, because `snap.py`
+interpolates between matched neighbours and there was no later neighbour.
+The same loss of lock happens mirrored at the head of a track that fades in
+from near silence (measured on synthesized audio, `test_mir_beat_extension`).
+
+`mir/beats.py::extend_beat_grid` continues the grid rather than re-detecting
+in the faded region — that region is exactly where onset detection is
+unreliable, so tempo continuation is the more accurate answer, not a
+compromise. It fires only when the gap at an end exceeds two bars AND at
+least 16 beats were detected (enough to trust the tempo), continuing at the
+median interval of the nearest 32 beats and cycling the engine's own
+beat-in-bar phase. It runs on the full-track path only: a fast-accuracy
+window's edges are where the trim fell, not where the music did.
+
+Continued beats are never indistinguishable from measured ones. `Beat.detected`
+and `BeatMark.detected` (default `true`, so pre-existing documents decode
+unchanged) carry the distinction into the stored song, the run trace payloads
+report `beatsDetected`/`beatsInferred`, and `timing-snap` provenance reads
+`beats=filled (440 measured, 37 inferred)`. Chord recognition and structure
+segmentation are handed the DETECTED beats only — a timeline repair is not
+new evidence. The end of the continued grid also becomes the closing anchor
+`snap.py` lacked, so trailing placements spread across the fade instead of
+collapsing; when nothing was continued, they hold the last matched time
+exactly as before.
+
 ## Timing survives a re-analysis that doesn't listen
 
 `snap_chords` is the only pass that fills timing, and it is a documented

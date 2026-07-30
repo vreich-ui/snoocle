@@ -150,6 +150,190 @@ def test_a_short_run_of_two_shared_timestamps_is_not_a_collapse():
     assert grade_song(_song(lines), _mir()).value("collapseRuns") == 0.0
 
 
+# --- collapseRuns is a hard gate ---------------------------------------------
+
+
+def test_a_single_collapsed_run_forces_fail_even_in_an_otherwise_perfect_document():
+    """The production defect, isolated: `collapseRuns`' `ok` is a COUNT test
+    (any run at all is a defect) but its `score` is a DENSITY, so one short
+    run on a long, otherwise-pristine document barely dents the weighted
+    overall. Before `Metric.hard_gate`, this document would have graded
+    `warn`: one failing metric is nowhere near `half_of_measured`, and 0.98
+    overall is nowhere near the 0.6 fail line. The hard gate is the only
+    thing standing between this document and a `warn`."""
+    progression = ["C", "G", "Am", "F"]
+    duration = 100.0
+    n = 20
+    lines = [_line(i, progression[i % 4], i * 5.0) for i in range(n)]
+    # A run of exactly COLLAPSE_RUN_THRESHOLD (3) consecutive lines piled onto
+    # one timestamp -- everything else stays perfectly, distinctly timed.
+    for i in (10, 11, 12):
+        lines[i] = _line(i, progression[i % 4], 50.0)
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse", "startLineIndex": 0,
+         "endLineIndex": n - 1, "startTime": 0.0, "endTime": duration},
+    ]
+    mir = _mir(progression * (n // 4), duration=duration)
+    grade = grade_song(_song(lines, sections=sections, duration=duration), mir)
+
+    collapse = grade.metric("collapseRuns")
+    assert collapse.ok is False
+    assert collapse.value == 1.0
+    assert collapse.score > 0.9, "one short run on 20 lines barely costs the density score"
+
+    # The two pre-existing fail routes both plainly do NOT explain this
+    # verdict -- only the hard gate does.
+    assert grade.overall > 0.9 > GradeThresholds().overall
+    half_of_measured = max(2, -(-len(grade.measured) // 2))
+    assert len(grade.failing) == 1 < half_of_measured
+
+    assert grade.verdict == "fail", grade.describe()
+
+
+def test_the_warn_0_76_incident_now_grades_fail_from_the_collapse_gate_alone():
+    """The exact production shape: two hard FAILs (`collapseRuns`,
+    `sectionCoverage`) commanding only 0.2 of the total weight, an overall in
+    the high 0.7s, and a failure count nowhere near `half_of_measured`. This
+    used to grade `warn (0.76)`. It must now grade `fail` -- and specifically
+    because `collapseRuns` is gated, not because `sectionCoverage` is (that
+    gate defaults OFF; see the `sectionCoverage` gate tests below)."""
+    progression = ["C", "G", "Am", "F"]
+    duration = 120.0
+    n = 24
+    chords = [progression[i % 4] for i in range(n)]
+    # A handful of chords the document got wrong (chordMatchRatio ~0.62) and
+    # timing that only reaches 81% of the track (timingCoverage ~0.81) --
+    # imperfect, but both comfortably above their own `ok` thresholds.
+    mismatched = list(chords)
+    for i in (2, 5, 8, 9, 14, 15, 18, 20, 22):
+        mismatched[i] = "B"
+    lines = [_line(i, mismatched[i], round(i * 4.2, 3)) for i in range(n)]
+    # One collapsed run of exactly COLLAPSE_RUN_THRESHOLD lines.
+    for i in (10, 11, 12):
+        lines[i] = _line(i, mismatched[i], 42.0)
+    # Sections present but never timed -- sectionCoverage fails to 0.0, the
+    # second hard FAIL in the incident, structurally NOT gated by default.
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse",
+         "startLineIndex": 0, "endLineIndex": n - 1},
+    ]
+    mir = _mir(chords, duration=duration)
+    grade = grade_song(_song(lines, sections=sections, duration=duration), mir)
+
+    assert grade.metric("chordMatchRatio").ok is True
+    assert grade.metric("timingCoverage").ok is True
+    assert grade.metric("collapseRuns").ok is False
+    assert grade.metric("sectionCoverage").ok is False
+    assert {m.name for m in grade.failing} == {"collapseRuns", "sectionCoverage"}
+
+    # The incident's own arithmetic: warn-shaped, both fail routes clear.
+    assert grade.overall == pytest.approx(0.76, abs=0.02)
+    assert grade.overall > GradeThresholds().overall
+    half_of_measured = max(2, -(-len(grade.measured) // 2))
+    assert len(grade.failing) < half_of_measured
+
+    assert grade.verdict == "fail", grade.describe()
+
+
+# --- which route made it a fail ---------------------------------------------
+
+
+def _collapse_only_fail_song() -> tuple[Song, MirAnalysis]:
+    """An otherwise-healthy document with one collapsed run at the tail: the
+    gate is the only route to `fail`."""
+    progression = ["C", "G", "Am", "F"]
+    duration = 100.0
+    n = 20
+    lines = [_line(i, progression[i % 4], i * 5.0) for i in range(n)]
+    for i in (17, 18, 19):  # held at one timestamp, nothing later to spread to
+        lines[i] = _line(i, progression[i % 4], 85.0)
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse", "startLineIndex": 0,
+         "endLineIndex": n - 1, "startTime": 0.0, "endTime": duration},
+    ]
+    return (
+        _song(lines, sections=sections, duration=duration),
+        _mir(progression * (n // 4), duration=duration),
+    )
+
+
+def test_a_collapse_only_fail_names_the_gate_as_its_single_reason():
+    """`fail` says a document is bad; `fail_routes` says WHICH of the three
+    independent routes got it there, which is what lets an escalation tell "one
+    zero-tolerance metric tripped" apart from "this document is broadly bad" --
+    they want different actions (see quality/escalation.py)."""
+    song, mir = _collapse_only_fail_song()
+    grade = grade_song(song, mir)
+
+    assert grade.verdict == "fail", grade.describe()
+    assert grade.fail_routes == ("hard-gate:collapseRuns",)
+    assert grade.fails_only_on_hard_gate("collapseRuns") is True
+    assert grade.fails_only_on_hard_gate("sectionCoverage") is False
+
+
+def test_a_broadly_bad_document_is_not_a_collapse_only_fail():
+    """The 1966 shape: every line piled onto one timestamp. The collapse gate
+    trips, but so do the overall and the failing-majority routes -- the collapse
+    is a symptom here, not the whole story."""
+    lines = [_line(i, _PROGRESSION[i % 4], 8.0, confidence=0.3) for i in range(5)]
+    grade = grade_song(_song(lines), _mir())
+
+    assert grade.verdict == "fail", grade.describe()
+    assert "hard-gate:collapseRuns" in grade.fail_routes
+    assert len(grade.fail_routes) > 1
+    assert grade.fails_only_on_hard_gate("collapseRuns") is False
+
+
+def test_a_healthy_grade_has_no_fail_routes():
+    grade = grade_song(_healthy_song(), _mir())
+    assert grade.verdict == "pass"
+    assert grade.fail_routes == ()
+    assert grade.fails_only_on_hard_gate("collapseRuns") is False
+
+
+def test_a_warn_has_no_fail_routes_either():
+    grade = grade_song(_song_with_failing_section_coverage(), _mir())
+    assert grade.verdict == "warn", grade.describe()
+    assert grade.metric("sectionCoverage").ok is False
+    assert grade.fail_routes == ()
+
+
+# --- which way a threshold points -------------------------------------------
+
+
+def test_the_maximum_style_metrics_declare_themselves_as_maximums():
+    """`interpolationShare` and `collapseRuns` pass their `ok` test by staying
+    BELOW their threshold. Anything rendering one has to know that -- printing
+    "collapseRuns = 1.00 (needs >= 0.0)" states a satisfied condition for a
+    metric that just failed (see quality/escalation.py's retry feedback).
+
+    `comparator` alone is NOT enough to render every metric's threshold
+    honestly, though -- `sectionCoverage`'s `ok` is a compound test (coverage
+    AND no untimed section AND no excess overlap), so knowing it points ">="
+    still is not the whole requirement. See `test_a_compound_ok_metric_states_
+    its_real_requirement` below, and `Metric.requirement`'s docstring, for the
+    gap this pins wrong if read as "comparator + threshold is always the full
+    story"."""
+    grade = grade_song(_healthy_song(), _mir())
+
+    for name in ("collapseRuns", "interpolationShare"):
+        assert grade.metric(name).maximum is True, name
+        assert grade.metric(name).comparator == "<=", name
+    for name in ("chordMatchRatio", "timingCoverage", "sectionCoverage",
+                 "theoryValidity", "lyricCompleteness"):
+        assert grade.metric(name).maximum is False, name
+        assert grade.metric(name).comparator == ">=", name
+
+    # `sectionCoverage` is the one metric here whose `ok` a (comparator,
+    # threshold) pair cannot fully state -- it alone carries an explicit
+    # `requirement`; every metric whose `ok` really is just `value` against
+    # `threshold` carries none.
+    assert grade.metric("sectionCoverage").requirement != ""
+    for name in ("chordMatchRatio", "timingCoverage", "interpolationShare",
+                 "collapseRuns", "theoryValidity", "lyricCompleteness"):
+        assert grade.metric(name).requirement == "", name
+
+
 # --- partial timing ---------------------------------------------------------
 
 
@@ -220,6 +404,96 @@ def test_no_sections_at_all_is_not_measurable_rather_than_zero():
     metric = grade_song(_song(lines), _mir()).metric("sectionCoverage")
     assert metric.value is None
     assert metric.ok is None
+
+
+def test_a_compound_ok_metric_states_its_real_requirement():
+    """`sectionCoverage`'s `ok` is a CONJUNCTION -- coverage >= threshold AND
+    no untimed section AND no excess overlap -- so a comparator/threshold pair
+    alone cannot state what it needs. Mode A has no section timer, so a
+    partially-timed section (one timed, one not) is the normal case, not a
+    corner: the coverage NUMBER can be satisfied while `ok` is still `False`
+    because of the untimed section, and `Metric.requirement` has to name the
+    real, compound reason rather than leave a renderer to reconstruct a
+    satisfied-looking clause from `threshold` alone."""
+    lines = [_line(i, _PROGRESSION[i % 4], i * 20.0) for i in range(4)]
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse", "startLineIndex": 0,
+         "endLineIndex": 1, "startTime": 0.0, "endTime": 60.0},
+        {"sectionIndex": 1, "name": "Chorus", "kind": "chorus", "startLineIndex": 2,
+         "endLineIndex": 3},
+    ]
+    metric = grade_song(
+        _song(lines, sections=sections, duration=60.0), _mir(duration=60.0)
+    ).metric("sectionCoverage")
+
+    # The coverage NUMBER is fully satisfied -- one timed section already
+    # spans the whole track -- yet `ok` is still False because of the other
+    # section's missing times.
+    assert metric.value == 1.0
+    assert metric.ok is False
+    assert metric.requirement != ""
+    assert "0.75" in metric.requirement or str(GradeThresholds().section_coverage) in metric.requirement
+    assert "untimed" in metric.requirement
+    assert "overlap" in metric.requirement
+
+
+# --- sectionCoverage's hard gate is configurable and OFF by default ---------
+
+
+def _song_with_failing_section_coverage() -> Song:
+    """Otherwise-healthy, no collapse anywhere -- the only failing metric is
+    `sectionCoverage` (sections present, never timed)."""
+    lines = [_line(i, _PROGRESSION[i % 4], i * 5.0) for i in range(8)]
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse",
+         "startLineIndex": 0, "endLineIndex": 7},
+    ]
+    return _song(lines, sections=sections)
+
+
+def test_section_coverage_is_not_hard_gated_by_default():
+    """Mode A has no section timer yet (see `GradeThresholds.
+    section_coverage_gated`'s docstring) -- gating this metric unconditionally
+    today would hard-fail nearly every Mode A document, which is exactly the
+    regression this default avoids."""
+    song = _song_with_failing_section_coverage()
+    grade = grade_song(song, _mir())
+
+    assert GradeThresholds().section_coverage_gated is False
+    assert grade.metric("sectionCoverage").hard_gate is False
+    assert grade.metric("sectionCoverage").ok is False
+    assert grade.verdict == "warn", grade.describe()
+
+
+def test_section_coverage_gate_forces_fail_once_switched_on():
+    song = _song_with_failing_section_coverage()
+    mir = _mir()
+
+    ungated = grade_song(song, mir)
+    assert ungated.verdict == "warn", ungated.describe()
+
+    gated = grade_song(song, mir, thresholds=GradeThresholds(section_coverage_gated=True))
+    assert gated.metric("sectionCoverage").hard_gate is True
+    assert gated.metric("sectionCoverage").ok is False
+    # Same document, same overall, same failing metric NAMES -- only the gate
+    # differs (each metric's own `hard_gate` flag), and that alone flips the
+    # verdict.
+    assert gated.overall == ungated.overall
+    assert {m.name for m in gated.failing} == {m.name for m in ungated.failing}
+    assert gated.verdict == "fail", gated.describe()
+
+
+def test_section_coverage_gate_is_configurable_via_settings(monkeypatch):
+    from snoocle_server.config import settings
+
+    assert GradeThresholds.from_settings().section_coverage_gated is False
+
+    monkeypatch.setattr(settings, "quality_section_coverage_gated", True)
+    assert GradeThresholds.from_settings().section_coverage_gated is True
+
+    song = _song_with_failing_section_coverage()
+    grade = grade_song(song, _mir(), thresholds=GradeThresholds.from_settings())
+    assert grade.verdict == "fail", grade.describe()
 
 
 # --- theory validity --------------------------------------------------------

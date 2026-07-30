@@ -233,6 +233,14 @@ def build_user_prompt(
         )
         parts.append(header + json.dumps(prior_song, indent=1))
     if guidance:
+        # Everything in force for the song is not necessarily what lands here:
+        # on a notes-only run the caller passes the CORRECTION alone, because
+        # the header above promises "nothing else changed" and a standing
+        # rendering preference ("capo-free voicings please") is not part of a
+        # one-chord fix. A full run gets the preference and the correction both.
+        # The choice belongs to the caller that knows the scope — see
+        # pipeline.py's `model_guidance`, which is also why nothing here has to
+        # inspect the guidance it was handed.
         parts.append(
             "## Human correction notes (highest priority)\n"
             "Apply these explicit instructions from the user; they override"

@@ -493,6 +493,11 @@ def _reconcile_response(result: ReconcileResult) -> dict:
 
 @app.post("/v1/reconcile")
 def post_reconcile(req: ReconcileRequest) -> dict:
+    # No `timing_authority`: this endpoint hands the reconciled document
+    # straight back to the caller and runs no timing pass, so nothing may be
+    # stripped from it (reconcile/engine.py's TimingAuthority defaults to NONE).
+    # A MIR in the request is evidence for the reconciliation, not a promise
+    # that something downstream is about to re-time the result.
     try:
         result = reconcile(
             req.title,
@@ -557,15 +562,36 @@ class PipelineRequest(BaseModel):
     # Human-in-the-loop re-run: free-text correction notes and/or the prior
     # human-edited Song, fed to the reconciler as high-priority evidence so a
     # re-analysis honors the user's fixes instead of rediscovering from scratch.
+    # `guidance` is persisted as the song's notes before any expensive step, so
+    # a run that dies does not eat it — as a SINGLE-SHOT correction: it replays
+    # into a retry that sends none, and stops once it has landed in a stored
+    # version. It never disturbs a standing preference already on file (the two
+    # lifetimes are independent) — if one is set, what is IN FORCE for this run
+    # is BOTH, combined (see store/song_notes.py's `combine_guidance`).
+    #
+    # What the run is SHOWN can be less than that, and on the most common shape
+    # it is: when this guidance names a specific chord/line/section, notes-only
+    # scope is inferred (see `scope` below) and a notes-only run is handed the
+    # correction ALONE — its contract is "change nothing else", which a standing
+    # rendering preference is no part of. A run that is not notes-only sees both.
+    # `steps.notes` in the response says which of the two happened.
+    #
+    # A standing instruction ("capo-free voicings please") goes to
+    # PUT /v1/songs/{id}/notes instead, which replays until cleared. Bounded by
+    # the same per-slot ceiling as that endpoint's body (MAX_NOTES_CHARS): over
+    # it is a 400 here, not a truncation later.
     guidance: Optional[str] = None
     priorSong: Optional[dict] = None
     # Re-analysis SCOPE: which evidence-gathering stages this run may do.
-    # ABSENT means "no opinion" -> the full pipeline, UNLESS `guidance` names
-    # a specific chord/line/section, in which case notes-only scope is
-    # inferred (see correction_routing.py); every pre-scope client and test
-    # that sends no such guidance is unaffected. Present means constrain, and
-    # always overrides inference. Reconciliation itself always runs — the
-    # flags decide what evidence it is handed, not whether it happens.
+    # ABSENT means "no opinion" -> the full pipeline, UNLESS the `guidance` in
+    # THIS request names a specific chord/line/section, in which case notes-only
+    # scope is inferred (see correction_routing.py). Inference reads ONLY
+    # guidance the caller sent here: a note replayed from the song's stored
+    # notes is not an expressed intent about this run and never narrows it, so a
+    # request that sends no guidance gets the full pipeline whatever the store
+    # holds. Present means constrain, and always overrides inference.
+    # Reconciliation itself always runs — the flags decide what evidence it is
+    # handed, not whether it happens.
     scope: Optional[AnalysisScopeRequest] = None
     # Force the deterministic caches (MIR, discovery) to recompute and
     # overwrite. The caches key on everything that can change an answer, so
@@ -590,6 +616,18 @@ class PipelineRequest(BaseModel):
 
 @app.post("/v1/songs/analyze")
 async def post_songs_analyze(req: PipelineRequest) -> dict:
+    from .store.song_notes import length_error as notes_length_error
+
+    # `guidance` is a CORRECTION write (pipeline._resolve_guidance persists it
+    # before any expensive step), so it is bounded by the same per-slot ceiling
+    # as a preference write, rejected with the same message and the same 400 as
+    # PUT /v1/songs/{id}/notes — one contract, both slots. At the door, before
+    # the pipeline: a caller who pasted too much finds out immediately instead of
+    # having the tail of their instruction quietly dropped from a prompt while
+    # the whole of it is stored and marked applied.
+    guidance_problem = notes_length_error(req.guidance)
+    if guidance_problem:
+        raise HTTPException(status_code=400, detail=guidance_problem)
     try:
         report = await run_pipeline_async(
             req.title,
@@ -639,25 +677,84 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
 
 # --- per-song reconciliation notes -------------------------------------------
 # Free-text "how to build this song" instructions, stored beside the song (not
-# in it — the Song document is the app's content contract) and replayed as
-# reconciler guidance by every analyze of the same song id.
+# in it — the Song document is the app's content contract) and fed to a later
+# analyze of the same song id as reconciler guidance.
+#
+# A song's notes have TWO INDEPENDENT lifetimes (store/song_notes.py), so the
+# response carries two independent objects rather than one ambiguous `notes`
+# string:
+#   - `preference` — written HERE (this PUT, or the `set_song_notes` MCP tool):
+#     a durable standing instruction that replays on every later analyze that
+#     sends no guidance of its own, until this surface changes or clears it.
+#   - `correction` — written by an analyze request's `guidance`: a single-shot
+#     fix, replayed only until `appliedToVersion` names the stored version it
+#     landed in, after which it stops replaying.
+# Both can be set at once (a standing preference AND a pending correction),
+# and when an analyze replays or receives guidance while both exist, it acts
+# on their COMBINATION — see `song_notes.combine_guidance` for the rule.
+# A single flat `notes` field could not say which of the two it was, or that
+# both were in force at once; that ambiguity is exactly the defect this shape
+# replaces (a correction being read back as if it were the durable
+# preference, or vice versa). The flat `notes`/`updatedAt` keys REMAIN in every
+# response as a deprecated compatibility view of `preference` — this shape was
+# always meant to be additive, and there is a shipped client reading them (see
+# `_notes_response`).
 
 
 class NotesRequest(BaseModel):
     notes: str = ""
 
 
-def _notes_response(song_id: str, doc: dict | None) -> dict:
+def _component(doc: dict | None) -> dict | None:
+    """One lifetime's sub-record for the wire, or None when it isn't set."""
+    if not doc:
+        return None
+    return {"notes": doc.get("notes", "") or "", "updatedAt": doc.get("updated_at")}
+
+
+def _notes_response(song_id: str, record: dict | None) -> dict:
+    preference = _component((record or {}).get("preference"))
+    correction_doc = (record or {}).get("correction")
+    correction = _component(correction_doc)
+    if correction is not None:
+        correction["appliedToVersion"] = (correction_doc or {}).get("applied_to_version")
     return {
         "songId": song_id,
-        "notes": (doc or {}).get("notes", "") or "",
-        "updatedAt": (doc or {}).get("updated_at"),
+        # DEPRECATED compatibility view, kept for clients written against the
+        # flat `{songId, notes, updatedAt}` shape this endpoint had before it
+        # grew two objects — the iOS app reads notes for every song it opens and
+        # saves through this same PUT, and a strict `Decodable` with
+        # `let notes: String` throws `keyNotFound` on every read and every save
+        # if these disappear. New clients should read `preference`/`correction`.
+        #
+        # It mirrors `preference`, not "whichever slot has something": the
+        # preference is the slot THIS surface writes, so GET-after-PUT still
+        # reflects what the caller just saved. That is a deliberate NARROWING,
+        # not a restatement of what was always true. Before the two-lifetime
+        # split, `analyze(guidance=...)` wrote `store.set(song_id, text)` into
+        # the ONE slot this document reads, and `notes` returned it — so an old
+        # client could set guidance on an analyze and read it back here. It now
+        # reads `""` (or an unrelated preference) instead, and its own
+        # correction under `correction`.
+        #
+        # That divergence is the point. The two lifetimes are what the flat
+        # field could not tell apart: surfacing a single-shot correction under
+        # `notes` tells a client its DURABLE note is now a one-off fix it never
+        # set — and worse, a client that reads `notes` and PUTs it back would
+        # promote a spent correction into a standing preference. A client that
+        # wants its analyze guidance back reads `correction`, which also carries
+        # the `appliedToVersion` that says whether it is still pending.
+        "notes": (preference or {}).get("notes", ""),
+        "updatedAt": (preference or {}).get("updatedAt"),
+        "preference": preference,
+        "correction": correction,
     }
 
 
 @app.get("/v1/songs/{song_id}/notes")
 def get_song_notes(song_id: str) -> dict:
-    """Notes for a song, or an empty document when there are none.
+    """A song's stored preference and pending correction, or an empty
+    document (both null) when there are none.
 
     Never 404: the app asks this for every song it opens, so "no notes" is a
     normal answer, not an error the client has to special-case.
@@ -669,22 +766,29 @@ def get_song_notes(song_id: str) -> dict:
 
 @app.put("/v1/songs/{song_id}/notes")
 def put_song_notes(song_id: str, req: NotesRequest) -> dict:
-    from .store.song_notes import MAX_NOTES_CHARS, get_song_notes_store
+    """Store a song's durable PREFERENCE (replaces whatever preference was
+    there; empty/whitespace clears it). Never touches a pending `correction`
+    left behind by an analyze — the two lifetimes are independent, so writing
+    one never disturbs the other."""
+    from .store.song_notes import get_song_notes_store, length_error
 
-    if len(req.notes or "") > MAX_NOTES_CHARS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"notes too long: {len(req.notes)} chars (limit {MAX_NOTES_CHARS})"
-            ),
-        )
+    problem = length_error(req.notes)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
     store = get_song_notes_store()
-    store.set(song_id, req.notes)  # empty/whitespace deletes
+    store.set_preference(song_id, req.notes)  # empty/whitespace deletes
     return _notes_response(song_id, store.get_record(song_id))
 
 
 @app.delete("/v1/songs/{song_id}/notes")
 def delete_song_notes(song_id: str) -> dict:
+    """Clear BOTH the preference and any pending correction — the whole
+    stored slate for this song id, so the next analyze that sends no guidance
+    replays nothing. There is no partial-delete here: a stray pending
+    correction is rare (it only outlives one run when that run died before
+    storing) and the next successful analyze consumes it on its own: a
+    caller with a standing preference they want to keep should simply not
+    call this."""
     from .store.song_notes import get_song_notes_store
 
     return {"deleted": get_song_notes_store().delete(song_id)}

@@ -200,6 +200,120 @@ def _classify_api_error(e: Exception) -> ProviderError:
     return ProviderError(f"anthropic-agent: model API error: {msg}")
 
 
+def _block_field(block, key: str, default=None):
+    """Read one field from a content block.
+
+    Blocks arrive from the SDK as objects (``.type``/``.id``), but the ones this
+    module writes into the history — and the ones tests script — are plain
+    dicts. Both shapes have to be readable, and ``.model_dump()`` is not
+    guaranteed to exist on either.
+    """
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _is_tool_result_block(block_type: str) -> bool:
+    """True for a client ``tool_result`` and for every server-side result block
+    (``web_search_tool_result``, ``text_editor_code_execution_tool_result``...)."""
+    return block_type == "tool_result" or block_type.endswith("_tool_result")
+
+
+def _tool_use_kind(block_type: str) -> str | None:
+    """``"client"`` for a local ``tool_use``, ``"server"`` for one the API runs
+    itself, ``None`` for anything that is not a tool use.
+
+    Server-side uses are ``server_tool_use`` (web_search / web_fetch) plus the
+    blocks their API-managed code-execution container emits, whose types carry
+    ``code_execution`` (e.g. ``text_editor_code_execution``). Result blocks are
+    excluded first: their type names contain the same words.
+    """
+    if _is_tool_result_block(block_type):
+        return None
+    if block_type == "tool_use":
+        return "client"
+    if block_type == "server_tool_use" or "code_execution" in block_type:
+        return "server"
+    return None
+
+
+_TRUNCATED_TURN_NOTE = "[turn truncated at the token cap]"
+_ORPHANED_RESULT_NOTE = "[tool results dropped: the calls they answered were truncated away]"
+_TRUNCATED_TOOL_ERROR = (
+    "the assistant turn was cut off before this tool could run "
+    "(stop_reason max_tokens); no result was produced"
+)
+
+
+def _result_ids(blocks) -> set:
+    """The tool-use ids that the ``*_tool_result`` blocks in one content list
+    answer. A non-list content (a plain string user message) answers nothing."""
+    if not isinstance(blocks, (list, tuple)):
+        return set()
+    return {
+        _block_field(block, "tool_use_id")
+        for block in blocks
+        if _is_tool_result_block(str(_block_field(block, "type", "")))
+    }
+
+
+def _answered_ids(messages) -> set:
+    """Every tool-use id answered anywhere in ``messages``."""
+    answered: set = set()
+    for message in messages:
+        answered |= _result_ids(message.get("content"))
+    return answered
+
+
+def _tool_use_ids(blocks) -> set:
+    """The ids of every tool use (client or server) in one content list."""
+    return {
+        _block_field(block, "id")
+        for block in blocks
+        if _tool_use_kind(str(_block_field(block, "type", ""))) is not None
+    }
+
+
+def _open_client_ids(blocks, answered: set) -> list:
+    """Client ``tool_use`` ids in ``blocks`` that ``answered`` does not cover,
+    in the order the model emitted them."""
+    return [
+        _block_field(block, "id")
+        for block in blocks
+        if _tool_use_kind(str(_block_field(block, "type", ""))) == "client"
+        and _block_field(block, "id") not in answered
+    ]
+
+
+def _first_unpairable(content, answered_later: set) -> int:
+    """Index of the first block in ``content`` that can never be paired — a
+    SERVER tool use no ``*_tool_result`` answers — or ``len(content)`` when
+    every server use is answered.
+
+    ``answered_later`` are the ids answered by the messages AFTER this one (a
+    paused turn's result arrives with the resumption); results inside this same
+    message count too, because server results are inline.
+    """
+    cut = len(content)
+    while True:
+        answered = answered_later | _result_ids(content[:cut])
+        first = next(
+            (
+                i
+                for i, block in enumerate(content[:cut])
+                if _tool_use_kind(str(_block_field(block, "type", ""))) == "server"
+                and _block_field(block, "id") not in answered
+            ),
+            None,
+        )
+        if first is None:
+            return cut
+        # Everything from here on goes with it — and a dropped tail can take an
+        # inline result with it, which re-opens a block that looked paired a
+        # moment ago, so the kept region has to be re-checked.
+        cut = first
+
+
 def _tool_summary(name: str, tool_input: dict, result: dict, is_error: bool) -> str:
     """One human-readable line describing a tool call and its outcome."""
     if is_error:
@@ -432,6 +546,148 @@ class AnthropicAgentProvider(LLMProvider):
             tool_result["is_error"] = True
         return tool_result
 
+    def _drop_orphaned_results(self, start: int, dropped_ids: set) -> int:
+        """Delete the ``*_tool_result`` blocks that ``dropped_ids`` orphaned.
+
+        Truncating a NON-trailing assistant turn breaks the pairing in the other
+        direction: a client ``tool_use`` inside the dropped region was answered
+        by a ``tool_result`` in a LATER message, and that result now names a
+        tool use the request no longer contains — which the API rejects just as
+        it rejects the unanswered use. A message left with nothing but dropped
+        results keeps a note, because empty content is rejected too.
+        """
+        removed = 0
+        for i in range(start, len(self._messages)):
+            message = self._messages[i]
+            blocks = message.get("content")
+            if not isinstance(blocks, (list, tuple)):
+                continue
+            kept = [
+                block
+                for block in blocks
+                if not (
+                    _is_tool_result_block(str(_block_field(block, "type", "")))
+                    and _block_field(block, "tool_use_id") in dropped_ids
+                )
+            ]
+            if len(kept) == len(blocks):
+                continue
+            removed += len(blocks) - len(kept)
+            self._messages[i] = {
+                "role": message.get("role"),
+                "content": kept or [{"type": "text", "text": _ORPHANED_RESULT_NOTE}],
+            }
+        return removed
+
+    def _stub_client_results(self, idx: int, tool_use_ids: list) -> None:
+        """Answer the assistant turn at ``idx``'s open client tool uses."""
+        stubs = [
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": json.dumps({"error": _TRUNCATED_TOOL_ERROR}),
+                "is_error": True,
+            }
+            for tool_use_id in tool_use_ids
+        ]
+        following = self._messages[idx + 1] if idx + 1 < len(self._messages) else None
+        if following is not None and following.get("role") == "user":
+            existing = following.get("content")
+            # tool_result blocks lead the user turn they answer.
+            if isinstance(existing, list):
+                following["content"] = stubs + existing
+                return
+            if isinstance(existing, str) and existing:
+                # A plain-text user turn (the engine's repair prompt) becomes a
+                # text block so the results can join it, rather than opening a
+                # second user message between the two.
+                following["content"] = [*stubs, {"type": "text", "text": existing}]
+                return
+        self._messages.insert(idx + 1, {"role": "user", "content": stubs})
+
+    def _close_open_assistant_turn(self) -> None:
+        """Make EVERY assistant turn in the history self-consistent again.
+
+        A turn the API cut short (stop_reason ``max_tokens``) can end ON a
+        tool-use block: the model asked for a tool and the turn died before the
+        result existed. Sending that turn back — which every later turn and
+        every repair round does — is a 400: "tool use with id ... was found
+        without a corresponding ..._tool_result block", which kills the whole
+        reconciliation. Nothing else in this loop closes such a turn, so:
+
+        - an unanswered CLIENT ``tool_use`` gets an is_error ``tool_result``
+          (we own that side of the protocol, so the pair can be completed);
+        - an unanswered SERVER tool use is DROPPED, along with everything after
+          it, back to the last complete pair. Its ``*_tool_result`` is generated
+          by the API inside its own container; a client cannot synthesise one,
+          so not carrying the open block is the only valid repair. Dropping it
+          can orphan a later ``tool_result`` (see ``_drop_orphaned_results``),
+          which is broken pairing too and goes with it.
+
+        Every assistant message is scanned, not just the last one: the open
+        block that produced the live 400 was at ``messages.1``, and a turn stops
+        being the last one as soon as anything is appended after it — its client
+        tool results, the resumption of a paused turn, or the repair prompt.
+
+        The one block that is legitimately pending is a SERVER tool use in a
+        GENUINELY TRAILING assistant message: that is the ``pause_turn`` resume
+        shape, where re-sending the still-open block is how the paused work
+        continues. "Genuinely trailing" means last in the history AND staying
+        there — a turn that also has an open client tool use does not qualify,
+        because answering that appends a user turn right after it. Once a
+        resumption HAS happened, the paused turn is no longer trailing and its
+        result is inline in the message that follows, so it stays paired without
+        the exemption; if the resumption was itself truncated before that result
+        arrived, the block is an orphan and goes.
+
+        A turn with no open blocks is left exactly as it is — same dicts, same
+        lists — so this is inert on the normal path.
+        """
+        closed = dropped = stubbed = orphaned = 0
+        i = 0
+        while i < len(self._messages):
+            message = self._messages[i]
+            content = message.get("content")
+            if message.get("role") != "assistant" or not isinstance(content, (list, tuple)):
+                i += 1
+                continue
+            # Answered ids: server results are inline in the same assistant
+            # message, client results (and a paused turn's result) arrive in the
+            # message(s) that follow it.
+            answered_later = _answered_ids(self._messages[i + 1:])
+            trailing = (
+                i == len(self._messages) - 1
+                and not _open_client_ids(content, answered_later | _result_ids(content))
+            )
+            cut = len(content) if trailing else _first_unpairable(content, answered_later)
+            kept = list(content[:cut])
+            unanswered_client = _open_client_ids(kept, answered_later | _result_ids(kept))
+            if cut == len(content) and not unanswered_client:
+                i += 1
+                continue  # nothing open in this turn — leave its stored dicts alone
+            closed += 1
+            if cut < len(content):
+                # An assistant message may not be empty, so a turn that was
+                # nothing but an open server block keeps a marker instead of
+                # vanishing.
+                self._messages[i] = {
+                    "role": "assistant",
+                    "content": kept or [{"type": "text", "text": _TRUNCATED_TURN_NOTE}],
+                }
+                dropped += len(content) - cut
+                orphaned += self._drop_orphaned_results(i + 1, _tool_use_ids(content[cut:]))
+            if unanswered_client:
+                self._stub_client_results(i, unanswered_client)
+                stubbed += len(unanswered_client)
+            i += 1
+        if closed:
+            log.warning(
+                "anthropic-agent: closed %d open assistant turn(s) (dropped %d "
+                "unpairable block(s), stubbed %d tool result(s), dropped %d "
+                "orphaned tool result(s))",
+                closed, dropped, stubbed, orphaned,
+            )
+
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         if not settings.anthropic_api_key:
             raise ProviderError("anthropic-agent: SNOOCLE_ANTHROPIC_API_KEY is not configured")
@@ -488,7 +744,19 @@ class AnthropicAgentProvider(LLMProvider):
             # Repair round: the engine passed [user, assistant, repair-user, ...].
             # The assistant's previous final answer is already in self._messages;
             # append only the new repair prompt and continue the same loop.
-            self._messages.append({"role": "user", "content": turns[-1]["text"]})
+            # That previous answer may be a turn the API cut short — appending
+            # this prompt is what turns its open tool use into an unpairable one,
+            # so the loop below sanitises the history AFTER the append, not here.
+            last = self._messages[-1] if self._messages else None
+            if last is not None and last.get("role") == "user" and isinstance(
+                last.get("content"), list
+            ):
+                # Closing the turn left stub tool_results in a trailing user
+                # message; the repair prompt joins that same turn (results
+                # first, then text) rather than opening a second user message.
+                last["content"] = [*last["content"], {"type": "text", "text": turns[-1]["text"]}]
+            else:
+                self._messages.append({"role": "user", "content": turns[-1]["text"]})
 
         client = self._create_client()
         usage: dict = {}
@@ -502,6 +770,14 @@ class AnthropicAgentProvider(LLMProvider):
         # that allocated it, so it has to be carried forward by hand.
         container_id: str | None = None
         for turn in range(1, max_turns + 1):
+            # Every request has to be internally consistent, and this loop is
+            # what breaks that: a turn that stopped with `tool_use` while also
+            # carrying an open server block stops being trailing the moment its
+            # client results are appended below, and a paused turn whose
+            # resumption was truncated is left open behind the repair prompt.
+            # Sanitising here — after every append, before every send — is the
+            # only point that sees the history exactly as the API will.
+            self._close_open_assistant_turn()
             turn_start = time.monotonic()
             request: dict = {
                 "model": resolved_model,
@@ -579,12 +855,32 @@ class AnthropicAgentProvider(LLMProvider):
                 results = [self._run_tool(b) for b in response.content if b.type == "tool_use"]
                 self._messages.append({"role": "user", "content": results})
                 continue
-            break  # end_turn / max_tokens: fall through with whatever text we have
+            if response.stop_reason == "max_tokens":
+                # Handled apart from end_turn: this turn is INCOMPLETE, not
+                # finished. The partial text is still the best diagnostic there
+                # is (the engine's repair round re-asks for the whole Song and
+                # usually gets it), so it falls through — but the turn can end
+                # on a tool-use block whose result will never exist, which is
+                # what _close_open_assistant_turn below removes.
+                log.warning(
+                    "anthropic-agent turn=%d was truncated at the max_tokens cap (%s); "
+                    "the partial output goes to the repair round",
+                    turn, request["max_tokens"],
+                )
+                break
+            break  # end_turn (or an unknown reason): fall through with the text we have
         else:
             raise ProviderError("anthropic-agent: exceeded max turns without a final answer")
 
-        # Keep the assistant's final answer in the history for any repair round.
+        # Keep the assistant's final answer in the history for any repair round,
+        # then close it: a turn truncated at the token cap can carry a tool-use
+        # block with no result, and every later request would be rejected. Doing
+        # it here rather than only at the top of the next round is what answers a
+        # client tool use in the SAME user turn the repair prompt joins; an open
+        # server block in this now-trailing turn is still pause_turn-shaped, so
+        # it waits for the append above to make it unpairable.
         self._messages.append({"role": "assistant", "content": response.content})
+        self._close_open_assistant_turn()
         final_text = "".join(b.text for b in response.content if b.type == "text")
         return LLMResponse(
             text=final_text,

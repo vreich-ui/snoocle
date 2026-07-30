@@ -73,6 +73,19 @@ class GradeThresholds:
     interpolation_share: float = 0.5  # MAXIMUM: over half interpolated is not timing
     collapse_runs: int = 0  # MAXIMUM: any run surviving the guard is a defect
     section_coverage: float = 0.75
+    #: Whether a failing `sectionCoverage` metric (`ok is False`) forces the
+    #: verdict to `fail` outright — the same unconditional hard gate
+    #: `collapseRuns` always applies (see `Metric.hard_gate`). OFF by default:
+    #: Mode A has no section timer today. `timing/realign.py`'s
+    #: `retime_sections` is the only writer of section times outside the
+    #: model, and it runs only from Mode B (`snoocle_server/realign.py`) —
+    #: `pipeline.py` never calls it. That means `sectionCoverage` fails on
+    #: essentially every Mode A document as things stand, so gating it now
+    #: would hard-fail nearly every run and drive retry/escalation for a gap
+    #: nobody actually introduced. Switch this on (via
+    #: `SNOOCLE_QUALITY_SECTION_COVERAGE_GATED=1`) once Mode A gains a section
+    #: timer of its own — a separate, later change.
+    section_coverage_gated: bool = False
     theory_validity: float = 0.85
     lyric_completeness: float = 0.95
     overall: float = 0.6  # below this the verdict is "fail"
@@ -109,6 +122,17 @@ class Metric:
     overall is a weighted mean of. Both are reported: "3 collapsed runs" is
     what a human wants to read, and the normalized form is what a number can
     be computed from.
+
+    ``ok`` and ``score`` can and do disagree: ``ok`` is whatever count/
+    threshold test the metric defines for itself (for ``collapseRuns`` that is
+    "zero runs survive the guard" — a document either has a collapse or it
+    doesn't), while ``score`` is a density folded into the weighted
+    ``overall``. Two collapsed runs on an otherwise-perfect 100-entry document
+    can cost ``overall`` as little as 0.004 through the weighted mean alone.
+    ``hard_gate`` is how a metric that must never be laundered through the
+    mean like that says so: when ``hard_gate`` is set and ``ok is False``,
+    :func:`grade_song` forces the verdict to ``fail`` outright, independent of
+    ``overall`` and independent of how many *other* metrics also failed.
     """
 
     name: str
@@ -117,12 +141,45 @@ class Metric:
     ok: Optional[bool]
     threshold: float
     weight: float
+    #: See the class docstring. Defaults to ``False`` — most metrics are
+    #: legitimately fine being folded into the weighted mean.
+    hard_gate: bool = False
+    #: ``True`` when this metric's ``ok`` test is an UPPER bound (``value <=
+    #: threshold``) rather than the usual lower one. Two metrics are maximums
+    #: today — ``interpolationShare`` and ``collapseRuns``, both marked MAXIMUM
+    #: on :class:`GradeThresholds` — and anything that RENDERS a threshold has
+    #: to know which way it points: "collapseRuns = 1.00 (needs >= 0.0)" states
+    #: a satisfied condition for a metric that just failed. See
+    #: :attr:`comparator`.
+    maximum: bool = False
+    #: An explicit, renderable statement of what would make ``ok`` ``True``,
+    #: for a metric whose ``ok`` is a COMPOUND test that a single
+    #: (``comparator``, ``threshold``) pair cannot state truthfully —
+    #: ``sectionCoverage``'s is ``coverage >= threshold AND overlaps <= 0.5s
+    #: AND no untimed section``. A renderer that reconstructs "needs {comparator}
+    #: {threshold}" from `threshold`/`maximum` alone can print a SATISFIED
+    #: clause for a metric that just failed, when the failing conjunct is one
+    #: of the others (coverage itself is fine; a section is untimed, say).
+    #: Empty for every metric whose `ok` really is just `value` against
+    #: `threshold` — most of them — where the reconstructed clause is already
+    #: the truth. See :func:`quality.escalation.build_retry_feedback`.
+    requirement: str = ""
     detail: str = ""
     offenders: list[dict] = field(default_factory=list)
 
     @property
     def measured(self) -> bool:
         return self.value is not None
+
+    @property
+    def comparator(self) -> str:
+        """``<=`` for a maximum-style threshold, ``>=`` otherwise.
+
+        The one place anything printing this metric's threshold asks which way
+        it points, so no renderer has to keep its own list of which metrics are
+        maximums (see :func:`quality.escalation.build_retry_feedback`).
+        """
+        return "<=" if self.maximum else ">="
 
     def to_dict(self) -> dict:
         out: dict = {
@@ -132,6 +189,10 @@ class Metric:
         }
         if self.score is not None and self.score != self.value:
             out["score"] = round(self.score, 4)
+        if self.hard_gate:
+            out["hardGate"] = True
+        if self.requirement:
+            out["requirement"] = self.requirement
         if self.detail:
             out["detail"] = self.detail
         if self.offenders:
@@ -139,14 +200,53 @@ class Metric:
         return out
 
 
+#: The three independent routes to a ``fail`` verdict, named so that a caller
+#: can ask not just WHETHER a grade failed but BY WHICH route — the difference
+#: between "this document is broadly bad" and "one zero-tolerance metric
+#: tripped its gate on an otherwise fine document", which want different
+#: actions (see :mod:`quality.escalation`).
+FAIL_ROUTE_OVERALL = "overall"
+FAIL_ROUTE_FAILING_MAJORITY = "failing-majority"
+
+
+def hard_gate_route(metric_name: str) -> str:
+    """The :data:`Grade.fail_routes` entry for `metric_name`'s hard gate."""
+    return f"hard-gate:{metric_name}"
+
+
+def _fail_routes(
+    metrics: Sequence[Metric], overall: Optional[float], t: GradeThresholds
+) -> tuple[str, ...]:
+    """Every route by which these metrics reach ``fail``, in order.
+
+    One function so :func:`grade_song` and :attr:`Grade.fail_routes` can never
+    disagree about why a grade failed — a verdict and an explanation of that
+    verdict computed by two different pieces of arithmetic would drift the
+    first time either changed.
+    """
+    failing = [m for m in metrics if m.ok is False]
+    measured = [m for m in metrics if m.measured]
+    half_of_measured = max(2, -(-len(measured) // 2))
+    routes: list[str] = []
+    if overall is not None and overall < t.overall:
+        routes.append(FAIL_ROUTE_OVERALL)
+    if len(failing) >= half_of_measured:
+        routes.append(FAIL_ROUTE_FAILING_MAJORITY)
+    routes += [hard_gate_route(m.name) for m in metrics if m.hard_gate and m.ok is False]
+    return tuple(routes)
+
+
 @dataclass(frozen=True)
 class Grade:
     """The full grade: every metric, the weighted overall, and a verdict.
 
-    Verdicts: ``fail`` when the weighted overall is below its threshold OR when
-    half of the measurable metrics fail (perfect chords and words cannot make
-    an untimed document playable); ``warn`` when something failed but the
-    overall holds; ``pass`` when nothing failed; ``unknown`` when fewer than
+    Verdicts: ``fail`` when the weighted overall is below its threshold, OR
+    when half of the measurable metrics fail (perfect chords and words cannot
+    make an untimed document playable), OR when any :attr:`Metric.hard_gate`
+    metric's ``ok`` is ``False`` (a defect the weighted mean could otherwise
+    launder down to a rounding error — see that field); ``warn`` when
+    something failed but the overall holds and no hard gate tripped; ``pass``
+    when nothing failed; ``unknown`` when fewer than
     :data:`MIN_MEASURED_METRICS` metrics could be measured at all. Only
     ``fail`` can escalate — see :mod:`quality.escalation`.
     """
@@ -170,6 +270,29 @@ class Grade:
     @property
     def failing(self) -> tuple[Metric, ...]:
         return tuple(m for m in self.metrics if m.ok is False)
+
+    @property
+    def fail_routes(self) -> tuple[str, ...]:
+        """Which route(s) made this verdict ``fail`` — empty for any other.
+
+        Derived from the metrics by the same function :func:`grade_song` used to
+        reach the verdict, so it re-derives rather than remembers.
+        """
+        if self.verdict != "fail":
+            return ()
+        return _fail_routes(self.metrics, self.overall, self.thresholds)
+
+    def fails_only_on_hard_gate(self, metric_name: str) -> bool:
+        """Is `metric_name`'s hard gate the ONE thing failing this grade?
+
+        True when the verdict is ``fail`` and would have been ``warn`` without
+        that one gate: the weighted overall holds, not enough metrics failed to
+        trip the majority route, and no OTHER gated metric failed either. What
+        this answers is "is this defect the whole story", which is what decides
+        whether a remedy aimed at that one metric is the right response — see
+        :mod:`quality.escalation`'s collapse branch.
+        """
+        return self.fail_routes == (hard_gate_route(metric_name),)
 
     def to_dict(self) -> dict:
         return {
@@ -274,7 +397,7 @@ def _interpolation_metric(song: Song, t: GradeThresholds) -> Metric:
     if not timed:
         return Metric(
             name="interpolationShare", value=None, score=None, ok=None,
-            threshold=t.interpolation_share, weight=0.1,
+            threshold=t.interpolation_share, weight=0.1, maximum=True,
             detail="no placement carries a time — nothing was interpolated or measured",
         )
     interpolated = [
@@ -286,6 +409,7 @@ def _interpolation_metric(song: Song, t: GradeThresholds) -> Metric:
     return Metric(
         name="interpolationShare", value=share, score=1.0 - share,
         ok=share <= t.interpolation_share, threshold=t.interpolation_share, weight=0.1,
+        maximum=True,
         detail=(
             f"{len(interpolated)}/{len(timed)} timed placement(s) sit at the "
             f"interpolated confidence tier ({INTERPOLATED_CONFIDENCE}) — derived "
@@ -334,13 +458,23 @@ def _collapse_metric(song: Song, t: GradeThresholds) -> Metric:
     if not entries:
         return Metric(
             name="collapseRuns", value=None, score=None, ok=None,
-            threshold=float(t.collapse_runs), weight=0.1,
+            threshold=float(t.collapse_runs), weight=0.1, hard_gate=True, maximum=True,
             detail="nothing is timed — there is no collapse to detect",
         )
     return Metric(
         name="collapseRuns", value=float(len(runs)),
         score=max(0.0, 1.0 - collapsed_entries / entries),
         ok=len(runs) <= t.collapse_runs, threshold=float(t.collapse_runs), weight=0.1,
+        # Unconditional hard gate (see `Metric.hard_gate` and `Grade`'s
+        # docstring): `ok` here is a COUNT test ("zero runs may survive"), but
+        # `score` is a density that a single short run barely dents on a long
+        # document. Without this, a real collapse can be graded `warn` at an
+        # overall arbitrarily close to 1.0 — exactly the production incident
+        # this field exists to close.
+        hard_gate=True,
+        # A MAXIMUM, like its threshold says: zero runs may survive. Stated so
+        # nothing renders it as "needs >= 0.0" — see `Metric.comparator`.
+        maximum=True,
         detail=(
             f"{len(runs)} run(s) of >={COLLAPSE_RUN_THRESHOLD} consecutive entries "
             f"sharing one timestamp survive the collapse guard "
@@ -350,20 +484,34 @@ def _collapse_metric(song: Song, t: GradeThresholds) -> Metric:
     )
 
 
+def _section_coverage_requirement(t: GradeThresholds) -> str:
+    """The real, compound requirement `sectionCoverage`'s `ok` tests.
+
+    Three conjuncts, not one (see :func:`_section_coverage_metric`): a single
+    (comparator, threshold) pair can state the first but not the other two, so
+    this is what :attr:`Metric.requirement` carries for this metric — see that
+    field's docstring.
+    """
+    return f">= {t.section_coverage} coverage, no untimed section, <= 0.5s overlap"
+
+
 def _section_coverage_metric(
     song: Song, duration: Optional[float], t: GradeThresholds
 ) -> Metric:
     weight = 0.1
+    # Configurable, OFF by default — see `GradeThresholds.section_coverage_gated`.
+    gated = t.section_coverage_gated
+    requirement = _section_coverage_requirement(t)
     if not song.sections:
         return Metric(
             name="sectionCoverage", value=None, score=None, ok=None,
-            threshold=t.section_coverage, weight=weight,
+            threshold=t.section_coverage, weight=weight, hard_gate=gated,
             detail="the document has no sections",
         )
     if duration is None or duration <= 0:
         return Metric(
             name="sectionCoverage", value=None, score=None, ok=None,
-            threshold=t.section_coverage, weight=weight,
+            threshold=t.section_coverage, weight=weight, hard_gate=gated,
             detail="track duration unknown — section spans have nothing to cover",
         )
 
@@ -380,7 +528,8 @@ def _section_coverage_metric(
     if not spans:
         return Metric(
             name="sectionCoverage", value=0.0, score=0.0, ok=False,
-            threshold=t.section_coverage, weight=weight,
+            threshold=t.section_coverage, weight=weight, hard_gate=gated,
+            requirement=requirement,
             detail=(
                 f"none of the {len(song.sections)} section(s) carries a "
                 f"startTime/endTime, so they span 0.0s of the {duration:.1f}s track"
@@ -413,7 +562,8 @@ def _section_coverage_metric(
     return Metric(
         name="sectionCoverage", value=coverage, score=coverage,
         ok=(coverage >= t.section_coverage and overlaps <= 0.5 and not untimed),
-        threshold=t.section_coverage, weight=weight,
+        threshold=t.section_coverage, weight=weight, hard_gate=gated,
+        requirement=requirement,
         detail=(
             f"sections span {coverage:.1%} of the {duration:.1f}s track; "
             f"{len(untimed)}/{len(song.sections)} untimed, "
@@ -557,16 +707,31 @@ def grade_song(
     )
 
     failing = [m for m in metrics if m.ok is False]
-    measured = [m for m in metrics if m.measured]
     # Half of what could be measured failing IS a failing document, however
     # well the other half scored: the weighted overall alone lets a document
     # with perfect chords, key and lyrics but no usable timing at all
     # (coverage 0.00, everything interpolated, a five-line collapse) land above
     # the line, and that document is not one anybody can play along to.
-    half_of_measured = max(2, -(-len(measured) // 2))
+    #
+    # A hard gate is a THIRD, independent route to "fail" — see
+    # `Metric.hard_gate`. It exists because the other two routes both go
+    # through the weighted mean or a failure COUNT, and a metric whose `ok`
+    # is a count/existence test (not a density) can fail that test while
+    # costing the mean almost nothing: two collapsed runs on an otherwise
+    # perfect 100-entry document score 0.96 on `collapseRuns` (density), so at
+    # its 0.10 weight that FAIL costs `overall` just 0.004 — nowhere near
+    # `t.overall`, and nowhere near enough OTHER failures to hit
+    # `half_of_measured` either. `collapseRuns` is gated unconditionally
+    # (`_collapse_metric` always sets `hard_gate=True`); `sectionCoverage` is
+    # gated only when `GradeThresholds.section_coverage_gated` is switched on.
+    #
+    # `_fail_routes` computes all three, NAMED, rather than or-ing them into one
+    # boolean: `Grade.fail_routes` re-derives them for a caller that needs to
+    # know which route a fail took, and it must be the same arithmetic.
+    routes = _fail_routes(metrics, overall, t)
     if len(scored) < MIN_MEASURED_METRICS or overall is None:
         verdict = "unknown"
-    elif overall < t.overall or len(failing) >= half_of_measured:
+    elif routes:
         verdict = "fail"
     elif failing:
         verdict = "warn"
@@ -577,9 +742,9 @@ def grade_song(
 
 
 def timing_unreliable_provenance_entry(
-    attribution, *, actor: str = "snoocle-server/quality"
+    attribution, *, reason: Optional[str] = None, actor: str = "snoocle-server/quality"
 ) -> ProvenanceEntry:
-    """Mark a stored version's timing as not to be trusted (AUDIO fault).
+    """Mark a stored version's timing as not to be trusted.
 
     The document is still worth storing — its chords and words can be right
     while its times cannot be — and a reader has to be able to tell. This is a
@@ -587,6 +752,15 @@ def timing_unreliable_provenance_entry(
     about how this version came to be, which is exactly what provenance is,
     and it needs no schema change to be readable by anything already reading
     a song's history.
+
+    Two situations write this marker, and they differ in WHY (see
+    :func:`quality.escalation.plan_escalation`): an AUDIO fault, where the
+    recording itself cannot be timed, and a collapse run that survived
+    ``timing.collapse_guard``, where one region could not be timed on any
+    recording this run had. Pass `reason` — the escalation's own reason — so
+    the note states the cause that actually applied; without it the note falls
+    back to the fault attribution, which on a collapse-driven mark would
+    describe something else entirely.
     """
     return ProvenanceEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -595,7 +769,7 @@ def timing_unreliable_provenance_entry(
         confidence=None,
         notes=(
             "this version's timing is NOT reliable and was not retried: "
-            + attribution.reason
+            + (reason if reason is not None else attribution.reason)
         ),
     )
 

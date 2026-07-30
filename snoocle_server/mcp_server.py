@@ -169,6 +169,10 @@ def reconcile_song(
     if mir_json:
         payload = json.loads(mir_json)
         mir = MirAnalysis.model_validate(payload.get("analysis", payload))
+    # No `timing_authority`: this tool returns the document to the agent and
+    # persists nothing (save_song is a separate call that runs no timing pass
+    # either), so no deterministic pass will re-time it and the model's timing
+    # must survive intact. See reconcile/engine.py's TimingAuthority.
     result = _reconcile(
         title,
         artist,
@@ -200,6 +204,7 @@ async def analyze_and_store_song(
     skip_audio: bool = False,
     expected_version: Optional[str] = None,
     accuracy: Optional[str] = None,
+    guidance: Optional[str] = None,
     scope: Optional[dict] = None,
     allow_timing_loss: bool = False,
 ) -> dict:
@@ -213,6 +218,25 @@ async def analyze_and_store_song(
     Each external step runs under its own timeout so the call can't hang; a
     fatal step failure raises with the step name. Returns the song, the per-step
     report, and the stored version sha.
+
+    guidance (optional): free-text instructions for THIS run — the
+    human-in-the-loop correction path ("change the C to a B in line 12", "the
+    bridge is Bm, not D"), handed to the reconciler as high-priority evidence so
+    a re-analysis honors the fix instead of rediscovering from scratch. Stored as
+    the song's notes before any expensive step runs, so a run that dies at
+    acquire or reconcile does not eat it, and applied ONCE: it replays into a
+    retry that passes none, then stops replaying as soon as it has landed in a
+    stored version. It never disturbs a standing preference already on file
+    (set_song_notes) — if one is set, BOTH are in force for this run, combined.
+    What the run is SHOWN can be less: a notes-only run (inferred from a
+    targeted correction, or asked for explicitly) is handed the correction
+    ALONE, because its contract is "change nothing else" and a standing
+    rendering preference is no part of that; a run that is not notes-only sees
+    both. `steps.notes` says which happened. Max 8000 chars, same ceiling as
+    set_song_notes — over it is a rejection here, not a truncation later.
+    For a standing instruction that should shape EVERY later analyze
+    ("capo-free voicings please") use set_song_notes instead; get_song_notes
+    shows what a run passing no guidance would replay.
 
     scope (optional, same shape as the HTTP API's `scope`):
     {"listen": bool, "reconcile": bool} — which evidence-gathering stages this
@@ -234,6 +258,15 @@ async def analyze_and_store_song(
     out of that and of the guard that refuses to store a version which drops
     audio-derived data the prior one had — only pass it when losing that data
     is the actual intent."""
+    from .store.song_notes import length_error as notes_length_error
+
+    # Same per-slot ceiling and same message as set_song_notes: `guidance` is a
+    # CORRECTION write, and both slots of one contract must refuse an over-long
+    # body the same way. Before the pipeline, so nothing is paid for a run that
+    # is going to be refused.
+    guidance_problem = notes_length_error(guidance)
+    if guidance_problem:
+        raise ValueError(guidance_problem)
     report = await run_pipeline_async(
         title,
         artist,
@@ -243,6 +276,7 @@ async def analyze_and_store_song(
         skip_audio=skip_audio,
         expected_version=expected_version,
         accuracy=accuracy,
+        guidance=guidance,
         # None in -> None out: an omitted scope must stay omitted all the way
         # down, or every MCP caller silently starts getting a "scope" step.
         scope=AnalysisScope.parse(scope),
@@ -367,6 +401,112 @@ def save_song(song_json: str, message: str = "Manual save", expected_version: Op
     song = Song.model_validate_json(song_json)
     saved = get_store().save(song, message, expected_version=expected_version)
     return dataclasses.asdict(saved)
+
+
+# --- per-song reconciliation notes -------------------------------------------
+# Free-text "how to build this song" instructions, stored beside the song (never
+# in it — the Song document is the app's content contract) and handed to a later
+# analyze as reconciler guidance. Mirrors the REST trio (GET/PUT/DELETE
+# /v1/songs/{songId}/notes) so the note an analyze would replay is visible,
+# settable and clearable from here too: without these, an MCP caller inherits
+# whatever an HTTP client happened to leave behind and cannot even see it.
+#
+# A song's notes have TWO INDEPENDENT lifetimes (store/song_notes.py): a
+# durable `preference` (this surface) and a single-shot `correction` (an
+# analyze request's `guidance`). Both may be set at once, and an analyze that
+# replays or receives guidance while both exist acts on their COMBINATION
+# (`song_notes.combine_guidance`). The tools below report them as two
+# separate objects rather than one `notes` string, because a flat field could
+# not say which lifetime it was reading, or that both were in force —
+# exactly the ambiguity that made one slot unable to hold two lifetimes. The
+# flat `notes`/`updatedAt` keys are still present, as a deprecated
+# compatibility view of `preference` mirroring the REST response.
+
+
+def _component(doc: dict | None) -> dict | None:
+    """One lifetime's sub-record for the wire, or None when it isn't set."""
+    if not doc:
+        return None
+    return {"notes": doc.get("notes", "") or "", "updatedAt": doc.get("updated_at")}
+
+
+def _notes_doc(song_id: str, record: dict | None) -> dict:
+    preference = _component((record or {}).get("preference"))
+    correction_raw = (record or {}).get("correction")
+    correction = _component(correction_raw)
+    if correction is not None:
+        correction["appliedToVersion"] = (correction_raw or {}).get("applied_to_version")
+    return {
+        "songId": song_id,
+        # DEPRECATED flat compatibility view of `preference`, mirroring the REST
+        # response key-for-key (api.py's `_notes_response`) — one store, two
+        # surfaces, and a shape that differs between them is a shape neither can
+        # be described by. Read `preference`/`correction` instead.
+        "notes": (preference or {}).get("notes", ""),
+        "updatedAt": (preference or {}).get("updatedAt"),
+        "preference": preference,
+        "correction": correction,
+    }
+
+
+@mcp.tool()
+def get_song_notes(song_id: str) -> dict:
+    """Read a song's stored reconciliation notes — the guidance an analyze that
+    passes none would replay. Never an error: "no notes" is a normal answer
+    (preference: null, correction: null).
+
+    `preference` is a standing instruction and replays on every later analyze
+    that passes none. `correction` came from one
+    analyze_and_store_song(guidance=...) call and replays only until its
+    `appliedToVersion` names the stored version it landed in — after that it
+    is already in the document and is NOT applied again. Both may be set at
+    once, in which case both are IN FORCE and a run acts on their combination
+    (a labeled "Standing preference: ... / Requested correction: ..." string),
+    never one silently standing in for the other — except on a notes-only run,
+    which is shown the correction alone (see analyze_and_store_song)."""
+    from .store.song_notes import get_song_notes_store
+
+    return _notes_doc(song_id, get_song_notes_store().get_record(song_id))
+
+
+@mcp.tool()
+def set_song_notes(song_id: str, notes: str) -> dict:
+    """Store a song's reconciliation notes as a durable PREFERENCE — a standing
+    instruction ("capo-free voicings please", "the bridge is Bm, not D") replayed
+    as guidance by every later analyze of this song id that passes none, until
+    it is changed or cleared. Replaces whatever PREFERENCE was there
+    (empty/whitespace clears it, same as clear_song_notes) but never touches a
+    pending CORRECTION left behind by an analyze — the two lifetimes are
+    stored independently, so writing one never disturbs the other; when both
+    are set, a later analyze's guidance is the two combined. Max 8000 chars.
+
+    For a one-off fix to the document you already have ("change the C to a B in
+    line 12"), pass it as analyze_and_store_song(guidance=...) instead: that
+    applies to that run, survives a run that dies before storing, and then stops
+    replaying — a correction that replays forever silently re-applies itself to
+    later runs nobody attached it to."""
+    from .store.song_notes import get_song_notes_store, length_error
+
+    problem = length_error(notes)
+    if problem:
+        raise ValueError(problem)
+    store = get_song_notes_store()
+    store.set_preference(song_id, notes)  # empty/whitespace deletes
+    return _notes_doc(song_id, store.get_record(song_id))
+
+
+@mcp.tool()
+def clear_song_notes(song_id: str) -> dict:
+    """Delete a song's stored reconciliation notes — BOTH the standing
+    preference and any pending correction, so the next analyze that sends no
+    guidance replays nothing. There is no partial clear here: a stray pending
+    correction is rare (it only outlives one run when that run died before
+    storing, and the next successful analyze consumes it on its own), so if
+    you only want to keep a standing preference intact, simply don't call
+    this. `deleted` is false when there was nothing stored in either slot."""
+    from .store.song_notes import get_song_notes_store
+
+    return {"songId": song_id, "deleted": get_song_notes_store().delete(song_id)}
 
 
 # --- deterministic audio utilities (no AI) -----------------------------------

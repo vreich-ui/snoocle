@@ -259,6 +259,63 @@ def test_a_transposed_sheet_still_counts_as_agreeing_with_the_audio():
     assert attribution.candidate_agreement == 1.0
 
 
+# --- a warn is no longer "nothing to attribute" ------------------------------
+
+
+def test_a_warn_with_a_failing_metric_gets_a_named_fault_not_none():
+    """`sectionCoverage` failing (untimed sections) on an otherwise-healthy
+    document holds the verdict at `warn` (that gate defaults OFF). Before
+    this change, `warn` short-circuited straight to `Fault.NONE` -- "nothing
+    to attribute" -- even though a metric measurably failed. It must now be
+    routed through the same comparison logic a `fail` gets, and it must not
+    come back NONE: sources, audio and document all agree here, which is a
+    real, named, honest non-answer (UNKNOWN) rather than "nothing is
+    wrong"."""
+    mir = _mir(_TRUE_PROGRESSION)
+    candidates = [_candidate(_TRUE_PROGRESSION, "web-1")]
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse",
+         "startLineIndex": 0, "endLineIndex": 11},  # never timed
+    ]
+    document = Song.model_validate(
+        _document(_TRUE_PROGRESSION, duration=90.0).model_dump() | {"sections": sections}
+    )
+    grade, attribution = _attribute(document, mir, candidates)
+
+    assert grade.verdict == "warn", grade.describe()
+    assert grade.metric("sectionCoverage").ok is False
+    assert attribution.fault is not Fault.NONE
+    assert attribution.fault is Fault.UNKNOWN
+    assert "no retry" in attribution.reason
+
+
+def test_a_warn_still_finds_a_model_fault_when_the_evidence_says_so():
+    """The same routing, but where the comparison has something specific to
+    say: sources and audio agree, the document doesn't -- MODEL fault, even
+    though the overall verdict only ever reaches `warn` because nothing else
+    failed hard enough to sink it below the fail line."""
+    mir = _mir(_TRUE_PROGRESSION)
+    candidates = [_candidate(_TRUE_PROGRESSION, "web-1"), _candidate(_TRUE_PROGRESSION, "web-2")]
+    sections = [
+        {"sectionIndex": 0, "name": "Verse 1", "kind": "verse",
+         "startLineIndex": 0, "endLineIndex": 11},  # never timed -- sectionCoverage fails
+    ]
+    # A document that mostly ignores the evidence on JUST enough placements to
+    # miss the chordMatchRatio threshold slightly while everything else (an
+    # otherwise well-timed, well-covered document) keeps the overall above the
+    # fail line.
+    document = Song.model_validate(
+        _document(_TRUE_PROGRESSION[:-6] + ["D", "E", "D", "E", "D", "E"], duration=90.0)
+        .model_dump()
+        | {"sections": sections}
+    )
+    grade, attribution = _attribute(document, mir, candidates)
+
+    assert grade.verdict == "warn", grade.describe()
+    assert attribution.fault is Fault.MODEL
+    assert attribution.actionable is True
+
+
 # --- the honest non-answers --------------------------------------------------
 
 

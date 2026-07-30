@@ -575,7 +575,16 @@ def test_a_realign_that_is_still_audio_bound_suggests_another_recording(monkeypa
 
     report = realign_song(SONG_ID, NEW_VIDEO, allow_timing_loss=True)
 
-    if report.quality.escalation.mark_timing_unreliable:
+    # Gated on `suggest_alternative_recording`, not `mark_timing_unreliable`:
+    # BOTH an audio fault and a collapse the guard could not spread set
+    # `mark_timing_unreliable`, but only an audio fault also looks for a
+    # different recording (see `test_a_mode_b_collapse_only_fail_marks_but_
+    # does_not_search_for_a_recording` below, where `mark_timing_unreliable`
+    # is True and this flag is not). This fixture's chord timeline dies a
+    # quarter of the way in, which fails `chordMatchRatio` and `timingCoverage`
+    # in their own right (not merely a tail collapse), so it is a genuine,
+    # broad AUDIO fault and must still search.
+    if report.quality.escalation.suggest_alternative_recording:
         assert captured, "an audio fault must look for a better recording"
         assert report.suggestions is not None
         assert report.suggestions.suggestions[0].video_id == "studio12345"
@@ -587,6 +596,57 @@ def test_a_realign_that_is_still_audio_bound_suggests_another_recording(monkeypa
             f"expected an audio-fault verdict from a partial timeline, got "
             f"{report.quality.attribution.describe()}"
         )
+
+
+def test_a_mode_b_collapse_only_fail_marks_but_does_not_search_for_a_recording(
+    monkeypatch, store
+):
+    """The other half of the split, exercised through Mode B specifically
+    (`realign.py` wires `mark_timing_unreliable` and `suggest_alternative_
+    recording` from two separate escalation flags -- see the block right
+    after the quality gate there). A tail collapse that is the ONLY thing
+    wrong with the grade must mark the timing unreliable and make NO
+    `suggest_recordings` call: the guard already refused to invent spacing for
+    those lines, and no other recording of the song supplies the span it
+    looked for -- unlike the broad audio fault above, where a different
+    recording genuinely might do better.
+    """
+    store.save(_stored_song(), message="gold")
+    # The new recording's chord timeline matches the stored document for its
+    # first 9 chords (comfortably clearing `chordMatchRatio` and
+    # `timingCoverage`) and diverges only for the last 3 -- exactly
+    # `COLLAPSE_RUN_THRESHOLD`, with nothing later to spread the tail into.
+    mismatched_tail = list(PROGRESSION[:9]) + ["Dm", "Dm", "Dm"]
+    _wire(monkeypatch, _mir(mismatched_tail, duration=DURATION))
+
+    captured: list[dict] = []
+
+    def spy_suggest(song, **kwargs):
+        captured.append({"song": song, **kwargs})
+        from snoocle_server.recordings import RecordingSuggestions
+
+        return RecordingSuggestions(song_id=song.id, reason="spy")
+
+    monkeypatch.setattr(realign_mod, "suggest_recordings", spy_suggest)
+
+    report = realign_song(SONG_ID, NEW_VIDEO, allow_timing_loss=True)
+
+    assert report.quality.grade.failing == (report.quality.grade.metric("collapseRuns"),), (
+        "the collapse must be the grade's only failing metric for this to be "
+        "a genuine collapse-only fail"
+    )
+    assert report.quality.escalation.mark_timing_unreliable is True
+    assert report.quality.escalation.suggest_alternative_recording is False
+
+    assert captured == [], "no other recording of the song supplies the collapsed span"
+    assert report.suggestions is None
+    assert "recording-suggestions" not in report.steps
+    assert report.steps["timing-reliability"] == (
+        "marked unreliable (collapsed timing the guard could not spread)"
+    )
+
+    stored = store.get(SONG_ID)
+    assert "timing-unreliable" in [p.action for p in stored.provenance]
 
 
 # --- the HTTP surface --------------------------------------------------------

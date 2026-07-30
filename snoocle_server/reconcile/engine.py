@@ -12,6 +12,21 @@ validation. See that module for why (a Song document IS the complete lyrics
 of a copyrighted song) and for the four rules that make it a guarantee
 rather than a request.
 
+Timing is enforced here too, in the same spirit and for the same reason: the
+model is never the authority on it. Every deterministic timing pass guards its
+writes with "is this field empty?", and model-supplied timing is never empty —
+so a re-emitted ``timeSeconds`` silently outranked the measured value the pass
+would have written, and nothing downstream could see it happen. ``_finalize``
+strips model-supplied timing before those passes run, field by field, keeping
+only what nothing else on that run can supply. See ``_strip_model_timing``.
+
+WHICH pass will time the document is the CALLER's fact, not something this
+module may infer: two public entry points (``POST /v1/reconcile`` and the MCP
+``reconcile_song``) hand over a MIR and then run no timing pass at all. So the
+caller declares it — :class:`TimingAuthority`, defaulting to ``NONE`` (strip
+nothing) — and a caller that declares a pass and then doesn't complete it can
+put back exactly what was taken (:meth:`TimingStrip.restore`).
+
 A targeted correction in notes-only scope is a THIRD path, not a smaller
 version of the first two: the model doesn't reconcile or reference anything,
 it names a short list of OPERATIONS against the prior document
@@ -28,6 +43,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -117,6 +133,10 @@ class ReconcileResult:
     # nothing was regenerated, so there is nothing for those passes to do
     # except risk disturbing what a patch deliberately left alone.
     patch_ops_applied: int = 0
+    # What the model-timing strip removed (None when nothing was), so the caller
+    # that DECLARED the authority can put the recording-level fields back if the
+    # pass it named never completed. See :class:`TimingStrip`.
+    timing_strip: TimingStrip | None = None
 
 
 def extract_json(text: str) -> str:
@@ -131,6 +151,299 @@ def extract_json(text: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+#: Provenance ``action`` for the normalisation below. Greppable on purpose: a
+#: reader of a song's history must be able to find every run whose model output
+#: claimed timing, and see exactly what was dropped.
+TIMING_STRIP_ACTION = "model-timing-stripped"
+
+#: Provenance ``action`` for the undo (:meth:`TimingStrip.restore`). Equally
+#: greppable: a strip entry whose authority never delivered must be readable as
+#: such off the song's own history, not inferred from a missing field.
+TIMING_RESTORE_ACTION = "model-timing-restored"
+
+
+class TimingAuthority(str, Enum):
+    """WHICH deterministic pass will time this document once ``reconcile``
+    returns — declared by the CALLER, never inferred here.
+
+    The engine used to read this off ``mir is not None``, which is a property of
+    the INPUTS, not of what the caller is going to do with the output. Two
+    public entry points (``POST /v1/reconcile``, MCP ``reconcile_song``) pass a
+    MIR and then hand the document straight back with no timing pass at all: on
+    those, inferring an authority stripped ``metadata.bpm`` and ``audio.syncMap``
+    for a pass that never ran, and named it in provenance as if it had.
+
+    ``NONE`` is the default precisely because it is the safe answer: a caller
+    that says nothing gets nothing stripped, and only a caller that OWNS a
+    timing pass can ask for the fields that pass writes to be cleared.
+    """
+
+    #: No pass will time this document — strip nothing, the model's timing is
+    #: the only timing there is (``POST /v1/reconcile``, MCP ``reconcile_song``,
+    #: and any pipeline run that ends up with no MIR and no prior to carry).
+    NONE = "none"
+    #: ``timing.snap`` (``timing/snap.py``) will run against THIS run's MIR.
+    SNAP = "snap"
+    #: ``timing.carry_forward`` (``timing/carry_forward.py``) will copy the prior
+    #: version's timing onto this document.
+    CARRY_FORWARD = "carry_forward"
+
+
+#: How each authority is named in provenance and on the run trace. Read by a
+#: human six months later, so it says both the pass and where its numbers come
+#: from.
+_AUTHORITY_NAMES = {
+    TimingAuthority.SNAP: "timing.snap (this run's MIR)",
+    TimingAuthority.CARRY_FORWARD: "timing.carry_forward (the prior version)",
+}
+
+
+@dataclass(frozen=True)
+class TimingStrip:
+    """What :func:`_strip_model_timing` removed, and who owed it back.
+
+    Rides on :class:`ReconcileResult` so the caller that DECLARED the authority
+    can undo the strip when that authority did not actually complete — see
+    :meth:`restore`. Only the RECORDING-level values are recorded: the
+    per-element and per-section strip happens exclusively on the
+    ``CARRY_FORWARD`` branch, whose only caller treats a carry-forward failure
+    as fatal (``pipeline.py``'s ``timing_carry_forward_failed``), so a run that
+    loses those never reaches a store to lose them in.
+    """
+
+    authority: TimingAuthority
+    #: The field groups dropped, in the wording the provenance entry uses.
+    fields: tuple[str, ...]
+    #: The removed recording-level values, keyed by their path on the Song.
+    #: Only keys actually stripped are present, so a restore puts back exactly
+    #: what was taken and never invents a value the model never sent.
+    recording: dict = field(default_factory=dict)
+
+    @property
+    def authority_name(self) -> str:
+        return _AUTHORITY_NAMES.get(self.authority, self.authority.value)
+
+    def restore(self, song: Song, *, reason: str) -> tuple[Song, list[str]]:
+        """Put back every recording-level field this strip took that is STILL
+        empty, with a provenance entry saying why. Returns ``(song, restored)``;
+        ``restored`` is empty when the authority delivered after all.
+
+        The strip's whole justification is "a pass is about to write this". When
+        that pass skips or raises, the justification is void, and the honest
+        repair is to undo the removal rather than substitute a third source:
+        after the undo the document is byte-for-byte what it would have been
+        with no strip at all, so nothing downstream — the pre-store audio-data
+        guard included (``timing/carry_forward.audio_data_lost``) — can behave
+        differently than it did before the strip existed.
+        """
+        restored: list[str] = []
+        audio_update: dict = {}
+        beats = self.recording.get("audio.beats")
+        if beats and not song.audio.beats:
+            audio_update["beats"] = list(beats)
+            restored.append(f"audio.beats ({len(beats)} entries)")
+        sync_map = self.recording.get("audio.syncMap")
+        # Every restored value is one this document already validated with, so
+        # the only cross-field rule the undo could break is the syncMap's
+        # "lineIndex within range" (schema/song.py:309) — and only if something
+        # dropped lines between the strip and here. Skip that one field rather
+        # than let the undo be the thing that raises: the fields the pre-store
+        # guard reads must come back regardless.
+        if (
+            sync_map
+            and not song.audio.syncMap
+            and all(p.lineIndex < len(song.lines) for p in sync_map)
+        ):
+            audio_update["syncMap"] = list(sync_map)
+            restored.append(f"audio.syncMap ({len(sync_map)} points)")
+        updates: dict = {}
+        if audio_update:
+            updates["audio"] = song.audio.model_copy(update=audio_update)
+        bpm = self.recording.get("metadata.bpm")
+        if bpm is not None and song.metadata.bpm is None:
+            updates["metadata"] = song.metadata.model_copy(update={"bpm": bpm})
+            restored.append(f"metadata.bpm ({bpm})")
+        if not restored:
+            return song, []
+        entry = ProvenanceEntry(
+            timestamp=_now(),
+            actor=f"snoocle-server/{__version__}",
+            action=TIMING_RESTORE_ACTION,
+            confidence=None,
+            notes=(
+                f"{self.authority_name} did not time this document ({reason}), so "
+                "the fields stripped for it were put back exactly as the model "
+                "supplied them: " + ", ".join(restored)
+                + " — nothing measured them on this run"
+            ),
+        )
+        # Same rule as the strip itself: never hand a caller a Song this pass
+        # hasn't re-validated (model_copy skips validators in pydantic v2).
+        return (
+            Song.model_validate(
+                song.model_copy(
+                    update={**updates, "provenance": list(song.provenance) + [entry]}
+                ).model_dump()
+            ),
+            restored,
+        )
+
+
+def _strip_model_timing(
+    song: Song, *, authority: TimingAuthority, mir: MirAnalysis | None
+) -> tuple[Song, TimingStrip | None]:
+    """Drop the timing the MODEL supplied, so the deterministic pass the caller
+    named can actually write it. Returns ``(song, strip)`` — ``strip`` is
+    ``None`` when nothing was stripped (or nothing may be).
+
+    Every timing pass guards its writes with "is this field empty?"
+    (``timing/snap.py:303,308``, ``timing/carry_forward.py:272,313,324``), and
+    model-supplied timing is never empty — so the model's own numbers silently
+    outrank the measured or carried-forward ones. That is the whole bug. The
+    fix is not another guard downstream; it is that a model claim never reaches
+    a pass as if it were evidence.
+
+    WHICH fields go depends on what the named pass will actually refill.
+    Stripping a field nothing else writes just makes coverage worse, so:
+
+    * **``SNAP`` — ``timing.snap`` will run against this run's MIR.** Only the
+      RECORDING-level fields go: ``audio.beats`` (blocked by ``if not
+      song.audio.beats``), ``metadata.bpm`` (blocked by ``if bpm is None``) and
+      ``audio.syncMap`` (which ``snap_chords`` regenerates unconditionally).
+      ``audio.beats``/``metadata.bpm`` are stripped only when THIS run's MIR
+      actually carries them, so the strip can never empty a field the pass would
+      then leave empty.
+
+      Per-element timing (placement/line ``timeSeconds``) is deliberately NOT
+      stripped: ``snap_chords`` writes it with no presence guard
+      (``timing/snap.py:275,293``) and so already overrules the model whenever
+      it has anything to write — but it writes NOTHING when no chord root
+      matched the MIR timeline at all, and in that case the model's times are
+      the only ones there are. Section spans are NOT stripped either: on this
+      path nothing else can write them (``timing/realign.retime_sections`` is
+      only reachable from ``realign.py``'s Mode B), so stripping them would
+      guarantee ``sectionCoverage=0.00``.
+
+      A ``SNAP`` declaration with no MIR strips nothing: ``snap_chords`` is a
+      documented no-op in that case, so there is no authority to strip for.
+
+    * **``CARRY_FORWARD`` — ``timing.carry_forward`` will copy the prior
+      version's timing on.** Everything goes, including section spans:
+      ``_carry_sections`` (``timing/carry_forward.py:202-206``) requires BOTH
+      section times to be ``None`` before it will carry the prior's, so
+      stripping is what ENABLES section carry-forward here. The recording-level
+      fields come from the prior version or the caller's audio fallback
+      (``carry_forward.py:309-325``), which are the same documents the pre-store
+      guard compares against, so emptying them here can never outrun a refill.
+
+    * **``NONE``** — nothing is stripped. Either no pass will read this document
+      at all (``POST /v1/reconcile``, MCP ``reconcile_song``), or the run reached
+      the snap branch with no MIR (a failed analysis, ``listen=off`` with no
+      prior to carry): the model is genuinely the only writer and dropping its
+      timing would only destroy data.
+    """
+    if authority is TimingAuthority.NONE:
+        return song, None
+    if authority is TimingAuthority.SNAP and mir is None:
+        # Declared, but `snap_chords` returns the document untouched without a
+        # MIR (timing/snap.py:250) — no pass, so no strip.
+        return song, None
+    recording_fields_only = authority is TimingAuthority.SNAP
+
+    stripped: list[str] = []
+    removed: dict = {}
+    updates: dict = {}
+
+    if not recording_fields_only:
+        new_lines = []
+        placements_cleared = 0
+        lines_cleared = 0
+        for line in song.lines:
+            placements = []
+            for placement in line.chordPlacements:
+                if (
+                    placement.timeSeconds is not None
+                    or placement.confidence is not None
+                    or placement.beat is not None
+                ):
+                    placements_cleared += 1
+                    placement = placement.model_copy(
+                        update={"timeSeconds": None, "confidence": None, "beat": None}
+                    )
+                placements.append(placement)
+            line_update: dict = {"chordPlacements": placements}
+            if line.timeSeconds is not None or line.confidence is not None:
+                lines_cleared += 1
+                line_update["timeSeconds"] = None
+                line_update["confidence"] = None
+            new_lines.append(line.model_copy(update=line_update))
+        if placements_cleared or lines_cleared:
+            updates["lines"] = new_lines
+        if placements_cleared:
+            stripped.append(
+                f"chordPlacement.timeSeconds/confidence/beat ({placements_cleared})"
+            )
+        if lines_cleared:
+            stripped.append(f"line.timeSeconds/confidence ({lines_cleared})")
+
+        sections_cleared = sum(
+            1 for s in song.sections if s.startTime is not None or s.endTime is not None
+        )
+        if sections_cleared:
+            updates["sections"] = [
+                s.model_copy(update={"startTime": None, "endTime": None})
+                for s in song.sections
+            ]
+            stripped.append(f"section.startTime/endTime ({sections_cleared})")
+
+    # The recording-level fields, and who can put each one back.
+    if authority is TimingAuthority.CARRY_FORWARD:
+        # The prior version, or the caller's audio fallback. USUALLY those are
+        # the same documents the pre-store guard measures against, so emptying
+        # these cannot outrun a refill. Not always: with a request-supplied
+        # priorSong and NO stored version, carry-forward's only audio source is
+        # that prior, and if it carries `beats: []`/`bpm: null` nothing refills
+        # them. That is the right outcome on a listen=off run — nothing measured
+        # them — and the guard stays quiet because its baseline is the same
+        # bpm-less document. Do not read this as "a refill is guaranteed".
+        beats_refillable = bpm_refillable = True
+    else:
+        # Only THIS run's analysis can, so a field its MIR hasn't got is left
+        # alone rather than emptied for nobody.
+        beats_refillable = bool(mir and mir.beats)
+        bpm_refillable = bool(mir and mir.bpm)
+
+    audio_update: dict = {}
+    if song.audio.beats and beats_refillable:
+        audio_update["beats"] = []
+        removed["audio.beats"] = list(song.audio.beats)
+        stripped.append(f"audio.beats ({len(song.audio.beats)} entries)")
+    if song.audio.syncMap:
+        # Both passes REGENERATE the syncMap from the line times they wrote
+        # (snap.py:302, carry_forward.py:310), so this one is never a loss.
+        audio_update["syncMap"] = []
+        removed["audio.syncMap"] = list(song.audio.syncMap)
+        stripped.append(f"audio.syncMap ({len(song.audio.syncMap)} points)")
+    if audio_update:
+        updates["audio"] = song.audio.model_copy(update=audio_update)
+    if song.metadata.bpm is not None and bpm_refillable:
+        removed["metadata.bpm"] = song.metadata.bpm
+        updates["metadata"] = song.metadata.model_copy(update={"bpm": None})
+        stripped.append(f"metadata.bpm ({song.metadata.bpm})")
+
+    if not stripped:
+        return song, None
+    # model_copy(update=...) does not re-run validators (pydantic v2). Same
+    # rule as timing.snap and timing.carry_forward: never hand the pipeline a
+    # Song this pass hasn't re-validated.
+    return (
+        Song.model_validate(song.model_copy(update=updates).model_dump()),
+        TimingStrip(
+            authority=authority, fields=tuple(stripped), recording=removed
+        ),
+    )
 
 
 def _make_snippet(audio_path: str) -> AudioAttachment | None:
@@ -162,6 +475,7 @@ def _finalize(
     attempts: int,
     guidance: str | None = None,
     guidance_origin: str | None = None,
+    guidance_withheld: str | None = None,
     scope: AnalysisScope | None = None,
     mir_cache=None,
     lyric_refs_resolved: int = 0,
@@ -169,8 +483,23 @@ def _finalize(
     patch_ops_applied: tuple[AppliedOp, ...] = (),
     quality_feedback: str | None = None,
     structure_feedback: str | None = None,
-) -> Song:
-    """Server-side guardrails + append provenance (never trusted to the LLM)."""
+    timing_authority: TimingAuthority = TimingAuthority.NONE,
+    trace: TraceRecorder | None = None,
+) -> tuple[Song, TimingStrip | None]:
+    """Server-side guardrails + append provenance (never trusted to the LLM).
+
+    ``timing_authority`` enforces the one rule the eleven timing paths had no
+    single owner for: the model is never the authority on timing (see
+    :func:`_strip_model_timing`). It defaults to ``NONE`` — strip nothing —
+    because the safe answer must be the one a caller gets by saying nothing, and
+    because the PATCH path must never strip: a patch copies the prior document's
+    timing through verbatim and the pipeline skips every timing pass for it, so
+    there would be nothing to refill what a strip emptied.
+
+    Returns the song and the :class:`TimingStrip` describing what was removed
+    (``None`` when nothing was), which the caller needs to undo the strip if the
+    authority it declared does not complete.
+    """
     updates: dict = {"id": song_id, "provenance": []}
     if song.displayPreferences.capo != 0:
         log.warning("reconciler set capo=%d; forcing display capo to 0", song.displayPreferences.capo)
@@ -185,6 +514,10 @@ def _finalize(
     if youtube_video_id and song.audio.youtubeVideoId != youtube_video_id:
         updates["audio"] = song.audio.model_copy(update={"youtubeVideoId": youtube_video_id})
     song = song.model_copy(update=updates)
+
+    # The model is not the authority on timing, and this is the last place the
+    # rule can be enforced before the deterministic passes read the document.
+    song, timing_strip = _strip_model_timing(song, authority=timing_authority, mir=mir)
 
     prov: list[ProvenanceEntry] = []
     if candidates:
@@ -226,6 +559,14 @@ def _finalize(
     guidance_note = ""
     if guidance:
         guidance_note = f"; guidance applied (from {guidance_origin or 'this request'})"
+    # And never WITHHELD silently either — the same claim about the same run.
+    # A notes-only run is shown its correction alone (pipeline.py's
+    # `model_guidance`), so a standing preference was in force for this version
+    # and deliberately not acted on. Without this the only record of that lived
+    # in the HTTP response's `steps`, which nothing persists, and a reader six
+    # months later would see a version built as if no preference existed.
+    if guidance_withheld:
+        guidance_note += "; standing preference held back (notes-only run)"
     # Same reasoning for scope: a version produced from the prior song + notes
     # alone is a very different artifact from a full re-analysis, and six
     # months later the history is the only place that difference survives.
@@ -310,7 +651,37 @@ def _finalize(
                 ),
             )
         )
-    return song.model_copy(update={"provenance": prov})
+    # A silent strip would trade one invisible write for another. The operator
+    # must be able to read, off the song's own history, that the model claimed
+    # timing on this run and exactly which claims were dropped — the actor is
+    # the SERVER, not the model: this is a server-side normalisation, not
+    # something the model was asked to do.
+    if timing_strip is not None:
+        prov.append(
+            ProvenanceEntry(
+                timestamp=_now(),
+                actor=f"snoocle-server/{__version__}",
+                action=TIMING_STRIP_ACTION,
+                confidence=None,
+                notes=(
+                    "the model is not the authority on timing: dropped "
+                    + ", ".join(timing_strip.fields)
+                    + " from the model's document before the timing pass ran; "
+                    + f"{timing_strip.authority_name} decides these fields on this run"
+                ),
+            )
+        )
+        if trace is not None:
+            trace.step(
+                "timing", TIMING_STRIP_ACTION,
+                f"dropped model-supplied timing ({len(timing_strip.fields)} field "
+                f"group(s)); {timing_strip.authority_name} is the authority",
+                detail={
+                    "fields": list(timing_strip.fields),
+                    "authority": timing_strip.authority_name,
+                },
+            )
+    return song.model_copy(update={"provenance": prov}), timing_strip
 
 
 def _attempt_patch(
@@ -404,6 +775,11 @@ def reconcile(
     trace: TraceRecorder | None = None,
     guidance: str | None = None,
     guidance_origin: str | None = None,
+    #: A standing preference that WAS in force for this run and was deliberately
+    #: not handed over (a notes-only run sees its correction alone — see
+    #: pipeline.py's `model_guidance`). Recorded in provenance, never in a
+    #: prompt: the point is that the model does not see it.
+    guidance_withheld: str | None = None,
     prior_song: dict | None = None,
     depth: DepthProfile | None = None,
     scope: AnalysisScope | None = None,
@@ -412,7 +788,20 @@ def reconcile(
     patch_ops_eligible: bool = False,
     quality_feedback: str | None = None,
     structure_feedback: str | None = None,
+    timing_authority: TimingAuthority = TimingAuthority.NONE,
 ) -> ReconcileResult:
+    """Reconcile the run's evidence into a validated Song.
+
+    ``timing_authority`` is the caller's declaration of WHICH deterministic
+    timing pass will run against the returned document (:class:`TimingAuthority`).
+    It defaults to ``NONE`` — nothing is stripped — because a caller that runs no
+    timing pass must get the model's timing back untouched: an entry point that
+    returns the document to a client (``POST /v1/reconcile``, MCP
+    ``reconcile_song``) has no pass to hand authority to, and stripping there
+    dropped ``metadata.bpm``/``audio.syncMap`` for nobody. Only a caller that
+    OWNS a pass may declare it, and if that pass then skips or raises the caller
+    puts the fields back from ``result.timing_strip``.
+    """
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
     depth = depth or resolve_depth(None)
@@ -475,7 +864,11 @@ def reconcile(
         )
         if attempt is not None:
             patched_song, applied_ops, resolved_model, usage = attempt
-            song = _finalize(
+            # No `timing_authority` whatever the caller declared: a patch
+            # regenerated nothing, and the pipeline skips every timing pass for
+            # it (pipeline.py's `patched -> skip entirely`), so there would be
+            # nothing to refill what a strip emptied.
+            song, _ = _finalize(
                 patched_song,
                 song_id=song_id,
                 title=title,
@@ -488,6 +881,7 @@ def reconcile(
                 attempts=1,
                 guidance=guidance,
                 guidance_origin=guidance_origin,
+                guidance_withheld=guidance_withheld,
                 scope=scope,
                 patch_ops_applied=tuple(applied_ops),
             )
@@ -658,7 +1052,7 @@ def reconcile(
                 {"role": "user", "text": build_repair_prompt(last_errors, uses_lyric_refs)}
             )
             continue
-        song = _finalize(
+        song, timing_strip = _finalize(
             song,
             song_id=song_id,
             title=title,
@@ -671,12 +1065,19 @@ def reconcile(
             attempts=attempt,
             guidance=guidance,
             guidance_origin=guidance_origin,
+            guidance_withheld=guidance_withheld,
             scope=scope,
             mir_cache=mir_cache,
             lyric_refs_resolved=refs_resolved,
             lyric_overrides=overrides,
             quality_feedback=quality_feedback,
             structure_feedback=structure_feedback,
+            # Whatever the CALLER said will time this document. Never inferred
+            # from `mir is not None`: that is a fact about this run's inputs,
+            # and two public entry points hand a MIR in and then run no timing
+            # pass at all. A caller that declares nothing strips nothing.
+            timing_authority=timing_authority,
+            trace=trace,
         )
         if trace is not None:
             trace.step(
@@ -705,6 +1106,7 @@ def reconcile(
             audio_attached=audio is not None,
             usage=usage,
             trace=trace.trace if trace is not None else None,
+            timing_strip=timing_strip,
         )
 
     raise ReconcileError(

@@ -1,4 +1,9 @@
-from .engine import ReconcileResult, reconcile  # noqa: F401
+from .engine import (  # noqa: F401
+    ReconcileResult,
+    TimingAuthority,
+    TimingStrip,
+    reconcile,
+)
 from .providers import (  # noqa: F401
     get_provider,
     provider_capabilities,

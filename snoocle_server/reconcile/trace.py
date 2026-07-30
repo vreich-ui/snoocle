@@ -91,6 +91,11 @@ class RunTrace:
     # it stays in the run summary alongside reviewQueue rather than being
     # stripped like "mir"/"mirWindows" — the admin UI wants it in list views.
     evidence_manifest: dict | None = None
+    # This run's quality grade, fault attribution and escalation decision (see
+    # snoocle_server/quality/). Recorded on EVERY run whatever the verdict —
+    # a song's grade history is what makes non-convergence visible. Small and
+    # flat, so it stays in list views too.
+    quality: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -110,6 +115,7 @@ class RunTrace:
             "mirWindows": self.mir_windows,
             "reviewQueue": self.review_queue,
             "evidenceManifest": self.evidence_manifest,
+            "quality": self.quality,
         }
 
 
@@ -157,6 +163,13 @@ class TraceRecorder:
         """Attach the run's evidence manifest — replaces any previous value."""
         with self._lock:
             self.trace.evidence_manifest = dict(manifest) if manifest else None
+        _publish(self.trace)
+
+    def set_quality(self, quality: dict | None) -> None:
+        """Attach the run's quality grade/attribution/escalation (see
+        snoocle_server/quality/) — replaces any previous value."""
+        with self._lock:
+            self.trace.quality = dict(quality) if quality else None
         _publish(self.trace)
 
     def set_review_queue(self, review_queue: list[dict]) -> None:

@@ -50,6 +50,17 @@ snoocle_server/
 │                    (memory.py, hermetic) backends; content-hash versions,
 │                    expected_version optimistic locking via a Firestore
 │                    transaction, append-only provenance, JSON diffs
+├── quality/         step 5f: the deterministic grade (grader.py), fault
+│                    attribution — MODEL vs AUDIO vs SOURCE (attribution.py),
+│                    and the escalation decision with its one-retry ceiling
+│                    (escalation.py). theory.py is the optional music21
+│                    key-explainability check
+├── reconcile/match.py  score_candidate: one candidate sheet against the MIR
+│                    chord timeline at all 12 transpositions, so a sheet in
+│                    another key reads as good evidence needing a shift
+├── timing/root_match.py  the root-pitch-class matcher shared by snap.py and
+│                    reconcile/match.py — one implementation, so a grade
+│                    measures what the pipeline actually did
 ├── timing/          Phase A/B deterministic timing: snap.py (MIR chord/line
 │                    time assignment), carry_forward.py (the same fields
 │                    carried from the PRIOR version when a run doesn't
@@ -333,6 +344,76 @@ spanned by line timings — in its `timing-collapse-guard` provenance entry
 on every run that timed anything at all, whether or not a collapse fired,
 so "39% coverage" is now a number every run surfaces instead of one this
 repo had to notice by hand.
+
+## Grading a document, and escalating only when escalation can help
+
+Every signal above was computed and then dropped on the floor. `timing-snap`
+recorded "matched 9/86 chord placement(s)" (0.10) for the 1966 live take and
+32/66 (0.48) on the next attempt, both stored without comment. Three Little
+Birds was reconciled ten times in sixteen minutes — match ratios 0.41 0.51
+0.42 0.53 0.68 0.55 0.48 0.47 0.63 0.49 — no convergence, nothing noticing.
+
+`quality/` closes that loop in three separate pieces, deliberately separate
+because they answer different questions:
+
+**`quality/grader.py` — the grade.** Pure, deterministic, no model, no
+network. Seven metrics: chord match ratio, timing coverage, interpolation
+share, surviving collapse runs, section coverage, theory validity, lyric
+completeness. Each one REUSES the pass that already computed it (the match
+ratio is `timing.snap`'s own matcher via `timing/root_match.py`; coverage and
+collapse runs are `timing.collapse_guard`'s; the interpolation tier is
+`snap.INTERPOLATED_CONFIDENCE`) — a grade measuring something subtly different
+from what the pipeline did would be worse than no grade. A metric with no
+inputs reports `None` and is excluded from the weighted overall: "not
+measured" must never read as "measured and bad". Thresholds are configurable
+(`SNOOCLE_QUALITY_*`), and the verdict is `pass`/`warn`/`fail`/`unknown` —
+`fail` when the overall is below its threshold OR when half of the measurable
+metrics fail, since perfect chords and words cannot make an untimed document
+playable. The grade lands in provenance (`quality-grade`) and on the run trace
+on EVERY run, whatever it says: the grade history is what would have made ten
+non-converging Marley runs visible on the second one.
+
+Theory validity is the one new signal: a chord no key explains is usually a
+transcription error that survived reconciliation. music21 (extra `theory`)
+owns the key -> scale and chord-symbol -> pitch-class mappings; a chord counts
+as explained when it is fully diatonic (raised seventh included in minor) or
+is a borrowed major/secondary dominant on a diatonic root. Deliberately
+permissive — a false "this song is broken" is worse than a missed one — and
+absent the extra it reports "not measured", like any other optional engine.
+
+**`quality/attribution.py` — whose fault.** A low grade is not automatically
+the model's, and retrying a run whose evidence was bad pays full price for the
+same result. Each candidate is scored against the MIR timeline by
+`reconcile/match.py::score_candidate`, at all twelve transpositions, so a
+sheet in G against a recording in Bb reads as the good source it is (score
+1.0 at +3) rather than as garbage. Then: candidates disagreeing with each
+other -> **SOURCE**; candidates agreeing with each other while the timeline
+contradicts them, or a chord timeline spanning under half the track ->
+**AUDIO**; candidates agreeing with each other AND the audio while the
+document agrees with neither -> **MODEL**. Anything else is `NONE`/`UNKNOWN`,
+and both are non-actionable — guessing "model" is how a retry budget gets
+burned on runs that were never going to converge.
+
+**`quality/escalation.py` — what to do.** MODEL fault: one retry, handed the
+grade and the specific failures (metric names, offending line and placement
+indexes — `build_retry_feedback`), never a vague "try harder". AUDIO fault:
+store it and mark the version `timing-unreliable` in provenance; do not
+retry. SOURCE fault: one targeted, cache-bypassing search, which earns the
+single retry only if the new sheets agree with the audio materially better
+than the ones already judged contradictory. **Never more than one retry per
+grade**, enforced structurally — `pipeline.py` threads the real spent counts
+into `plan_escalation`, so a second escalation cannot be planned. Collapse
+runs are deliberately not an escalation path at all: the collapse guard
+already spread what could honestly be spread, and a run that reaches the
+grader is one where "could not time this region" beats fabricated spacing.
+
+In `pipeline.py` this is step 5f, which is why steps 5-5d live in one
+re-runnable unit (`_reconcile_and_time`): a retry that re-reconciled without
+re-snapping, re-guarding and re-scoring would be graded on a document no
+store would ever receive. Grading is best-effort throughout — a grader
+failure records itself in `steps` and never fails a run — and a retry that
+dies leaves the first attempt's graded document to be stored, since losing a
+storable song to a failed optional retry is strictly worse.
 
 ## A permanent id is forever — auditing and repairing a bad one
 

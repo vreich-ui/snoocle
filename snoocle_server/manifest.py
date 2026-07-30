@@ -84,7 +84,7 @@ def _mir_block(mir, cache_info) -> dict:
     return block
 
 
-def _sources_block(candidates, cache_info) -> dict:
+def _sources_block(candidates, cache_info, mir=None) -> dict:
     block: dict[str, Any] = {
         "status": f"cache-{cache_info.status}" if cache_info is not None else "absent",
         "count": len(candidates or []),
@@ -94,11 +94,20 @@ def _sources_block(candidates, cache_info) -> dict:
         age = _age_days(cache_info.gathered_at)
         if age is not None:
             block["ageDays"] = age
-    # NOTE: no `scores` field. Per-candidate scoring (reconcile.match.
-    # score_candidate) does not exist on this branch, and inventing a scoring
-    # function here would make the manifest a source of truth about quality
-    # rather than a description of provenance. When that module lands, add the
-    # field here — do not synthesize a stand-in.
+    # `scores` is each candidate measured against THIS run's audio timeline by
+    # reconcile.match.score_candidate — matched/total at the best of the 12
+    # transpositions, so a sheet in another key reads as the good source it is.
+    # Still descriptive, not a source of truth: the manifest reports the score,
+    # quality/attribution.py is what decides anything with it. Absent (not
+    # zeroed) with no MIR to score against — "unmeasured" and "scored badly"
+    # must not look alike.
+    if candidates and mir is not None:
+        try:
+            from .reconcile.match import score_candidates
+
+            block["scores"] = [s.to_dict() for s in score_candidates(candidates, mir)]
+        except Exception as e:  # noqa: BLE001 — descriptive only; never fail a run
+            log.warning("candidate scoring unavailable for the manifest: %s", e)
     return block
 
 
@@ -172,7 +181,7 @@ def build_evidence_manifest(
             request["notesOrigin"] = guidance_origin
         return {
             "mir": _mir_block(mir, mir_cache),
-            "sources": _sources_block(candidates, discovery_cache),
+            "sources": _sources_block(candidates, discovery_cache, mir),
             "priorSong": _prior_song_block(prior_song),
             # Filled in after step 5c; "pending" is the honest value at the
             # moment the reconciler sees this.

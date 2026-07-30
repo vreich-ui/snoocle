@@ -15,8 +15,9 @@ import pytest
 from snoocle_server.discovery.cache import DiscoveryCacheInfo
 from snoocle_server.discovery.models import CandidateSource
 from snoocle_server.manifest import build_evidence_manifest, lrc_block
-from snoocle_server.mir.base import AnalyzedWindow, MirAnalysis
+from snoocle_server.mir.base import AnalyzedWindow, ChordSegment, MirAnalysis
 from snoocle_server.mir.cache import MirCacheInfo
+from snoocle_server.schema.song import ChordPlacement, Line
 from snoocle_server.scope import AnalysisScope
 
 
@@ -193,16 +194,46 @@ def test_manifest_survives_an_unparseable_prior_song():
     assert "version" not in m["priorSong"], "an unvalidatable song has no derivable version"
 
 
-def test_no_scores_field_until_a_real_scorer_exists():
-    """reconcile.match.score_candidate does not exist on this branch. Inventing
-    a stand-in would make the manifest a source of truth about quality rather
-    than a description of provenance — so the field is simply absent."""
-    import importlib.util
-
-    assert importlib.util.find_spec("snoocle_server.reconcile.match") is None, (
-        "reconcile.match now exists — add the `scores` field to _sources_block "
-        "using its score_candidate, rather than leaving this test asserting absence"
+def test_scores_report_each_candidate_against_the_audio():
+    """`scores` is reconcile.match.score_candidate per candidate — a real
+    measurement against this run's MIR timeline, not a stand-in. Still
+    descriptive: the manifest reports it, quality/attribution.py is what
+    decides anything with it."""
+    mir = make_mir(
+        chords=[
+            ChordSegment(start=0.0, end=2.0, chord="A"),
+            ChordSegment(start=2.0, end=4.0, chord="E"),
+        ]
     )
+    candidate = CandidateSource(
+        sourceId="web-0",
+        confidence=0.9,
+        lines=[
+            Line(
+                lineIndex=0,
+                lyrics="don't worry about a thing",
+                chordPlacements=[
+                    ChordPlacement(charIndex=0, chord="A"),
+                    ChordPlacement(charIndex=12, chord="E"),
+                ],
+            )
+        ],
+    )
+    m = build_evidence_manifest(
+        mir=mir,
+        mir_cache=MirCacheInfo(status="miss", analyzed_at="x"),
+        candidates=[candidate],
+        discovery_cache=DiscoveryCacheInfo(status="miss", gathered_at="x"),
+    )
+    assert m["sources"]["scores"] == [
+        {"score": 1.0, "transposition": 0, "matched": 2, "total": 2, "conflicts": 0,
+         "sourceId": "web-0"}
+    ]
+
+
+def test_no_scores_field_without_an_audio_timeline_to_score_against():
+    """"unmeasured" and "scored badly" must not look alike: with no MIR there
+    is nothing to compare a candidate to, so the field is absent rather than 0."""
     m = build_evidence_manifest(
         candidates=make_candidates(3),
         discovery_cache=DiscoveryCacheInfo(status="miss", gathered_at="x"),

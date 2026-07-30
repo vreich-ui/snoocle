@@ -131,10 +131,14 @@ def test_full_pipeline_and_versioning():
     assert added and any("timestamp" in ln for ln in added)
 
     # second run's provenance extends the first (append-only): one "reconciled"
-    # entry per run (no discovery in the mock path).
+    # entry per run (no discovery in the mock path), and one "quality-grade" per
+    # run -- the grader records its verdict on every run whatever it says (see
+    # snoocle_server/quality/grader.py).
     latest = client.get("/v1/songs/the-beatles--let-it-be").json()
-    assert len(latest["provenance"]) == 2
-    assert all(p["action"] == "reconciled" for p in latest["provenance"])
+    actions = [p["action"] for p in latest["provenance"]]
+    assert actions.count("reconciled") == 2
+    assert actions.count("quality-grade") == 2
+    assert set(actions) == {"reconciled", "quality-grade"}
 
 
 def test_pipeline_expected_version_conflict():

@@ -61,7 +61,11 @@ from .identity import IdentityError, SongIdentity, resolve_identity
 from .manifest import build_evidence_manifest, lrc_block
 from .mir import MirAnalysis, analyze_audio
 from .mir.cache import MirCacheInfo, analyze_cached
+from .quality import Attribution, Escalation, Grade, attribute_fault, grade_song, plan_escalation
+from .quality.escalation import build_retry_feedback, search_found_better
+from .quality.grader import grade_provenance_entry, timing_unreliable_provenance_entry
 from .reconcile import ReconcileResult, provider_preflight, reconcile
+from .reconcile.match import score_candidates
 from .reconcile.depth import resolve_depth
 from .reconcile.trace import TraceRecorder, start_run
 from .schema.song import ProvenanceEntry, Song, slugify_song_id
@@ -217,6 +221,7 @@ def _step_reconcile(
     evidence_manifest: dict | None = None,
     mir_cache: MirCacheInfo | None = None,
     patch_ops_eligible: bool = False,
+    quality_feedback: str | None = None,
 ) -> ReconcileResult:
     return reconcile(
         title,
@@ -238,6 +243,7 @@ def _step_reconcile(
         evidence_manifest=evidence_manifest,
         mir_cache=mir_cache,
         patch_ops_eligible=patch_ops_eligible,
+        quality_feedback=quality_feedback,
     )
 
 
@@ -540,235 +546,370 @@ async def run_pipeline_async(
     )
     recorder = start_run(song_id, resolved_provider, depth.name)
     report.run_id = recorder.trace.run_id
-    try:
-        report.reconcile = await _timed_step(
-            "reconcile",
-            lambda: _step_reconcile(
-                title, artist, song_id, report.candidates, report.mir,
-                provider, model, attach_audio, report.audio,
-                trace=recorder, guidance=guidance, guidance_origin=guidance_origin,
-                prior_song=effective_prior_song, depth=depth, scope=scope,
-                evidence_manifest=report.evidence_manifest,
-                mir_cache=report.mir_cache,
-                patch_ops_eligible=(
-                    classification.patch_eligible
-                    if classification is not None and scope is not None and scope.notes_only
-                    else False
+
+    # What the quality gate (5f) has already spent. Threaded into
+    # `plan_escalation`, which is what makes the one-retry ceiling structural
+    # rather than a promise: with these at their real values a second
+    # escalation cannot be planned. See quality/escalation.py.
+    quality_retries_spent = 0
+    quality_searches_spent = 0
+
+    # Steps 5-5d run as ONE unit because the quality gate (5f) may run them a
+    # SECOND time: a reconciliation and every deterministic pass that reads
+    # what it produced belong together. A retry that re-reconciled without
+    # re-snapping, re-guarding and re-scoring would be graded on a document
+    # nothing had timed — not the document a store would ever receive.
+    async def _reconcile_and_time(*, quality_feedback: str | None = None) -> bool:
+        """One reconciliation plus every deterministic pass that reads its output.
+
+        Returns True when the document came from the patch path (nothing was
+        regenerated, so 5b/5c/5c2/5d all skip by their own contracts). Mutates
+        `report` exactly as the inline code it replaced did; FATAL failures
+        raise :class:`PipelineStepError`.
+        """
+        nonlocal quality_retries_spent
+        if quality_feedback is not None:
+            quality_retries_spent += 1
+
+        try:
+            report.reconcile = await _timed_step(
+                "reconcile",
+                lambda: _step_reconcile(
+                    title, artist, song_id, report.candidates, report.mir,
+                    provider, model, attach_audio, report.audio,
+                    trace=recorder, guidance=guidance, guidance_origin=guidance_origin,
+                    prior_song=effective_prior_song, depth=depth, scope=scope,
+                    evidence_manifest=report.evidence_manifest,
+                    mir_cache=report.mir_cache,
+                    patch_ops_eligible=(
+                        classification.patch_eligible
+                        if classification is not None and scope is not None and scope.notes_only
+                        else False
+                    ),
+                    quality_feedback=quality_feedback,
                 ),
-            ),
-            settings.reconcile_timeout_seconds,
-        )
-    except asyncio.TimeoutError as e:
-        recorder.finish("error", error=f"timed out after {settings.reconcile_timeout_seconds:.0f}s")
-        _persist_trace(recorder)
-        raise PipelineStepError(
-            "reconcile",
-            f"timed out after {settings.reconcile_timeout_seconds:.0f}s",
-            steps=report.steps,
-        ) from e
-    except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
-        recorder.finish("error", error=str(e)[:2000])
-        _persist_trace(recorder)
-        # A classified provider error (e.g. content_filtered) carries its own
-        # code; otherwise fall back to any code an upstream step recorded.
-        code = getattr(e, "error_code", None) or report.error_code
-        raise PipelineStepError(
-            "reconcile", str(e), steps=report.steps, error_code=code
-        ) from e
-    result = report.reconcile
-    recorder.finish("ok", model=result.model)
-    report.steps["reconcile"] = (
-        f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"
-    )
-
-    # 5a. cover attribution. `artist` is who is PLAYING on this recording, so
-    # for a cover the artist who originally released the song would otherwise
-    # be lost entirely. Record it as a provenance note rather than bending
-    # metadata.album, which means the album this recording appears on.
-    if identity is not None and identity.is_cover and identity.original_artist:
-        result.song = result.song.model_copy(
-            update={
-                "provenance": list(result.song.provenance)
-                + [
-                    ProvenanceEntry(
-                        timestamp=_now_iso(),
-                        actor=f"snoocle-server/{__version__}",
-                        action="cover-attribution",
-                        confidence=round(identity.confidence, 3),
-                        notes=(
-                            f"cover: performed by {identity.artist!r}, "
-                            f"originally by {identity.original_artist!r} "
-                            f"(identified from the upload's own metadata via {identity.method})"
-                        ),
-                    )
-                ]
-            }
-        )
-
-    # A patch (reconcile/patch_ops.py) names exactly what it touches and
-    # copies everything else through untouched, including every timing
-    # field — there is nothing here to carry forward, snap, or re-align, and
-    # running any of 5b/5c/5d would mean re-deriving values a patch
-    # deliberately left alone. This is what makes the timing-loss class of
-    # bug impossible on this path rather than merely guarded against: none
-    # of the guarding passes are consulted, because nothing was regenerated.
-    patched = result.patch_ops_applied > 0
-
-    # 5b. deterministic chord/line timing. Three mutually exclusive passes:
-    #
-    #   patched -> skip entirely, see above.
-    #   listen=off -> carry the prior version's timing forward (FATAL on
-    #     failure). This run has no MIR by construction, so snap_chords would
-    #     be a no-op by its own contract and the reconciler's freshly-emitted
-    #     document — which correctly leaves timing empty for a post-pass to
-    #     fill — would store with its timing silently gone.
-    #   otherwise  -> MIR-grounded snapping, exactly as before (best-effort —
-    #     a failure here must never block storing an otherwise-good song; the
-    #     pipeline continues with whatever timing the reconciler produced,
-    #     which today is none). A no-op when MIR didn't run.
-    carried_forward = False
-    if patched:
-        report.steps["timing"] = (
-            f"skipped (patch: {result.patch_ops_applied} op(s) preserved the "
-            f"prior version's timing)"
-        )
-    elif not want_listen and timing_prior is not None:
-        try:
-            result.song, carry_stats = carry_forward_timing(
-                result.song,
-                timing_prior,
-                audio_fallback=stored_prior,
-                prior_version=timing_prior_version,
+                settings.reconcile_timeout_seconds,
             )
-        except Exception as e:  # noqa: BLE001 — fatal: see the block comment
-            log.warning("pipeline.step error step=timing err=%s", e)
+        except asyncio.TimeoutError as e:
+            recorder.finish("error", error=f"timed out after {settings.reconcile_timeout_seconds:.0f}s")
+            _persist_trace(recorder)
             raise PipelineStepError(
-                "timing",
-                f"could not carry the prior version's timing forward: {e}",
+                "reconcile",
+                f"timed out after {settings.reconcile_timeout_seconds:.0f}s",
                 steps=report.steps,
-                error_code="timing_carry_forward_failed",
             ) from e
-        carried_forward = True
-        report.steps["timing"] = f"ok: {carry_stats.describe()}"
-    else:
-        try:
-            timed_song = snap_chords(result.song, report.mir)
-            if report.mir is not None and report.audio is not None:
-                timed_song = timed_song.model_copy(
-                    update={
-                        "audio": timed_song.audio.model_copy(
-                            update={"analyzedVideoId": report.audio.video_id}
+        except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
+            recorder.finish("error", error=str(e)[:2000])
+            _persist_trace(recorder)
+            # A classified provider error (e.g. content_filtered) carries its own
+            # code; otherwise fall back to any code an upstream step recorded.
+            code = getattr(e, "error_code", None) or report.error_code
+            raise PipelineStepError(
+                "reconcile", str(e), steps=report.steps, error_code=code
+            ) from e
+        result = report.reconcile
+        recorder.finish("ok", model=result.model)
+        report.steps["reconcile"] = (
+            f"ok: provider={result.provider} model={result.model} attempts={result.attempts}"
+        )
+
+        # 5a. cover attribution. `artist` is who is PLAYING on this recording, so
+        # for a cover the artist who originally released the song would otherwise
+        # be lost entirely. Record it as a provenance note rather than bending
+        # metadata.album, which means the album this recording appears on.
+        if identity is not None and identity.is_cover and identity.original_artist:
+            result.song = result.song.model_copy(
+                update={
+                    "provenance": list(result.song.provenance)
+                    + [
+                        ProvenanceEntry(
+                            timestamp=_now_iso(),
+                            actor=f"snoocle-server/{__version__}",
+                            action="cover-attribution",
+                            confidence=round(identity.confidence, 3),
+                            notes=(
+                                f"cover: performed by {identity.artist!r}, "
+                                f"originally by {identity.original_artist!r} "
+                                f"(identified from the upload's own metadata via {identity.method})"
+                            ),
                         )
-                    }
-                )
-            result.song = timed_song
-            report.steps["timing"] = "ok" if report.mir is not None else "skipped (no MIR)"
-        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
-            report.steps["timing"] = f"failed: {e}"
-            log.warning("pipeline.step error step=timing err=%s", e)
-
-    # 5c. LRCLIB synced-lyrics overlay (best-effort, network-dependent). LRC
-    # is better LINE-timing evidence than MIR chord matching, so when it
-    # matches it WINS — this must run BEFORE confidence scoring (5d), which
-    # reads whatever timeSeconds ends up final, not 5b's provisional guess.
-    # Skipped for provider=mock like discover — mock is the fully-offline
-    # deterministic path and must make ZERO external calls of any kind.
-    if patched:
-        report.steps["lrc"] = "skipped (patch: nothing was regenerated to re-align)"
-        report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
-    elif carried_forward:
-        # apply_lrc REPLACES line times and then re-derives every chord time
-        # by proportional redistribution — which is exactly the timing 5b just
-        # restored from the prior version, only worse (with no MIR there is no
-        # beat grid to snap back onto). "Reuse the existing audio analysis"
-        # means reuse it, not re-derive it from a different source.
-        report.steps["lrc"] = "skipped (scope: timing carried forward from the prior version)"
-        report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
-    elif resolved_provider == "mock":
-        report.steps["lrc"] = "skipped (mock: offline deterministic reconciler)"
-        report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
-    else:
-        try:
-            duration = (
-                (report.mir.duration_seconds if report.mir else None)
-                or (report.audio.duration_seconds if report.audio else None)
+                    ]
+                }
             )
-            lrc = fetch_lrc(title, artist, duration)
-            if lrc:
-                matches = match_lrc_to_lines(lrc, result.song)
-                if matches:
-                    result.song = apply_lrc(result.song, report.mir, matches)
-                    report.steps["lrc"] = f"ok: {len(matches)}/{len(result.song.lines)} line(s) matched"
-                    report.evidence_manifest["lrcAlign"] = lrc_block(
-                        "hit", len(matches), len(result.song.lines)
+
+        # A patch (reconcile/patch_ops.py) names exactly what it touches and
+        # copies everything else through untouched, including every timing
+        # field — there is nothing here to carry forward, snap, or re-align, and
+        # running any of 5b/5c/5d would mean re-deriving values a patch
+        # deliberately left alone. This is what makes the timing-loss class of
+        # bug impossible on this path rather than merely guarded against: none
+        # of the guarding passes are consulted, because nothing was regenerated.
+        patched = result.patch_ops_applied > 0
+
+        # 5b. deterministic chord/line timing. Three mutually exclusive passes:
+        #
+        #   patched -> skip entirely, see above.
+        #   listen=off -> carry the prior version's timing forward (FATAL on
+        #     failure). This run has no MIR by construction, so snap_chords would
+        #     be a no-op by its own contract and the reconciler's freshly-emitted
+        #     document — which correctly leaves timing empty for a post-pass to
+        #     fill — would store with its timing silently gone.
+        #   otherwise  -> MIR-grounded snapping, exactly as before (best-effort —
+        #     a failure here must never block storing an otherwise-good song; the
+        #     pipeline continues with whatever timing the reconciler produced,
+        #     which today is none). A no-op when MIR didn't run.
+        carried_forward = False
+        if patched:
+            report.steps["timing"] = (
+                f"skipped (patch: {result.patch_ops_applied} op(s) preserved the "
+                f"prior version's timing)"
+            )
+        elif not want_listen and timing_prior is not None:
+            try:
+                result.song, carry_stats = carry_forward_timing(
+                    result.song,
+                    timing_prior,
+                    audio_fallback=stored_prior,
+                    prior_version=timing_prior_version,
+                )
+            except Exception as e:  # noqa: BLE001 — fatal: see the block comment
+                log.warning("pipeline.step error step=timing err=%s", e)
+                raise PipelineStepError(
+                    "timing",
+                    f"could not carry the prior version's timing forward: {e}",
+                    steps=report.steps,
+                    error_code="timing_carry_forward_failed",
+                ) from e
+            carried_forward = True
+            report.steps["timing"] = f"ok: {carry_stats.describe()}"
+        else:
+            try:
+                timed_song = snap_chords(result.song, report.mir)
+                if report.mir is not None and report.audio is not None:
+                    timed_song = timed_song.model_copy(
+                        update={
+                            "audio": timed_song.audio.model_copy(
+                                update={"analyzedVideoId": report.audio.video_id}
+                            )
+                        }
                     )
+                result.song = timed_song
+                report.steps["timing"] = "ok" if report.mir is not None else "skipped (no MIR)"
+            except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+                report.steps["timing"] = f"failed: {e}"
+                log.warning("pipeline.step error step=timing err=%s", e)
+
+        # 5c. LRCLIB synced-lyrics overlay (best-effort, network-dependent). LRC
+        # is better LINE-timing evidence than MIR chord matching, so when it
+        # matches it WINS — this must run BEFORE confidence scoring (5d), which
+        # reads whatever timeSeconds ends up final, not 5b's provisional guess.
+        # Skipped for provider=mock like discover — mock is the fully-offline
+        # deterministic path and must make ZERO external calls of any kind.
+        if patched:
+            report.steps["lrc"] = "skipped (patch: nothing was regenerated to re-align)"
+            report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
+        elif carried_forward:
+            # apply_lrc REPLACES line times and then re-derives every chord time
+            # by proportional redistribution — which is exactly the timing 5b just
+            # restored from the prior version, only worse (with no MIR there is no
+            # beat grid to snap back onto). "Reuse the existing audio analysis"
+            # means reuse it, not re-derive it from a different source.
+            report.steps["lrc"] = "skipped (scope: timing carried forward from the prior version)"
+            report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
+        elif resolved_provider == "mock":
+            report.steps["lrc"] = "skipped (mock: offline deterministic reconciler)"
+            report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
+        else:
+            try:
+                duration = (
+                    (report.mir.duration_seconds if report.mir else None)
+                    or (report.audio.duration_seconds if report.audio else None)
+                )
+                lrc = fetch_lrc(title, artist, duration)
+                if lrc:
+                    matches = match_lrc_to_lines(lrc, result.song)
+                    if matches:
+                        result.song = apply_lrc(result.song, report.mir, matches)
+                        report.steps["lrc"] = f"ok: {len(matches)}/{len(result.song.lines)} line(s) matched"
+                        report.evidence_manifest["lrcAlign"] = lrc_block(
+                            "hit", len(matches), len(result.song.lines)
+                        )
+                    else:
+                        report.steps["lrc"] = "ok: no line matched closely enough"
+                        report.evidence_manifest["lrcAlign"] = lrc_block(
+                            "miss", 0, len(result.song.lines)
+                        )
                 else:
-                    report.steps["lrc"] = "ok: no line matched closely enough"
-                    report.evidence_manifest["lrcAlign"] = lrc_block(
-                        "miss", 0, len(result.song.lines)
+                    report.steps["lrc"] = (
+                        "skipped (no LRCLIB match)" if settings.lrclib_enabled else "skipped (disabled)"
                     )
-            else:
-                report.steps["lrc"] = (
-                    "skipped (no LRCLIB match)" if settings.lrclib_enabled else "skipped (disabled)"
+                    report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
+            except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+                report.steps["lrc"] = f"failed: {e}"
+                report.evidence_manifest["lrcAlign"] = lrc_block("failed")
+                log.warning("pipeline.step error step=lrc err=%s", e)
+
+        # 5c2. timing collapse guard (best-effort). A generic safety net,
+        # independent of what upstream produced it: whatever path just set
+        # timeSeconds (snap, carry-forward, then possibly LRC), a run of 3+
+        # consecutive lines or in-line placements sharing one identical
+        # timestamp gets spread across the span to the next distinct time (on
+        # the beat grid when there is one); a collapse with nothing later to
+        # spread toward is left alone and reported as such. Runs BEFORE 5d so
+        # confidence scoring judges the corrected times, not the collapsed
+        # ones. Skipped for a patch, same as 5b/5c: nothing was regenerated.
+        any_line_timed = any(line.timeSeconds is not None for line in result.song.lines)
+        if patched:
+            report.steps["timing-collapse-guard"] = "skipped (patch: nothing was regenerated)"
+        elif not any_line_timed:
+            # Nothing was ever timed (no MIR, no carry-forward, no LRC match) --
+            # there is no collapse to guard against and no coverage worth
+            # reporting, so stay silent rather than add a provenance entry to a
+            # song this pipeline never attempted to time.
+            report.steps["timing-collapse-guard"] = "skipped (no line timings to guard)"
+        else:
+            try:
+                duration = (
+                    (report.mir.duration_seconds if report.mir else None)
+                    or (report.audio.duration_seconds if report.audio else None)
+                    or result.song.audio.durationSeconds
                 )
-                report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
-        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
-            report.steps["lrc"] = f"failed: {e}"
-            report.evidence_manifest["lrcAlign"] = lrc_block("failed")
-            log.warning("pipeline.step error step=lrc err=%s", e)
+                guarded_song, guard_entry = guard_against_collapsed_timing(result.song, duration)
+                result.song = guarded_song
+                report.steps["timing-collapse-guard"] = f"ok: {guard_entry.notes}"
+            except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+                report.steps["timing-collapse-guard"] = f"failed: {e}"
+                log.warning("pipeline.step error step=timing-collapse-guard err=%s", e)
 
-    # 5c2. timing collapse guard (best-effort). A generic safety net,
-    # independent of what upstream produced it: whatever path just set
-    # timeSeconds (snap, carry-forward, then possibly LRC), a run of 3+
-    # consecutive lines or in-line placements sharing one identical
-    # timestamp gets spread across the span to the next distinct time (on
-    # the beat grid when there is one); a collapse with nothing later to
-    # spread toward is left alone and reported as such. Runs BEFORE 5d so
-    # confidence scoring judges the corrected times, not the collapsed
-    # ones. Skipped for a patch, same as 5b/5c: nothing was regenerated.
-    any_line_timed = any(line.timeSeconds is not None for line in result.song.lines)
-    if patched:
-        report.steps["timing-collapse-guard"] = "skipped (patch: nothing was regenerated)"
-    elif not any_line_timed:
-        # Nothing was ever timed (no MIR, no carry-forward, no LRC match) --
-        # there is no collapse to guard against and no coverage worth
-        # reporting, so stay silent rather than add a provenance entry to a
-        # song this pipeline never attempted to time.
-        report.steps["timing-collapse-guard"] = "skipped (no line timings to guard)"
-    else:
+        # 5d. per-chord agreement scoring (best-effort). Must run LAST of this
+        # group: the MIR-agreement signal reads placement.timeSeconds, which 5b
+        # (or 5c, if LRC overrode it, or 5c2, if the collapse guard touched it)
+        # is what populates. Refines confidence when both a source and MIR
+        # signal exist, and records a compact "check these first" queue on the
+        # run trace. Skipped for a patch: with no candidates and no MIR it would
+        # only ever touch placements with NO confidence yet (a freshly inserted
+        # chord) by inventing the neutral default 0.5 for them — exactly the
+        # kind of un-named change this path exists to refuse.
+        if patched:
+            report.steps["confidence"] = "skipped (patch: nothing to re-score)"
+        else:
+            try:
+                scored_song, scores = score_song(result.song, report.candidates, report.mir)
+                result.song = scored_song
+                recorder.set_review_queue(build_review_queue(scores))
+                report.steps["confidence"] = f"ok: {len(scores)} placement(s) scored"
+            except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+                report.steps["confidence"] = f"failed: {e}"
+                log.warning("pipeline.step error step=confidence err=%s", e)
+
+        return patched
+
+    patched = await _reconcile_and_time()
+    result = report.reconcile
+
+    # 5f. the quality gate (snoocle_server/quality/). Three separate things,
+    # and the order matters:
+    #
+    #   grade      -> deterministic, recorded in provenance on EVERY run
+    #                 whatever it says. A song's grade history is the thing
+    #                 that would have made ten non-converging Marley runs
+    #                 visible on the second one instead of the tenth.
+    #   attribute  -> MODEL vs AUDIO vs SOURCE, by comparing the document, the
+    #                 candidate sheets and the MIR timeline against each other.
+    #   escalate   -> at most ONE retry, and only when a retry can plausibly
+    #                 change the outcome. A run whose evidence was bad pays
+    #                 full price for the same result.
+    #
+    # Grading a patched document is fine (and its grade is still recorded);
+    # escalating one is not — nothing was regenerated, so there is nothing for
+    # a second attempt to do differently.
+    if settings.quality_enabled:
         try:
-            duration = (
-                (report.mir.duration_seconds if report.mir else None)
-                or (report.audio.duration_seconds if report.audio else None)
-                or result.song.audio.durationSeconds
+            grade, attribution, escalation = _grade_document(
+                report,
+                can_search=want_sources,
+                can_retry=settings.quality_retry_enabled and not patched,
+                retries_spent=quality_retries_spent,
+                searches_spent=quality_searches_spent,
             )
-            guarded_song, guard_entry = guard_against_collapsed_timing(result.song, duration)
-            result.song = guarded_song
-            report.steps["timing-collapse-guard"] = f"ok: {guard_entry.notes}"
-        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
-            report.steps["timing-collapse-guard"] = f"failed: {e}"
-            log.warning("pipeline.step error step=timing-collapse-guard err=%s", e)
+            report.steps["quality"] = f"{grade.describe()} | fault: {attribution.describe()}"
+            recorder.step(
+                "quality", "quality-grade",
+                f"grade {grade.verdict}: {escalation.describe()}",
+                detail={"grade": grade.to_dict(), "attribution": attribution.to_dict()},
+            )
 
-    # 5d. per-chord agreement scoring (best-effort). Must run LAST of this
-    # group: the MIR-agreement signal reads placement.timeSeconds, which 5b
-    # (or 5c, if LRC overrode it, or 5c2, if the collapse guard touched it)
-    # is what populates. Refines confidence when both a source and MIR
-    # signal exist, and records a compact "check these first" queue on the
-    # run trace. Skipped for a patch: with no candidates and no MIR it would
-    # only ever touch placements with NO confidence yet (a freshly inserted
-    # chord) by inventing the neutral default 0.5 for them — exactly the
-    # kind of un-named change this path exists to refuse.
-    if patched:
-        report.steps["confidence"] = "skipped (patch: nothing to re-score)"
+            retry_feedback: str | None = escalation.feedback if escalation.retry else None
+
+            # SOURCE fault: the sheets this run had contradict each other, so
+            # one targeted search (cache bypassed on purpose — those same
+            # cached sheets are what is being escalated away from) looks for
+            # better evidence. It only earns the single retry if it actually
+            # found some; otherwise the document is stored with its grade.
+            if escalation.search:
+                quality_searches_spent += 1
+                retry_feedback = await _quality_targeted_search(
+                    report, title, artist, max_candidates, grade, attribution
+                )
+
+            if retry_feedback is not None:
+                try:
+                    patched = await _reconcile_and_time(quality_feedback=retry_feedback)
+                    result = report.reconcile
+                    # Re-grade what the retry produced. `retries_spent` is now
+                    # 1, so plan_escalation cannot plan another retry — that is
+                    # the ceiling, enforced by the same function that granted
+                    # the first one.
+                    grade, attribution, escalation = _grade_document(
+                        report,
+                        can_search=want_sources,
+                        can_retry=settings.quality_retry_enabled and not patched,
+                        retries_spent=quality_retries_spent,
+                        searches_spent=quality_searches_spent,
+                    )
+                    report.steps["quality"] = (
+                        f"{grade.describe()} | fault: {attribution.describe()} "
+                        f"(after 1 retry)"
+                    )
+                    recorder.step(
+                        "quality", "quality-regrade",
+                        f"after one retry: grade {grade.verdict}; {escalation.describe()}",
+                        detail={"grade": grade.to_dict(), "attribution": attribution.to_dict()},
+                    )
+                except PipelineStepError as e:
+                    # The retry failed. The first attempt's document is intact
+                    # and gradeable, and losing a storable song to a failed
+                    # OPTIONAL retry would be strictly worse than storing the
+                    # graded original.
+                    log.warning("pipeline.step error step=quality-retry err=%s", e)
+                    report.steps["quality-retry"] = f"failed: {e.message}"
+                    recorder.step(
+                        "quality", "quality-retry-failed",
+                        f"the quality retry failed; storing the first attempt: {e.message}",
+                    )
+                    recorder.finish("ok", model=result.model)
+
+            entries = [grade_provenance_entry(grade, attribution=attribution)]
+            if escalation.mark_timing_unreliable:
+                entries.append(timing_unreliable_provenance_entry(attribution))
+                report.steps["timing-reliability"] = "marked unreliable (audio fault)"
+            result.song = result.song.model_copy(
+                update={"provenance": list(result.song.provenance) + entries}
+            )
+            recorder.set_quality(
+                {
+                    "grade": grade.to_dict(),
+                    "attribution": attribution.to_dict(),
+                    "escalation": escalation.to_dict(),
+                    "retriesSpent": quality_retries_spent,
+                    "searchesSpent": quality_searches_spent,
+                }
+            )
+        except Exception as e:  # noqa: BLE001 — grading must never fail a run
+            report.steps["quality"] = f"failed: {e}"
+            log.warning("pipeline.step error step=quality err=%s", e)
     else:
-        try:
-            scored_song, scores = score_song(result.song, report.candidates, report.mir)
-            result.song = scored_song
-            recorder.set_review_queue(build_review_queue(scores))
-            report.steps["confidence"] = f"ok: {len(scores)} placement(s) scored"
-        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
-            report.steps["confidence"] = f"failed: {e}"
-            log.warning("pipeline.step error step=confidence err=%s", e)
+        report.steps["quality"] = "skipped (quality grading disabled)"
 
     # Record the manifest on the trace only NOW: 5c is what resolves its
     # lrcAlign block from "pending" to what actually happened, so attaching it
@@ -826,6 +967,82 @@ async def run_pipeline_async(
     report.stored_timestamp = saved.timestamp
     report.steps["store"] = f"ok: version {saved.version}"
     return report
+
+
+def _grade_document(
+    report: PipelineReport,
+    *,
+    can_search: bool,
+    can_retry: bool,
+    retries_spent: int,
+    searches_spent: int,
+) -> tuple[Grade, Attribution, Escalation]:
+    """Grade this run's document, attribute the fault, and plan the escalation.
+
+    Pure apart from reading `report` — all three steps are deterministic
+    functions of (document, MIR, candidates), which is what makes a grade
+    reproducible from the stored run trace.
+    """
+    song = report.reconcile.song
+    grade = grade_song(song, report.mir, report.candidates)
+    attribution = attribute_fault(grade, report.mir, report.candidates)
+    escalation = plan_escalation(
+        grade,
+        attribution,
+        retries_spent=retries_spent,
+        searches_spent=searches_spent,
+        can_search=can_search,
+        can_retry=can_retry,
+    )
+    return grade, attribution, escalation
+
+
+async def _quality_targeted_search(
+    report: PipelineReport,
+    title: str,
+    artist: str,
+    max_candidates: int | None,
+    grade: Grade,
+    attribution: Attribution,
+) -> str | None:
+    """The SOURCE-fault escalation: one search for better evidence.
+
+    Returns the retry feedback when the new sheets agree with the audio
+    materially better than the ones this run already had (in which case
+    `report.candidates` has been replaced with them), else None — a search
+    that found nothing better has not changed the situation, and reconciling
+    again against equivalent evidence is the full-price no-op this whole
+    module exists to refuse.
+
+    Best-effort: a failed search leaves the run exactly as it was.
+    """
+    try:
+        candidates, cache = await _timed_step(
+            "quality-search",
+            lambda: _step_discover(title, artist, max_candidates, True),
+            settings.discover_timeout_seconds,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort (incl. timeout)
+        report.steps["quality-search"] = _fail_text(e, settings.discover_timeout_seconds)
+        return None
+
+    old_scores = score_candidates(report.candidates, report.mir)
+    new_scores = score_candidates(candidates, report.mir)
+    if not search_found_better(old_scores, new_scores):
+        report.steps["quality-search"] = (
+            f"ok: {len(candidates)} candidate source(s) found, none agreeing with the "
+            f"audio better than the {len(report.candidates)} already gathered — "
+            f"storing with the grade rather than paying for an equivalent retry"
+        )
+        return None
+
+    report.steps["quality-search"] = (
+        f"ok: {len(candidates)} candidate source(s) agreeing with the audio better "
+        f"than the {len(report.candidates)} this run started with; reconciling once more"
+    )
+    report.candidates = candidates
+    report.discovery_cache = cache
+    return build_retry_feedback(grade, attribution)
 
 
 def _resolve_guidance(song_id: str, guidance: str | None) -> tuple[str | None, str | None]:

@@ -56,7 +56,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import NamedTuple, Optional
 
-from ..chords import ChordParseError, parse_chord
 from ..mir.base import ChordSegment, MirAnalysis
 from ..schema.song import (
     AudioInfo,
@@ -68,26 +67,22 @@ from ..schema.song import (
     SyncPoint,
 )
 from .quantize import DEFAULT_SNAP_TOLERANCE_SECONDS, build_beat_grid, snap_time
+from .root_match import match_chord_roots, sounding_segments
 
-# How many MIR segments ahead of the current search pointer we're willing to
-# scan for a root match before giving up on a placement. Small on purpose:
-# the reconciler's chord sequence and MIR's should already be closely
-# aligned in order; a large window would let a placement steal a segment
-# that rightfully belongs to a later one.
-_LOOKAHEAD = 2
+#: Confidence tiers this pass assigns. Named because other passes reason about
+#: them: the quality grader counts placements sitting at the INTERPOLATED tier
+#: (a time derived from neighbours, not heard in the audio), and the collapse
+#: guard never raises a spread placement above it.
+MATCHED_CONFIDENCE = 0.9
+#: A matched root whose major/minor family clashes with the audio's.
+FAMILY_CLASH_CONFIDENCE = 0.7
+#: Interpolated between matched neighbours — not measured.
+INTERPOLATED_CONFIDENCE = 0.3
 
 
 class _MatchedTime(NamedTuple):
     position: int  # index into the flat reading-order placement list
     time: float
-
-
-def _is_minor_family(quality: str) -> bool:
-    return quality.startswith("m") and not quality.startswith("maj")
-
-
-def _same_family(quality_a: str, quality_b: str) -> bool:
-    return _is_minor_family(quality_a) == _is_minor_family(quality_b)
 
 
 def _flatten_placements(song: Song) -> list[tuple[int, int, ChordPlacement]]:
@@ -102,43 +97,23 @@ def _flatten_placements(song: Song) -> list[tuple[int, int, ChordPlacement]]:
 def _match_chords_to_mir(
     flat: list[tuple[int, int, ChordPlacement]], mir: MirAnalysis
 ) -> tuple[dict[int, tuple[float, float]], dict[int, ChordSegment]]:
-    """Returns {flat_index: (time, confidence)} and {flat_index: matched_segment}."""
-    segments = sorted(
-        (s for s in mir.chords if s.chord != "N"),
-        key=lambda s: s.start,
+    """Returns {flat_index: (time, confidence)} and {flat_index: matched_segment}.
+
+    The matching itself lives in :mod:`timing.root_match` — shared with the
+    candidate scorer (``reconcile.match``) rather than reimplemented there.
+    This function is only the confidence mapping on top of it.
+    """
+    matched = match_chord_roots(
+        [placement.chord for _li, _pi, placement in flat], sounding_segments(mir)
     )
     matches: dict[int, tuple[float, float]] = {}
     matched_segments: dict[int, ChordSegment] = {}
-    search_idx = 0
-    for flat_idx, (_line_idx, _pi, placement) in enumerate(flat):
-        try:
-            want = parse_chord(placement.chord)
-        except ChordParseError:
-            continue  # schema already guarantees this can't happen; be defensive anyway
-
-        found_at: Optional[int] = None
-        scanned = 0
-        j = search_idx
-        while j < len(segments) and scanned <= _LOOKAHEAD:
-            seg = segments[j]
-            try:
-                seg_chord = parse_chord(seg.chord)
-            except ChordParseError:
-                seg_chord = None
-            if seg_chord is not None and seg_chord.root_pc == want.root_pc:
-                found_at = j
-                break
-            j += 1
-            scanned += 1
-
-        if found_at is not None:
-            seg = segments[found_at]
-            seg_chord = parse_chord(seg.chord)
-            confidence = 0.9 if _same_family(seg_chord.quality, want.quality) else 0.7
-            matches[flat_idx] = (seg.start, confidence)
-            matched_segments[flat_idx] = seg
-            search_idx = found_at + 1
-
+    for flat_idx, match in matched.items():
+        matches[flat_idx] = (
+            match.segment.start,
+            MATCHED_CONFIDENCE if match.same_family else FAMILY_CLASH_CONFIDENCE,
+        )
+        matched_segments[flat_idx] = match.segment
     return matches, matched_segments
 
 
@@ -175,7 +150,7 @@ def _interpolate_unmatched(
         span = tail_anchor - t0
         steps = flat_len - last_matched  # keeps the final placement short of the end
         for i in range(last_matched + 1, flat_len):
-            result[i] = (t0 + span * (i - last_matched) / steps, 0.3)
+            result[i] = (t0 + span * (i - last_matched) / steps, INTERPOLATED_CONFIDENCE)
 
     for i in range(flat_len):
         if i in result:
@@ -192,11 +167,11 @@ def _interpolate_unmatched(
             t0 = matches[before][0]
             t1 = matches[after][0]
             frac = (i - before) / (after - before)
-            result[i] = (t0 + frac * (t1 - t0), 0.3)
+            result[i] = (t0 + frac * (t1 - t0), INTERPOLATED_CONFIDENCE)
         elif before is not None:
-            result[i] = (matches[before][0], 0.3)
+            result[i] = (matches[before][0], INTERPOLATED_CONFIDENCE)
         elif after is not None:
-            result[i] = (matches[after][0], 0.3)
+            result[i] = (matches[after][0], INTERPOLATED_CONFIDENCE)
         # else: no matches at all -- unreachable here since `matches` is non-empty
     return result
 

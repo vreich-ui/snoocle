@@ -1,5 +1,5 @@
 from snoocle_server.mir.base import Beat, MirAnalysis
-from snoocle_server.timing.quantize import build_beat_grid, snap_time
+from snoocle_server.timing.quantize import build_beat_grid, grid_counts, snap_time
 
 
 def _mir(beats, time_signature=None):
@@ -64,3 +64,25 @@ def test_snap_time_empty_grid_is_noop():
     t, ref = snap_time(1.23, [])
     assert t == 1.23
     assert ref is None
+
+
+def test_grid_keeps_inferred_beats_distinguishable():
+    """A grid may run past where the tracker last locked (fade-outs). The
+    measure/beat numbering continues, but `detected` must not be laundered
+    away on the way into the song's schema."""
+    beats = [
+        Beat(time=0.0, position=1),
+        Beat(time=0.5, position=2),
+        Beat(time=1.0, position=3, detected=False),
+        Beat(time=1.5, position=4, detected=False),
+    ]
+    grid = build_beat_grid(_mir(beats))
+    assert [b.detected for b in grid] == [True, True, False, False]
+    assert [(b.measure, b.beatInMeasure) for b in grid] == [(1, 1), (1, 2), (1, 3), (1, 4)]
+    assert grid_counts(grid) == (2, 2)
+
+
+def test_grid_counts_on_an_all_measured_grid():
+    grid = build_beat_grid(_mir([Beat(time=0.0, position=1), Beat(time=0.5, position=2)]))
+    assert grid_counts(grid) == (2, 0)
+    assert grid_counts([]) == (0, 0)

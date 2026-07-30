@@ -178,3 +178,152 @@ def test_song_with_no_lines_does_not_crash():
     assert result.audio.syncMap == []
     assert result.provenance[-1].action == "timing-snap"
     assert result.provenance[-1].confidence is None  # 0/0 placements -- undefined, not 0%
+
+
+# --- fade-out endings ---------------------------------------------------------
+#
+# The failure these cover, from the stored "Three Little Birds" document: beat
+# tracking lost lock 15s before the end of the track, so every placement past
+# the last matched chord piled onto one timestamp -- the outro stopped
+# scrolling. The beat grid now runs to the end (tempo-continued through the
+# fade), which gives the tail something to spread across.
+
+
+def _fade_out_song():
+    """3 lines x 4 placements; MIR only heard the first line's worth."""
+    data = make_song()
+    data["lines"] = [
+        {
+            "lineIndex": i,
+            "lyrics": "Don't worry about a thing, every little thing",
+            "chordPlacements": [
+                {"charIndex": 0, "chord": "C"},
+                {"charIndex": 10, "chord": "G"},
+                {"charIndex": 20, "chord": "Am"},
+                {"charIndex": 30, "chord": "F"},
+            ],
+        }
+        for i in range(3)
+    ]
+    data["sections"] = [
+        {
+            "sectionIndex": 0,
+            "name": "Chorus",
+            "kind": "chorus",
+            "startLineIndex": 0,
+            "endLineIndex": 2,
+        }
+    ]
+    data["audio"]["syncMap"] = []
+    return Song.model_validate(data)
+
+
+def _fade_out_mir(beats_reach_end: bool) -> MirAnalysis:
+    detected_until = 8.0
+    beats = [
+        Beat(time=i * 0.5, position=(i % 4) + 1, detected=(i * 0.5 <= detected_until))
+        for i in range(60)  # 0.0 .. 29.5s
+    ]
+    if not beats_reach_end:
+        beats = [b for b in beats if b.detected]
+    return MirAnalysis(
+        engines={"beats": "librosa-fallback", "chords": "chroma-template-fallback"},
+        duration_seconds=30.0,
+        beats=beats,
+        chords=[
+            ChordSegment(start=0.0, end=2.0, chord="C"),
+            ChordSegment(start=2.0, end=4.0, chord="G"),
+            ChordSegment(start=4.0, end=6.0, chord="Am"),
+            ChordSegment(start=6.0, end=8.0, chord="F"),
+        ],
+    )
+
+
+def _times(song: Song) -> list[float]:
+    return [p.timeSeconds for line in song.lines for p in line.chordPlacements]
+
+
+def test_placements_past_the_last_match_no_longer_collapse_onto_one_time():
+    result = snap_chords(_fade_out_song(), _fade_out_mir(beats_reach_end=True))
+    times = _times(result)
+
+    assert times[:4] == [0.0, 2.0, 4.0, 6.0]  # matched against MIR
+    tail = times[4:]
+    assert len(set(tail)) == len(tail), f"tail collapsed onto shared timestamps: {tail}"
+    assert tail == sorted(tail)
+    assert tail[0] > 6.0
+    assert tail[-1] < 30.0  # never past the end of the track
+    # and they spread across the previously dead window, not just past it
+    assert tail[-1] > 20.0
+
+
+def test_line_times_and_syncmap_follow_the_spread_out_tail():
+    result = snap_chords(_fade_out_song(), _fade_out_mir(beats_reach_end=True))
+    line_times = [line.timeSeconds for line in result.lines]
+    assert line_times == sorted(line_times)
+    assert len(set(line_times)) == 3  # every line gets its own start, not one shared
+    assert [sp.lineIndex for sp in result.audio.syncMap] == [0, 1, 2]
+
+
+def test_a_grid_that_stops_at_the_fade_still_spreads_across_the_duration():
+    """A MIR result whose beats stop short anyway — one analyzed before grids
+    were tempo-continued, replayed from cache. The analyzed duration is still
+    a real anchor, so the tail spreads rather than collapsing; it just has no
+    beats to snap onto out there."""
+    result = snap_chords(_fade_out_song(), _fade_out_mir(beats_reach_end=False))
+    tail = _times(result)[4:]
+    assert len(set(tail)) == len(tail)
+    assert tail == sorted(tail)
+    assert tail[-1] < 30.0
+    past_the_grid = [
+        p for line in result.lines for p in line.chordPlacements if p.timeSeconds > 8.4
+    ]
+    assert past_the_grid and all(p.beat is None for p in past_the_grid)
+
+
+def test_with_neither_beats_nor_a_duration_the_tail_still_holds_constant():
+    """No grid and no duration means nothing is known past the last match --
+    inventing a spread there would be fabrication, not continuation."""
+    song = _fade_out_song()
+    mir = _fade_out_mir(beats_reach_end=False).model_copy(
+        update={"beats": [], "duration_seconds": 0.0}
+    )
+    tail = _times(snap_chords(song, mir))[4:]
+    assert set(tail) == {6.0}  # the last matched chord's time, held
+
+
+def test_provenance_splits_measured_from_inferred_beats():
+    result = snap_chords(_fade_out_song(), _fade_out_mir(beats_reach_end=True))
+    notes = result.provenance[-1].notes
+    assert "beats=filled (grid: 17 measured + 43 inferred)" in notes
+    assert [b.detected for b in result.audio.beats].count(False) == 43
+
+
+def test_provenance_reports_an_all_measured_grid_as_such():
+    song = Song.model_validate(make_song())
+    mir = MirAnalysis(
+        beats=[Beat(time=0.0, position=1), Beat(time=0.5, position=2)],
+        chords=[ChordSegment(start=0.0, end=3.0, chord="C")],
+    )
+    notes = snap_chords(song, mir).provenance[-1].notes
+    assert "beats=filled (grid: 2 measured + 0 inferred)" in notes
+
+
+def test_a_song_whose_beats_already_reach_the_end_is_unaffected():
+    """Nothing here changes for the ordinary case: every placement matches, so
+    there is no tail to spread and the times are exactly the MIR segments'."""
+    song = Song.model_validate(make_song())
+    mir = MirAnalysis(
+        duration_seconds=12.0,
+        beats=[Beat(time=i * 0.5, position=(i % 4) + 1) for i in range(24)],
+        chords=[
+            ChordSegment(start=0.0, end=3.0, chord="C"),
+            ChordSegment(start=3.0, end=6.0, chord="G"),
+            ChordSegment(start=6.0, end=9.0, chord="Am"),
+            ChordSegment(start=9.0, end=12.0, chord="F"),
+        ],
+    )
+    result = snap_chords(song, mir)
+    assert _times(result) == [0.0, 3.0, 6.0, 9.0]
+    assert all(p.confidence == 0.9 for line in result.lines for p in line.chordPlacements)
+    assert all(b.detected for b in result.audio.beats)

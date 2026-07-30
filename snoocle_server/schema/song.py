@@ -168,6 +168,11 @@ class BeatMark(_Model):
     time: float = Field(ge=0)
     measure: int = Field(ge=1)
     beatInMeasure: int = Field(ge=1)
+    # False = the beat tracker never heard this beat; it was continued from the
+    # established tempo across a span it lost lock on (a fade-out ending, a
+    # quiet intro). Grids stored before this field existed decode as all-True,
+    # which is what they were: every beat in them was measured.
+    detected: bool = True
 
 
 class AudioInfo(_Model):

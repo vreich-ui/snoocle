@@ -72,13 +72,16 @@ def test_analyze_windows_offsets_back_to_track_time(monkeypatch, tmp_path):
     from pathlib import Path
 
     from snoocle_server.mir import pipeline as mp
-    from snoocle_server.mir.base import ChordSegment
+    from snoocle_server.mir.base import Beat, ChordSegment
 
     monkeypatch.setattr(mp, "trim", lambda src, dst, s, e: Path(dst).write_bytes(b"x"))
     monkeypatch.setattr(mp, "to_analysis_wav", lambda src, dst, **k: Path(dst).write_bytes(b"x"))
     monkeypatch.setattr(
         mp, "track_beats",
-        lambda wav: ([(0.5, 1), (1.0, 2)], 120.0, "4/4", "librosa-fallback"),
+        lambda wav, duration=None: (
+            [Beat(time=0.5, position=1), Beat(time=1.0, position=2)],
+            120.0, "4/4", "librosa-fallback",
+        ),
     )
     monkeypatch.setattr(
         mp, "recognize_chords",

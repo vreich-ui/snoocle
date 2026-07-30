@@ -55,6 +55,10 @@ def build_beat_grid(
     ``metadata.timeSignature`` when given, else a 4/4 default. This is a
     best-effort approximation, not audio truth; it is still useful for a
     metronome click, just not authoritative for musical downbeat placement.
+
+    ``Beat.detected`` rides through onto ``BeatMark.detected``: a grid may
+    extend past where the tracker last locked (fade-outs), and the caller has
+    to be able to tell those beats apart from measured ones.
     """
     beats: list[Beat] = list(mir.beats) if mir else []
     if not beats:
@@ -81,8 +85,22 @@ def build_beat_grid(
             if beat_in_measure > bpm_count:
                 measure += 1
                 beat_in_measure = 1
-        grid.append(BeatMark(time=b.time, measure=measure, beatInMeasure=beat_in_measure))
+        grid.append(
+            BeatMark(
+                time=b.time,
+                measure=measure,
+                beatInMeasure=beat_in_measure,
+                detected=b.detected,
+            )
+        )
     return grid
+
+
+def grid_counts(grid: list[BeatMark]) -> tuple[int, int]:
+    """(measured, inferred) beats in a grid — inferred ones were continued
+    from the established tempo, not heard. See ``mir.beats.extend_to_duration``."""
+    measured = sum(1 for b in grid if b.detected)
+    return measured, len(grid) - measured
 
 
 def snap_time(

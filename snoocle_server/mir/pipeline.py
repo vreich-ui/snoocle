@@ -109,7 +109,7 @@ def _analyze_windows(
     track's time coordinates so the timeline still aligns with the video.
     Structure segmentation is skipped — text sources carry section names, and
     fragments would only produce misleading labels."""
-    all_beats: list[tuple[float, int]] = []
+    all_beats: list[Beat] = []
     all_chords: list[ChordSegment] = []
     bpms: list[tuple[int, float]] = []  # (beat count, bpm) per window
     time_signature = None
@@ -119,9 +119,11 @@ def _analyze_windows(
         wav = Path(td) / f"window{n}.wav"
         trim(audio_path, clip, start, end)
         to_analysis_wav(clip, wav)
-        beats, bpm, ts, beats_engine = track_beats(str(wav))
-        chords, chords_engine = recognize_chords(str(wav), [t for t, _ in beats])
-        all_beats.extend((t + start, p) for t, p in beats)
+        # duration is the WINDOW's own length: the grid is continued to the end
+        # of what was analyzed, never past it into unanalyzed audio.
+        beats, bpm, ts, beats_engine = track_beats(str(wav), duration=end - start)
+        chords, chords_engine = recognize_chords(str(wav), [b.time for b in beats])
+        all_beats.extend(b.model_copy(update={"time": b.time + start}) for b in beats)
         all_chords.extend(
             c.model_copy(update={"start": c.start + start, "end": c.end + start}) for c in chords
         )
@@ -140,7 +142,7 @@ def _analyze_windows(
         bpm=best_bpm,
         time_signature=time_signature,
         key=estimate_key(all_chords),
-        beats=[Beat(time=t, position=p) for t, p in all_beats],
+        beats=all_beats,
         chords=all_chords,
         sections=[],
         analyzed_windows=[AnalyzedWindow(start=s, end=e) for s, e in windows],
@@ -192,8 +194,8 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         wav = Path(td) / "analysis.wav"
         to_analysis_wav(src, wav)
 
-        beats, bpm, time_signature, beats_engine = track_beats(str(wav))
-        beat_times = [t for t, _ in beats]
+        beats, bpm, time_signature, beats_engine = track_beats(str(wav), duration=duration)
+        beat_times = [b.time for b in beats]
         chord_segments, chords_engine = recognize_chords(str(wav), beat_times)
         sections, structure_engine = segment_structure(str(wav), beat_times)
 
@@ -207,7 +209,7 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         bpm=bpm,
         time_signature=time_signature,
         key=estimate_key(chord_segments),
-        beats=[Beat(time=t, position=p) for t, p in beats],
+        beats=beats,
         chords=chord_segments,
         sections=sections,
         # duration was already reduced to the cap when the clip was trimmed, so

@@ -146,7 +146,12 @@ def mir_cache_key(
 ) -> str:
     """A hex key over every input that can change the analysis."""
     components = {
-        "v": 1,  # key-scheme version: bump to invalidate everything at once
+        # Key-scheme version: bump to invalidate everything at once. v2 =
+        # Beat.detected exists, so v1 blobs no longer round-trip faithfully;
+        # without the bump every pre-existing entry would be read, fail the
+        # round-trip check, and log a corruption warning on its way to the
+        # miss it was always going to be.
+        "v": 2,
         "audio": audio_hash,
         "engines": engine_fingerprint(engines),
         "accuracy": accuracy,

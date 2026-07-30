@@ -431,6 +431,35 @@ source's declared capo, and rating/votes feed a confidence prior
 well-vetted community tab deserves a higher starting confidence than an
 arbitrary, unvoted web hit.
 
+## A beat grid that reaches the end of a fade-out
+
+Both beat engines are onset-strength driven, so both stop locking exactly
+where onsets stop being crisp. A fade-out ending is the worst case: the
+stored "Three Little Birds" document had 439 beats ending at 177.31s of a
+192.18s track — 8% of the song with no beat data, right where the structure
+engine had labelled a "Chorus 5 (fade)" section. Everything downstream is
+beat-derived, so the damage compounded: `chordrec` is beat-synchronous, so
+the fade became one undifferentiated segment, and `snap_chords` had no
+anchor past the last matched chord, so every remaining placement piled onto
+a single timestamp and the outro stopped scrolling.
+
+`mir.beats.extend_to_duration` continues the grid across that span at the
+median detected inter-beat interval, keeping the bar phase. Continuation,
+not re-detection — the faded signal is precisely what the tracker is bad at,
+so re-running it there buys confident nonsense. Two guards keep it from
+firing on healthy tracks: at least 16 detected beats (the tempo estimate has
+to be worth trusting) and a gap of at least two bars (a track that merely
+ends between beats is not a tracking failure). The same test runs at the
+head of the track for a quiet intro; no song in the store has ever needed
+it, and it stays a no-op until one does.
+
+Inferred beats are never indistinguishable from measured ones: `Beat.detected`
+and `BeatMark.detected` are False on every one of them (absent = True, so
+grids stored before this decode as what they were — all measured), the
+`mir-analysis` and `timing-snap` provenance entries both report the
+measured/inferred split, and the run payload carries it per beat for the GUI
+timeline.
+
 ## Chord recognition engine
 
 `scripts/setup_chord_model.sh` vendors the real Chord-CNN-LSTM (ISMIR2019)

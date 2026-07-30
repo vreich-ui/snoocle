@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field
 class Beat(BaseModel):
     time: float  # seconds
     position: int = 0  # beat within bar (1 = downbeat); 0 = unknown
+    # False = this beat was never heard in the audio; it was continued from the
+    # established tempo across a span the tracker lost lock on (see
+    # `mir.beats.extend_to_duration`). Inferred beats must stay distinguishable
+    # from measured ones everywhere they travel.
+    detected: bool = True
 
 
 class ChordSegment(BaseModel):
@@ -49,6 +54,12 @@ class MirAnalysis(BaseModel):
     # unknown/legacy (treat as full-track).
     analyzed_windows: list[AnalyzedWindow] = Field(default_factory=list)
 
+    def beat_counts(self) -> tuple[int, int]:
+        """(measured, inferred) — how much of the beat grid the tracker
+        actually heard vs. continued from the established tempo."""
+        measured = sum(1 for b in self.beats if b.detected)
+        return measured, len(self.beats) - measured
+
     def to_prompt_payload(self, max_beats: int = 64) -> dict:
         """Compact JSON for the reconciliation prompt: full chord/section
         timeline, beats summarized (they matter as tempo/downbeat evidence,
@@ -63,8 +74,10 @@ class MirAnalysis(BaseModel):
             "timeSignature": self.time_signature,
             "estimatedKey": self.key,
             "beatCount": len(beats),
+            "beatsInferred": self.beat_counts()[1],
             "beatsSampled": [
-                {"time": round(b.time, 2), "position": b.position} for b in beats[::stride]
+                {"time": round(b.time, 2), "position": b.position, "detected": b.detected}
+                for b in beats[::stride]
             ],
             "chordTimeline": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}
@@ -101,8 +114,10 @@ class MirAnalysis(BaseModel):
             "timeSignature": self.time_signature,
             "estimatedKey": self.key,
             "beatCount": len(self.beats),
+            "beatsInferred": self.beat_counts()[1],
             "beatsSampled": [
-                {"time": round(b.time, 2), "position": b.position} for b in beats
+                {"time": round(b.time, 2), "position": b.position, "detected": b.detected}
+                for b in beats
             ],
             "chordTimeline": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}

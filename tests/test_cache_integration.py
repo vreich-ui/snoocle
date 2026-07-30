@@ -93,7 +93,7 @@ def test_provenance_is_unchanged_when_no_cache_info_is_supplied():
         provider_name="mock", song_id="bob-marley--three-little-birds",
     )
     assert _mir_provenance_notes(result.song) == (
-        "audio-grounded analysis; bpm=152.0, key=A major"
+        "audio-grounded analysis; bpm=152.0, key=A major; beats=0 measured"
     )
 
 

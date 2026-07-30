@@ -37,7 +37,8 @@ def click_track_wav(tmp_path_factory):
 
 def test_librosa_fallback_returns_plain_floats(click_track_wav):
     beats, bpm, time_signature = track_beats_librosa(click_track_wav)
-    assert beats and all(isinstance(t, float) for t, _ in beats)
+    assert beats and all(isinstance(b.time, float) for b in beats)
+    assert all(b.detected for b in beats)  # nothing inferred without a duration
     # bpm must be a plain float (not an ndarray) or None — float(ndarray) was
     # the production crash
     assert bpm is None or isinstance(bpm, float)

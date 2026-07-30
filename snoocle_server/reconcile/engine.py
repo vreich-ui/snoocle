@@ -205,13 +205,23 @@ def _finalize(
         reuse_note = ""
         if mir_cache is not None and getattr(mir_cache, "from_cache", False):
             reuse_note = f"; reused from cache (analyzedAt={mir_cache.analyzed_at})"
+        # Beats the tracker heard vs. beats continued from the established
+        # tempo across a span it lost lock on (fade-outs) — never collapse the
+        # two into one count.
+        measured, inferred = mir.beat_counts()
+        beats_note = f"; beats={measured} measured"
+        if inferred:
+            beats_note += f" + {inferred} inferred"
         prov.append(
             ProvenanceEntry(
                 timestamp=_now(),
                 actor=f"snoocle-server/{__version__}",
                 action="mir-analysis",
                 sources=[f"{slot}:{impl}" for slot, impl in mir.engines.items()],
-                notes=f"audio-grounded analysis; bpm={mir.bpm}, key={mir.key}{reuse_note}",
+                notes=(
+                    f"audio-grounded analysis; bpm={mir.bpm}, key={mir.key}"
+                    f"{beats_note}{reuse_note}"
+                ),
             )
         )
     # more independent sources -> higher reconciliation confidence

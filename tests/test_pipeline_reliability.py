@@ -329,6 +329,84 @@ def test_timing_snap_populates_chord_times_end_to_end(monkeypatch, isolated_stor
     assert any(p.action == "timing-snap" for p in stored.provenance)
 
 
+def test_timing_collapse_guard_runs_after_snap_and_reports_coverage(monkeypatch, isolated_store):
+    """The generic collapse guard (5c2) is wired in after snap_chords: when
+    the MIR chord timeline runs out early -- exactly the lo-fi-audio shape,
+    not the fade-out one already fixed at its source -- 3+ trailing lines
+    hold the same interpolated time with nothing later to spread toward, and
+    the guard reports that (rather than inventing spacing) plus a timing
+    coverage figure, end to end through the real pipeline."""
+    from snoocle_server.audio.acquire import AcquiredAudio
+    from snoocle_server.mir.base import ChordSegment, MirAnalysis
+
+    def fake_song(song_id="anon--y") -> Song:
+        chords = ["C", "G", "Am", "F", "C"]
+        return Song.model_validate(
+            {
+                "id": song_id,
+                "metadata": {"title": "Y", "artist": "Anon"},
+                "lines": [
+                    {
+                        "lineIndex": i,
+                        "lyrics": f"line {i}",
+                        "chordPlacements": [{"charIndex": 0, "chord": c}],
+                    }
+                    for i, c in enumerate(chords)
+                ],
+                "provenance": [
+                    {"timestamp": "2026-07-09T00:00:00Z", "actor": "reconcile:test/fake", "action": "reconciled"}
+                ],
+            }
+        )
+
+    monkeypatch.setattr(pipeline_mod, "discover_sources", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pipeline_mod,
+        "acquire",
+        lambda *a, **k: AcquiredAudio(
+            video_id="dQw4w9WgXcQ", video_title="Y", path="/tmp/fake.wav", duration_seconds=60.0
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_mod,
+        "analyze_audio",
+        lambda *a, **k: MirAnalysis(
+            duration_seconds=60.0,
+            engines={"chords": "chord-cnn-lstm"},
+            # Only C and G are ever heard -- like a chord timeline that runs
+            # out on lo-fi audio, everything after the second match has
+            # nothing later to interpolate toward.
+            chords=[
+                ChordSegment(start=1.0, end=2.0, chord="C"),
+                ChordSegment(start=2.0, end=3.0, chord="G"),
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_mod, "reconcile", lambda *a, **k: _fake_result_from(fake_song("anon--y"))
+    )
+
+    r = client.post(
+        "/v1/songs/analyze",
+        json={"title": "Y", "artist": "Anon", "provider": "anthropic"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["steps"]["timing-collapse-guard"].startswith("ok")
+
+    stored = isolated_store.get("anon--y")
+    times = [line.timeSeconds for line in stored.lines]
+    # the 3 trailing lines (Am, F, C) all held the last match's time (2.0) --
+    # left exactly as found, since nothing later exists to spread toward
+    assert times[2:] == [2.0, 2.0, 2.0]
+
+    guard_entries = [p for p in stored.provenance if p.action == "timing-collapse-guard"]
+    assert len(guard_entries) == 1
+    assert "left alone" in guard_entries[0].notes
+    assert "no later anchor" in guard_entries[0].notes
+    assert "timing coverage:" in guard_entries[0].notes
+
+
 def _fake_result_from(song: Song) -> ReconcileResult:
     return ReconcileResult(
         song=song, provider="anthropic", model="fake", attempts=1, audio_attached=False, usage={}

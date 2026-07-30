@@ -18,6 +18,22 @@ Given a grade and its :mod:`quality.attribution`:
   grade. The retry budget is one either way.
 - **Anything else** (pass, warn, unknown) -> store with the grade.
 
+Checked BEFORE any of the above: a failing ``timingCoverage`` metric on a run
+that only analyzed PART of the track (fast/windowed accuracy — see
+``MirAnalysis.analyzed_partially``) is not a model problem or an audio
+problem in the sense the fault attribution above means. A fast-accuracy
+window's edge and a genuine in-window fade produce an identical gap in the
+data (see issue #59) — telling them apart needs an amplitude/onset-decay
+test, not a boundary check, and #53 deliberately didn't build one. The fix
+that already exists is simpler: analyze the same recording again at full
+accuracy, where the beat grid reaches every edge it needs to (#53). This is
+reported as a RECOMMENDATION (``Escalation.reanalyze_full_accuracy``), the
+same way an AUDIO fault's alternative-recording suggestion is reported and
+not auto-run — a second MIR pass is real cost, and choosing to pay it is an
+operator decision. It is a distinct remedy from a model retry: it never sets
+``retry`` and never reads or increments the retry budget, so it can neither
+consume it nor be blocked by it having already been spent.
+
 Collapse runs are deliberately NOT an escalation path. They are already
 handled deterministically, before grading, by
 ``timing.collapse_guard``: a run gets spread over the span to the next distinct
@@ -49,17 +65,27 @@ SEARCH_IMPROVEMENT_MARGIN = 0.05
 
 @dataclass(frozen=True)
 class Escalation:
-    """The decision: retry, search, mark, or accept — and why."""
+    """The decision: retry, search, mark, recommend, or accept — and why."""
 
     retry: bool
     search: bool  # one targeted re-search for better sources
     mark_timing_unreliable: bool
     reason: str
     feedback: Optional[str] = None  # the specific text handed to the model on a retry
+    # A RECOMMENDATION, never auto-run: this run only analyzed part of the
+    # track (fast/windowed accuracy) and its timing coverage failed. See the
+    # module docstring — reported the same way an AUDIO fault's alternative-
+    # recording suggestion is, and never combined with `retry`.
+    reanalyze_full_accuracy: bool = False
 
     @property
     def acts(self) -> bool:
-        return self.retry or self.search or self.mark_timing_unreliable
+        return (
+            self.retry
+            or self.search
+            or self.mark_timing_unreliable
+            or self.reanalyze_full_accuracy
+        )
 
     def describe(self) -> str:
         actions = [
@@ -68,6 +94,7 @@ class Escalation:
                 ("retry", self.retry),
                 ("targeted-search", self.search),
                 ("mark-timing-unreliable", self.mark_timing_unreliable),
+                ("recommend-full-accuracy-reanalysis", self.reanalyze_full_accuracy),
             )
             if on
         ]
@@ -78,6 +105,7 @@ class Escalation:
             "retry": self.retry,
             "search": self.search,
             "markTimingUnreliable": self.mark_timing_unreliable,
+            "reanalyzeFullAccuracy": self.reanalyze_full_accuracy,
             "reason": self.reason,
         }
 
@@ -90,17 +118,40 @@ def plan_escalation(
     searches_spent: int = 0,
     can_search: bool = True,
     can_retry: bool = True,
+    used_partial_accuracy: bool = False,
 ) -> Escalation:
     """Decide what this run should do about `grade`. Pure and deterministic.
 
     `retries_spent`/`searches_spent` are what this run has ALREADY used, which
     is what makes the one-retry ceiling a fact rather than a hope: pass the
     real counts and a second escalation cannot happen.
+
+    `used_partial_accuracy` says this run's MIR analysis only covered part of
+    the track (``MirAnalysis.analyzed_partially`` — fast accuracy's sampled
+    windows). Checked first, before fault attribution even matters: a failing
+    ``timingCoverage`` metric on a partial analysis gets the full-accuracy
+    reanalysis recommendation instead of whatever the fault-specific branches
+    below would have planned — see the module docstring and issue #59.
     """
     if grade.verdict != "fail":
         return Escalation(
             retry=False, search=False, mark_timing_unreliable=False,
             reason=f"grade {grade.verdict}: nothing to escalate",
+        )
+
+    coverage = grade.metric("timingCoverage")
+    if used_partial_accuracy and coverage is not None and coverage.ok is False:
+        return Escalation(
+            retry=False, search=False, mark_timing_unreliable=False,
+            reanalyze_full_accuracy=True,
+            reason=(
+                f"timing coverage {coverage.value:.0%} (< {coverage.threshold:.0%}) on a "
+                "run that only analyzed part of the track (fast/windowed accuracy) — a "
+                "window's edge and a genuine in-window fade look identical in this data "
+                "(issue #59), so the recommended fix is a full-accuracy re-analysis of "
+                "this same recording, not another model attempt at the same partial "
+                "evidence"
+            ),
         )
 
     if attribution.fault is Fault.AUDIO:

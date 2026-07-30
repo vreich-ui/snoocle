@@ -24,7 +24,7 @@ from snoocle_server.audio.acquire import AcquiredAudio
 from snoocle_server.config import settings
 from snoocle_server.discovery.cache import DiscoveryCacheInfo
 from snoocle_server.discovery.models import CandidateSource
-from snoocle_server.mir.base import ChordSegment, MirAnalysis
+from snoocle_server.mir.base import AnalyzedWindow, ChordSegment, MirAnalysis
 from snoocle_server.mir.cache import MirCacheInfo
 from snoocle_server.reconcile.engine import ReconcileResult
 from snoocle_server.schema import Song
@@ -292,6 +292,67 @@ def test_an_audio_fault_run_does_not_retry_and_marks_the_timing_unreliable(
     assert actions.count("timing-unreliable") == 1
     marker = next(p for p in stored.provenance if p.action == "timing-unreliable")
     assert "NOT reliable and was not retried" in marker.notes
+
+
+# --- partial-accuracy timing coverage: recommend, don't retry (issue #59) --
+
+
+def test_a_fast_accuracy_low_coverage_run_recommends_reanalysis_not_a_retry(
+    monkeypatch, store
+):
+    """A fast-accuracy MIR (a few sampled windows, not the whole track) whose
+    document ends up with poor timing coverage gets the full-accuracy
+    reanalysis recommendation -- NOT a model retry, even though the sources
+    here agree with the audio and the document better than it (what would
+    otherwise be a MODEL fault)."""
+    partial_mir = _mir(TRUE_PROGRESSION).model_copy(
+        update={
+            "analyzed_windows": [
+                AnalyzedWindow(start=6.0, end=16.0),
+                AnalyzedWindow(start=26.0, end=36.0),
+                AnalyzedWindow(start=46.0, end=56.0),
+            ]
+        }
+    )
+    _wire(monkeypatch, mir=partial_mir,
+          candidates=[_candidate(TRUE_PROGRESSION, "web-1"),
+                      _candidate(TRUE_PROGRESSION, "web-2")])
+    reconciler = _Reconciler(_song(INVENTED, timed=False))
+    monkeypatch.setattr(pipeline_mod, "reconcile", reconciler)
+
+    report = _analyze()
+
+    assert len(reconciler.calls) == 1, "the recommendation must not spend the retry budget"
+    assert "recommended: re-analyze at full accuracy" in report.steps["accuracy-escalation"]
+    assert "fast/windowed accuracy" in report.steps["accuracy-escalation"]
+
+    run = pipeline_mod.get_run_store().get_run(report.run_id)
+    assert run["quality"]["escalation"]["reanalyzeFullAccuracy"] is True
+    assert run["quality"]["escalation"]["retry"] is False
+    assert run["quality"]["retriesSpent"] == 0
+    stored = store.get(SONG_ID)
+    assert "quality-grade" in _actions(stored)
+    assert "timing-unreliable" not in _actions(stored)
+
+
+def test_a_full_accuracy_low_coverage_run_is_unaffected(monkeypatch, store):
+    """The same document, the same everything, except the MIR analysis
+    covered the whole track -- ordinary MODEL-fault handling applies, exactly
+    as test_a_model_fault_run_retries_once_with_the_specific_failures pins."""
+    _wire(monkeypatch, mir=_mir(TRUE_PROGRESSION),
+          candidates=[_candidate(TRUE_PROGRESSION, "web-1"),
+                      _candidate(TRUE_PROGRESSION, "web-2")])
+    reconciler = _Reconciler(
+        _song(INVENTED, timed=False), _song(TRUE_PROGRESSION, timed=True),
+    )
+    monkeypatch.setattr(pipeline_mod, "reconcile", reconciler)
+
+    report = _analyze()
+
+    assert len(reconciler.calls) == 2, "a MODEL fault still gets its one retry"
+    assert "accuracy-escalation" not in report.steps
+    run = pipeline_mod.get_run_store().get_run(report.run_id)
+    assert run["quality"]["retriesSpent"] == 1
 
 
 # --- SOURCE fault: one targeted search --------------------------------------

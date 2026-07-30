@@ -80,6 +80,22 @@ class MirAnalysis(BaseModel):
     def inferred_beat_count(self) -> int:
         return len(self.beats) - self.detected_beat_count
 
+    @property
+    def analyzed_partially(self) -> bool:
+        """True when `analyzed_windows` covers only PART of the track —
+        fast accuracy's sampled windows (a few short spans, not the whole
+        song), rather than a single continuous pass over it. Empty
+        `analyzed_windows` predates window tracking and was always
+        full-track, so it reads as fully covered (see the field's own
+        docstring)."""
+        if not self.analyzed_windows:
+            return False
+        if len(self.analyzed_windows) != 1:
+            return True
+        w = self.analyzed_windows[0]
+        covers_all = w.start <= 1e-6 and w.end >= self.duration_seconds - 1e-6
+        return not covers_all
+
     def to_prompt_payload(self, max_beats: int = 64) -> dict:
         """Compact JSON for the reconciliation prompt: full chord/section
         timeline, beats summarized (they matter as tempo/downbeat evidence,

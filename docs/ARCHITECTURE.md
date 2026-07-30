@@ -334,6 +334,48 @@ on every run that timed anything at all, whether or not a collapse fired,
 so "39% coverage" is now a number every run surfaces instead of one this
 repo had to notice by hand.
 
+## A permanent id is forever — auditing and repairing a bad one
+
+A song id is minted once (`identity.py` -> `slugify_song_id`) and is then the
+content-hash-versioned store key: it is never renamed, because renaming would
+orphan the version history the old id carries. Before PR #45/#51 tightened
+identity resolution, several documents were minted under an id derived from a
+bad guess — a channel name, cover phrasing read as the artist, an unstripped
+upload description (`unknown--official-video`,
+`wil-per--rolling-stones-paint-it-black-live-1966`, and others). Those ids
+cannot be corrected in place.
+
+`snoocle_server/store/identity_audit.py` (CLI: `scripts/fix_song_identity.py`)
+is the maintenance path for that, split into three deliberately independent
+operations:
+
+- `find_mismatched_identities` — REPORT ONLY, always. Re-resolves every stored
+  song's identity from its `audio.youtubeVideoId` through today's
+  `identity.py` and lists whichever ids disagree, with the current id, the id
+  it would get now, and the confidence. Never writes, never re-analyzes. A
+  song with no video id, or whose id already matches, is skipped — it has
+  nothing to report. It does not decide which mismatches matter: a wrong
+  artist in the id doesn't mean the document's content is wrong (one of the
+  eight, the Creedence one, is the current gold version) — the operator picks
+  what to act on.
+- `supersede_song` — the forward pointer. One new, append-only version of the
+  OLD id carrying `Song.supersededBy` and a `"superseded"` provenance entry;
+  the content is otherwise untouched and every prior version, including the
+  one right before this, stays exactly as it was and fully readable. Never a
+  delete — the store is append-only by design and old versions are the only
+  record of how the library got here.
+- `reanalyze_and_supersede` — DRY RUN BY DEFAULT. Without `--confirm` it only
+  previews (a metadata fetch + identity resolution; no pipeline run, no store
+  write). With `--confirm` it runs the normal analyze pipeline
+  (`pipeline.run_pipeline`, same code path as a live analyze request) under
+  whatever id `identity.py` resolves today, then supersedes the old document
+  with the id the pipeline actually landed on. It refuses outright — before
+  touching the pipeline or the store, in both dry-run and confirmed mode —
+  when the old id is already superseded, already matches, has no video id, or
+  identity.py still can't resolve it; and when the old id carries a gold-eval
+  pointer (`store/evals.py`), since moving that to the new id automatically
+  would be deciding on the operator's behalf, not reporting.
+
 ## Timing survives a re-analysis that doesn't listen
 
 `snap_chords` is the only pass that fills timing, and it is a documented

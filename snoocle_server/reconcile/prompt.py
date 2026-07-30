@@ -130,6 +130,7 @@ def build_user_prompt(
     scope: AnalysisScope | None = None,
     evidence_manifest: dict | None = None,
     ref_index: dict[str, list[str]] | None = None,
+    quality_feedback: str | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append(
@@ -236,6 +237,13 @@ def build_user_prompt(
             "Apply these explicit instructions from the user; they override"
             " conflicting evidence:\n" + guidance
         )
+    # A MODEL-fault retry (see quality/escalation.py). Kept separate from
+    # `guidance` on purpose: this is the server's own measurement of the
+    # previous attempt, not a human instruction, and provenance must not
+    # report it as one. It carries named metrics and named indexes — the one
+    # retry this run allows is worth nothing if it only says "try harder".
+    if quality_feedback:
+        parts.append(quality_feedback)
     if time_align:
         parts.append(
             "## Time alignment (thorough analysis)\n"

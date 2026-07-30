@@ -167,6 +167,7 @@ def _finalize(
     lyric_refs_resolved: int = 0,
     lyric_overrides: tuple[LyricOverride, ...] = (),
     patch_ops_applied: tuple[AppliedOp, ...] = (),
+    quality_feedback: str | None = None,
 ) -> Song:
     """Server-side guardrails + append provenance (never trusted to the LLM)."""
     updates: dict = {"id": song_id, "provenance": []}
@@ -241,6 +242,15 @@ def _finalize(
     patch_note = (
         f"; patch: {len(patch_ops_applied)} op(s) applied" if patch_ops_applied else ""
     )
+    # A retry driven by the quality grader is a different artifact from a first
+    # attempt, and the history is the only place that difference survives. It is
+    # NOT reported as guidance: no human asked for it.
+    quality_note = (
+        "; quality retry: the previous attempt's grade and its specific failures "
+        "were handed back to the model"
+        if quality_feedback
+        else ""
+    )
     prov.append(
         ProvenanceEntry(
             timestamp=_now(),
@@ -254,6 +264,7 @@ def _finalize(
                 + scope_note
                 + lyric_note
                 + patch_note
+                + quality_note
             ),
         )
     )
@@ -387,6 +398,7 @@ def reconcile(
     evidence_manifest: dict | None = None,
     mir_cache=None,
     patch_ops_eligible: bool = False,
+    quality_feedback: str | None = None,
 ) -> ReconcileResult:
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
@@ -508,10 +520,12 @@ def reconcile(
             "inputs", "read-inputs",
             f"{len(candidates)} text source(s), "
             + (f"MIR key={mir.key} bpm={mir.bpm}" if mir else "no MIR")
-            + (f"; human corrections attached" if guidance else ""),
+            + (f"; human corrections attached" if guidance else "")
+            + ("; quality retry" if quality_feedback else ""),
             detail={
                 "provider": provider.name,
                 "depth": depth.name,
+                "qualityRetry": bool(quality_feedback),
                 "candidateSources": [c.url or c.sourceId for c in candidates],
                 "mir": (
                     {
@@ -555,6 +569,7 @@ def reconcile(
             "scope": scope,
             "agent_config": agent_config if not agent_config.is_default() else None,
             "evidence_manifest": evidence_manifest,
+            "quality_feedback": quality_feedback,
         }
     if hasattr(provider, "trace"):
         provider.trace = trace
@@ -569,6 +584,7 @@ def reconcile(
         guidance=guidance, prior_song=prior_song, time_align=depth.time_align,
         scope=scope, evidence_manifest=evidence_manifest,
         ref_index=ref_index if uses_lyric_refs else None,
+        quality_feedback=quality_feedback,
     )
     system_prompt = build_system_prompt(lyric_refs=uses_lyric_refs)
     turns: list[dict] = [{"role": "user", "text": user_prompt}]
@@ -642,6 +658,7 @@ def reconcile(
             mir_cache=mir_cache,
             lyric_refs_resolved=refs_resolved,
             lyric_overrides=overrides,
+            quality_feedback=quality_feedback,
         )
         if trace is not None:
             trace.step(

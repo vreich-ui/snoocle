@@ -56,7 +56,14 @@ class PlacementScore:
     reasons: list[str] = field(default_factory=list)
 
 
-def _best_matching_line(candidate_lines: list[Line], target_lyrics: str) -> Optional[Line]:
+def best_matching_line(candidate_lines: list[Line], target_lyrics: str) -> Optional[Line]:
+    """The candidate source line whose lyrics best match `target_lyrics`, or
+    None when nothing clears :data:`_LINE_MATCH_THRESHOLD`.
+
+    Public because the quality grader asks the same question for a different
+    reason -- "do this line's words appear in any source this run had?" is
+    lyric provenance, not chord agreement, but it is the same fuzzy match and
+    must use the same threshold to stay comparable."""
     best: Optional[Line] = None
     best_ratio = 0.0
     for cl in candidate_lines:
@@ -87,7 +94,7 @@ def _source_agreement(
     agreements = 0
     considered = 0
     for cand in candidates:
-        cand_line = _best_matching_line(cand.lines, line.lyrics)
+        cand_line = best_matching_line(cand.lines, line.lyrics)
         if cand_line is None:
             continue
         root = _nearest_root(cand_line, frac)

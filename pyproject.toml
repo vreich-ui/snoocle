@@ -70,7 +70,17 @@ align = [
     "whisperx>=3.1",
     "torch>=2.0",
 ]
-dev = ["pytest>=8"]
+# Music theory for the quality grader's key-explainability metric
+# (snoocle_server/quality/theory.py): does the established key explain every
+# stored chord? music21 owns the key -> scale and chord-symbol -> pitch-class
+# mappings; reimplementing either would be both worse and untrustworthy.
+#
+# An EXTRA rather than a core dep because it pulls matplotlib/numpy/pillow for
+# features this server never touches, and because the grader degrades the way
+# every other optional engine here does: without it the metric reports "not
+# measured" with the reason, and no other metric or decision changes.
+theory = ["music21>=9.1"]
+dev = ["pytest>=8", "music21>=9.1"]
 
 [project.scripts]
 snoocle-server = "snoocle_server.api:main"

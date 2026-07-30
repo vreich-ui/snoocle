@@ -73,12 +73,16 @@ def timing_coverage(lines: list[Line], duration: Optional[float]) -> Optional[fl
     return max(0.0, min(1.0, span / duration))
 
 
-def _find_collapsed_runs(
+def find_collapsed_runs(
     times: list[Optional[float]], threshold: int = COLLAPSE_RUN_THRESHOLD
 ) -> list[tuple[int, int, float]]:
     """Maximal ``(start, end_exclusive, value)`` ranges of >= `threshold`
     consecutive entries sharing an identical, non-None time. None entries
-    break a run without starting one of their own."""
+    break a run without starting one of their own.
+
+    Public because the quality grader counts the runs that SURVIVE this
+    module -- a collapse left alone here (nothing later to spread toward) is
+    exactly the "could not time this region" signal it needs to report."""
     runs: list[tuple[int, int, float]] = []
     i, n = 0, len(times)
     while i < n:
@@ -143,7 +147,7 @@ def guard_against_collapsed_timing(
     spread_notes: list[str] = []
     left_alone_notes: list[str] = []
 
-    for start, end, value in _find_collapsed_runs(line_times):
+    for start, end, value in find_collapsed_runs(line_times):
         dup_count = end - start - 1  # the anchor (start) itself is left alone
         if dup_count <= 0:
             continue
@@ -170,7 +174,7 @@ def guard_against_collapsed_timing(
             continue
         p_times: list[Optional[float]] = [p.timeSeconds for p in placements]
         changed = False
-        for start, end, value in _find_collapsed_runs(p_times):
+        for start, end, value in find_collapsed_runs(p_times):
             dup_count = end - start - 1
             if dup_count <= 0:
                 continue

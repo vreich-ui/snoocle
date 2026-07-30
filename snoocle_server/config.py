@@ -242,6 +242,37 @@ class Settings(BaseSettings):
     # matches (see timing/offset.py's module docstring).
     offset_max_search_seconds: float = 30.0
 
+    # --- quality grading + escalation (snoocle_server/quality/) ---
+    # The deterministic grader runs on every reconciled document and records
+    # its grade in provenance whatever the outcome. These thresholds decide
+    # where "good enough" sits per metric, and the overall below which the
+    # verdict is "fail" — the only verdict that can escalate at all.
+    #
+    # Defaults are read off production evidence, not guessed (see
+    # quality/grader.py). Lower a threshold to make the gate more forgiving;
+    # `quality_enabled=False` turns grading off entirely (the pipeline then
+    # stores exactly what it stored before this existed).
+    quality_enabled: bool = True
+    quality_chord_match_ratio: float = 0.5
+    quality_timing_coverage: float = 0.6
+    quality_interpolation_share: float = 0.5  # MAXIMUM
+    quality_collapse_runs: int = 0  # MAXIMUM
+    quality_section_coverage: float = 0.75
+    quality_theory_validity: float = 0.85
+    quality_lyric_completeness: float = 0.95
+    quality_overall: float = 0.6
+    # Fault attribution (quality/attribution.py): where each comparison tips
+    # over between MODEL, AUDIO and SOURCE. Attribution decides whether a
+    # retry can help at all, so these are the knobs that control spend.
+    quality_source_agreement: float = 0.6
+    quality_mir_agreement: float = 0.5
+    quality_mir_timeline_coverage: float = 0.5
+    quality_model_margin: float = 0.15
+    # A MODEL-fault retry is ONE extra full-price reconciliation. Set false to
+    # keep the grade (still recorded, still acted on for AUDIO/SOURCE) without
+    # ever paying for a second attempt.
+    quality_retry_enabled: bool = True
+
     # --- pipeline reliability ---
     # Per-step wall-clock ceilings (seconds) for POST /v1/songs/analyze so no
     # single external step can hang the request forever. discover/acquire/mir

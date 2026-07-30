@@ -37,6 +37,10 @@ Schema v2 additions (all OPTIONAL — v1 documents keep decoding unchanged):
 - AudioInfo.beats: a downbeat/beat grid, MIR-derived, for metronome/snapping.
   BeatMark.detected distinguishes a beat heard in the audio from one the grid
   was continued through at the established tempo (fade-outs, quiet intros).
+- Song.supersededBy: a forward pointer to another song id, set when this
+  document's id turned out to be wrong (see
+  snoocle_server.store.identity_audit). The id itself is permanent and is
+  never renamed or deleted; every prior version stays fully readable.
 """
 
 from __future__ import annotations
@@ -249,12 +253,27 @@ class Song(_Model):
     sections: list[Section] = Field(default_factory=list)
     lines: list[Line] = Field(default_factory=list)
     provenance: list[ProvenanceEntry] = Field(default_factory=list)
+    # Forward pointer, set by store/identity_audit.py when this document's id
+    # turned out to be wrong (a failed identity resolution predating PR
+    # #45/#51, or any future mis-mint). The id is permanent and
+    # content-hash-versioned -- it is never renamed, and this document is
+    # never deleted or rewritten to hide the mistake. None means "current";
+    # a non-None value means "re-analyzed under the correct id over there",
+    # while every prior version of THIS id remains fully readable.
+    supersededBy: Optional[str] = None
 
     @field_validator("id")
     @classmethod
     def _id_is_slug(cls, v: str) -> str:
         if not re.fullmatch(r"[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?", v):
             raise ValueError(f"song id must be a lowercase slug, got {v!r}")
+        return v
+
+    @field_validator("supersededBy")
+    @classmethod
+    def _superseded_by_is_slug(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not re.fullmatch(r"[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?", v):
+            raise ValueError(f"supersededBy must be a lowercase slug, got {v!r}")
         return v
 
     @model_validator(mode="after")

@@ -560,10 +560,12 @@ class PipelineRequest(BaseModel):
     guidance: Optional[str] = None
     priorSong: Optional[dict] = None
     # Re-analysis SCOPE: which evidence-gathering stages this run may do.
-    # ABSENT means "no opinion" -> the full pipeline, exactly as before this
-    # field existed; every pre-scope client and test is unaffected. Present
-    # means constrain. Reconciliation itself always runs — the flags decide
-    # what evidence it is handed, not whether it happens.
+    # ABSENT means "no opinion" -> the full pipeline, UNLESS `guidance` names
+    # a specific chord/line/section, in which case notes-only scope is
+    # inferred (see correction_routing.py); every pre-scope client and test
+    # that sends no such guidance is unaffected. Present means constrain, and
+    # always overrides inference. Reconciliation itself always runs — the
+    # flags decide what evidence it is handed, not whether it happens.
     scope: Optional[AnalysisScopeRequest] = None
     # Force the deterministic caches (MIR, discovery) to recompute and
     # overwrite. The caches key on everything that can change an answer, so

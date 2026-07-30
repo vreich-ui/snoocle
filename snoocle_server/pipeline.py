@@ -54,6 +54,7 @@ from .audio.acquire import (
     extract_metadata,
 )
 from .config import settings
+from .correction_routing import classify_correction
 from .discovery import CandidateSource, discover_sources
 from .discovery.cache import DiscoveryCacheInfo, discover_cached
 from .identity import IdentityError, SongIdentity, resolve_identity
@@ -214,6 +215,7 @@ def _step_reconcile(
     scope: AnalysisScope | None = None,
     evidence_manifest: dict | None = None,
     mir_cache: MirCacheInfo | None = None,
+    patch_ops_eligible: bool = False,
 ) -> ReconcileResult:
     return reconcile(
         title,
@@ -234,6 +236,7 @@ def _step_reconcile(
         scope=scope,
         evidence_manifest=evidence_manifest,
         mir_cache=mir_cache,
+        patch_ops_eligible=patch_ops_eligible,
     )
 
 
@@ -306,13 +309,6 @@ async def run_pipeline_async(
     allow_timing_loss: bool = False,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
-    # Scope constrains ONLY when it was explicitly supplied. `None` means the
-    # caller never heard of scope, and gets exactly the historical pipeline —
-    # this is why the flags below are read through `scope is None` rather than
-    # defaulting the parameter to FULL_SCOPE (the report would then grow a
-    # "scope" step for every legacy caller, changing their response shape).
-    want_listen = True if scope is None else scope.listen
-    want_sources = True if scope is None else scope.reconcile
     # analysisDepth is the canonical control; the older `accuracy` field is
     # honored as its source when a depth isn't given explicitly. The chosen
     # profile drives MIR accuracy, agent effort, the tool budget, and syncMap.
@@ -374,14 +370,10 @@ async def run_pipeline_async(
     if guidance:
         report.steps["notes"] = f"ok: guidance applied (from {guidance_origin})"
 
-    # Only recorded when the caller actually asked for a scope — an absent
-    # scope must leave the report shape untouched.
-    if scope is not None:
-        report.steps["scope"] = scope.describe()
-
-    # The prior version, resolved BEFORE anything expensive runs. Two roles:
-    # the source this run carries timing forward from (5b) when it isn't
-    # listening, and the baseline the pre-store guard compares against.
+    # The prior version, resolved BEFORE anything expensive runs (including
+    # scope inference below, which needs to know one exists). Two further
+    # roles: the source this run carries timing forward from (5b) when it
+    # isn't listening, and the baseline the pre-store guard compares against.
     store = store or get_store()
     stored_prior, stored_prior_version, store_problem = _load_stored_song(store, song_id)
     request_prior = _decode_prior_song(prior_song)
@@ -395,6 +387,55 @@ async def run_pipeline_async(
         if timing_prior is stored_prior
         else _content_version(timing_prior)
     )
+
+    # Route the request: a correction naming specific chords, lines, sections
+    # or lyric words needs no new sources — everything it refers to is
+    # already in the stored document — but without this the caller had to
+    # know that and set scope explicitly. A request with none re-discovered
+    # 3 sources and asked the model for a complete Song to change one chord,
+    # which is what got blocked by a content filter over a single chord.
+    #
+    # Only ever consulted when the caller has no opinion (`scope is None`) —
+    # an explicit scope always wins — and only when there is a PRIOR document
+    # to correct: "notes naming a chord" has nothing to apply itself to on a
+    # first-time analysis. `patch_eligible` is independent of how notes-only
+    # was reached (inferred here, or given explicitly) — see reconcile.engine
+    # for where it actually decides patch vs full notes-only reconcile.
+    classification = None
+    scope_was_inferred = False
+    if guidance and (stored_prior is not None or request_prior is not None):
+        classification = classify_correction(guidance)
+        if scope is None and classification.is_targeted_correction:
+            scope = AnalysisScope(listen=False, reconcile=False)
+            scope_was_inferred = True
+            log.info(
+                "pipeline.scope inferred notes-only for %s: %s",
+                song_id, classification.describe(),
+            )
+
+    # Scope constrains ONLY when it is present (explicit OR just inferred
+    # above). `None` means no opinion was ever formed, and gets exactly the
+    # historical pipeline — this is why the flags below are read through
+    # `scope is None` rather than defaulting the parameter to FULL_SCOPE (the
+    # report would then grow a "scope" step for every legacy caller, changing
+    # their response shape).
+    want_listen = True if scope is None else scope.listen
+    want_sources = True if scope is None else scope.reconcile
+
+    if scope is not None:
+        report.steps["scope"] = scope.describe() + (
+            f" (inferred: {classification.describe()})" if scope_was_inferred else ""
+        )
+
+    # A notes-only run needs SOMETHING to correct even when the caller didn't
+    # attach one: the request's own priorSong wins when given (it's the exact
+    # document the reconciler is being asked to fix), else the stored latest
+    # version stands in. Scoped narrowly to notes-only, not every reconcile —
+    # a full re-analysis without an explicit priorSong is unchanged.
+    effective_prior_song = prior_song
+    if scope is not None and scope.notes_only and effective_prior_song is None and stored_prior is not None:
+        effective_prior_song = stored_prior.model_dump(mode="json")
+
     if not want_listen and timing_prior is None and not allow_timing_loss:
         # "Reuse the existing audio analysis" with no existing analysis to
         # reuse. Storing anyway is exactly the silent-loss bug this guard
@@ -491,7 +532,7 @@ async def run_pipeline_async(
         mir_cache=report.mir_cache,
         candidates=report.candidates,
         discovery_cache=report.discovery_cache,
-        prior_song=prior_song,
+        prior_song=effective_prior_song,
         scope=scope,
         guidance=guidance,
         guidance_origin=guidance_origin,
@@ -505,9 +546,14 @@ async def run_pipeline_async(
                 title, artist, song_id, report.candidates, report.mir,
                 provider, model, attach_audio, report.audio,
                 trace=recorder, guidance=guidance, guidance_origin=guidance_origin,
-                prior_song=prior_song, depth=depth, scope=scope,
+                prior_song=effective_prior_song, depth=depth, scope=scope,
                 evidence_manifest=report.evidence_manifest,
                 mir_cache=report.mir_cache,
+                patch_ops_eligible=(
+                    classification.patch_eligible
+                    if classification is not None and scope is not None and scope.notes_only
+                    else False
+                ),
             ),
             settings.reconcile_timeout_seconds,
         )
@@ -558,8 +604,18 @@ async def run_pipeline_async(
             }
         )
 
-    # 5b. deterministic chord/line timing. Two mutually exclusive passes:
+    # A patch (reconcile/patch_ops.py) names exactly what it touches and
+    # copies everything else through untouched, including every timing
+    # field — there is nothing here to carry forward, snap, or re-align, and
+    # running any of 5b/5c/5d would mean re-deriving values a patch
+    # deliberately left alone. This is what makes the timing-loss class of
+    # bug impossible on this path rather than merely guarded against: none
+    # of the guarding passes are consulted, because nothing was regenerated.
+    patched = result.patch_ops_applied > 0
+
+    # 5b. deterministic chord/line timing. Three mutually exclusive passes:
     #
+    #   patched -> skip entirely, see above.
     #   listen=off -> carry the prior version's timing forward (FATAL on
     #     failure). This run has no MIR by construction, so snap_chords would
     #     be a no-op by its own contract and the reconciler's freshly-emitted
@@ -570,7 +626,12 @@ async def run_pipeline_async(
     #     pipeline continues with whatever timing the reconciler produced,
     #     which today is none). A no-op when MIR didn't run.
     carried_forward = False
-    if not want_listen and timing_prior is not None:
+    if patched:
+        report.steps["timing"] = (
+            f"skipped (patch: {result.patch_ops_applied} op(s) preserved the "
+            f"prior version's timing)"
+        )
+    elif not want_listen and timing_prior is not None:
         try:
             result.song, carry_stats = carry_forward_timing(
                 result.song,
@@ -611,7 +672,10 @@ async def run_pipeline_async(
     # reads whatever timeSeconds ends up final, not 5b's provisional guess.
     # Skipped for provider=mock like discover — mock is the fully-offline
     # deterministic path and must make ZERO external calls of any kind.
-    if carried_forward:
+    if patched:
+        report.steps["lrc"] = "skipped (patch: nothing was regenerated to re-align)"
+        report.evidence_manifest["lrcAlign"] = lrc_block("skipped")
+    elif carried_forward:
         # apply_lrc REPLACES line times and then re-derives every chord time
         # by proportional redistribution — which is exactly the timing 5b just
         # restored from the prior version, only worse (with no MIR there is no
@@ -656,15 +720,21 @@ async def run_pipeline_async(
     # group: the MIR-agreement signal reads placement.timeSeconds, which 5b
     # (or 5c, if LRC overrode it) is what populates. Refines confidence when
     # both a source and MIR signal exist, and records a compact "check these
-    # first" queue on the run trace.
-    try:
-        scored_song, scores = score_song(result.song, report.candidates, report.mir)
-        result.song = scored_song
-        recorder.set_review_queue(build_review_queue(scores))
-        report.steps["confidence"] = f"ok: {len(scores)} placement(s) scored"
-    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
-        report.steps["confidence"] = f"failed: {e}"
-        log.warning("pipeline.step error step=confidence err=%s", e)
+    # first" queue on the run trace. Skipped for a patch: with no candidates
+    # and no MIR it would only ever touch placements with NO confidence yet
+    # (a freshly inserted chord) by inventing the neutral default 0.5 for
+    # them — exactly the kind of un-named change this path exists to refuse.
+    if patched:
+        report.steps["confidence"] = "skipped (patch: nothing to re-score)"
+    else:
+        try:
+            scored_song, scores = score_song(result.song, report.candidates, report.mir)
+            result.song = scored_song
+            recorder.set_review_queue(build_review_queue(scores))
+            report.steps["confidence"] = f"ok: {len(scores)} placement(s) scored"
+        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+            report.steps["confidence"] = f"failed: {e}"
+            log.warning("pipeline.step error step=confidence err=%s", e)
 
     # Record the manifest on the trace only NOW: 5c is what resolves its
     # lrcAlign block from "pending" to what actually happened, so attaching it

@@ -13,6 +13,16 @@ prompt-level instruction alone is hope, not a guarantee:
 - the LYRIC REFERENCE PROTOCOL -> lyric_refs.splice_lyrics. The model never
   writes a song's words; it points at the source line it read them in, and
   deterministic code substitutes the text. See lyric_refs.py for why.
+
+A THIRD prompt lives here too, for a different kind of run entirely: a
+targeted correction ("change the C to a B in line 12") doesn't need the
+model to reconcile anything, and asking it to regenerate the whole Song for
+a one-word fix is exactly what got a real correction blocked by a content
+filter over a single chord. build_patch_system_prompt/build_patch_user_prompt
+ask for a short list of OPERATIONS instead — see reconcile/patch_ops.py,
+which is what actually applies them. Neither the reconciliation prompt above
+nor the lyric-reference contract belongs in a patch run: there is no
+reconciling to do, and an op never carries lyric text at all.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from ..discovery.models import CandidateSource
 from ..mir.base import MirAnalysis
 from ..scope import AnalysisScope
 from .lyric_refs import PRIOR_SONG_SOURCE_ID, describe_ref_sources
+from .patch_ops import MAX_OPS, describe_op_set
 
 _SYSTEM_BASE = """You are a music transcription reconciliation engine for the Snoocle song-practice app.
 
@@ -235,6 +246,74 @@ def build_user_prompt(
 
     parts.append("Now output the reconciled Song JSON only.")
     return "\n\n".join(parts)
+
+
+# --- the patch protocol (notes-only, targeted corrections) ------------------
+
+_PATCH_SYSTEM_PROMPT = f"""You are a targeted-correction engine for the Snoocle song-practice app.
+
+You are given a song document that already exists and a short correction note naming specific things to fix. Your ENTIRE job is to say what changes — nothing else. You do not reconcile, re-transcribe, or reproduce the song. Everything the note does not mention stays exactly as it already is; you never restate it.
+
+Answer with a JSON object of the shape:
+{{"ops": [ <op>, <op>, ... ]}}
+
+Each op is one of ({describe_op_set()}):
+- {{"op": "replace_chord", "lineIndex": int, "charIndex": int, "from": "<chord now there>", "to": "<chord it should be>", "reason": "<why, optional>"}}
+- {{"op": "insert_chord", "lineIndex": int, "charIndex": int, "chord": "<chord>", "reason": "<optional>"}} — charIndex must not already have a chord.
+- {{"op": "remove_chord", "lineIndex": int, "charIndex": int, "from": "<chord expected there, optional>", "reason": "<optional>"}}
+- {{"op": "move_chord", "lineIndex": int, "fromCharIndex": int, "toCharIndex": int, "chord": "<expected chord, optional>", "reason": "<optional>"}} — moves a chord within the SAME line only.
+- {{"op": "set_section_name", "sectionIndex": int, "to": "<new name>", "reason": "<optional>"}}
+- {{"op": "set_section_bounds", "sectionIndex": int, "startLineIndex": int, "endLineIndex": int, "reason": "<optional>"}} — give the FULL new range, both ends.
+- {{"op": "split_line", "lineIndex": int, "charIndex": int, "reason": "<optional>"}} — splits the line's EXISTING lyrics at that character position into two lines; every later line shifts down to make room.
+- {{"op": "merge_line", "lineIndex": int, "reason": "<optional>"}} — merges this line with the one right after it.
+
+Worked example — fixing one chord and renaming a section, in one patch:
+{{"ops": [
+  {{"op": "replace_chord", "lineIndex": 12, "charIndex": 21, "from": "C", "to": "B", "reason": "sheet has a walkdown here, not a straight C"}},
+  {{"op": "set_section_name", "sectionIndex": 3, "to": "Bridge"}}
+]}}
+
+Non-negotiable rules:
+- NEVER write out any of the song's words, in an op or anywhere else. There is no "replace lyric" op and there never will be — that is not an oversight, it is the whole point of this format. If the correction genuinely needs different words, do not attempt a patch: respond with exactly {{"ops": [], "needsFullReconcile": true, "reason": "<why>"}} instead of forcing the words into some other field.
+- charIndex is exact, not an estimate: it is the position in the LINE'S OWN lyrics as given to you below, character by character.
+- Reference only lines, sections, and chords that already exist in the document below. An op the server can't apply — wrong "from" chord, a charIndex that isn't there, a section that doesn't exist — fails the whole run. There is no retry: get it right the first time, or say plainly that you can't.
+- At most {MAX_OPS} ops. If the correction genuinely needs more than that, it is not a targeted correction — respond with {{"ops": [], "needsFullReconcile": true, "reason": "<why>"}}.
+- Output ONLY the JSON object. No markdown fences, no commentary, no prose before or after."""
+
+
+def build_patch_system_prompt() -> str:
+    return _PATCH_SYSTEM_PROMPT
+
+
+def build_patch_user_prompt(
+    title: str,
+    artist: str,
+    song_id: str,
+    prior_song: dict,
+    guidance: str,
+) -> str:
+    return "\n\n".join(
+        [
+            f"Correcting the song {title!r} by {artist!r} (id {song_id!r}).",
+            "## The document as it exists now\n" + json.dumps(prior_song, indent=1),
+            "## Correction note\n" + guidance,
+            "Now output the ops JSON only.",
+        ]
+    )
+
+
+def build_patch_repair_prompt(errors: str) -> str:
+    # NOT currently used by the engine — see engine.py's docstring on why a
+    # patch failure is fatal rather than repaired — but kept as a real,
+    # working function rather than a stub: a future retry policy for
+    # clearly-malformed-JSON-only failures (as opposed to a wrong "from")
+    # can use this without inventing prompt text under time pressure.
+    return (
+        "Your previous response did not parse as a valid patch:\n"
+        f"{errors}\n\n"
+        'Output the corrected {"ops": [...]} JSON only — no commentary, no '
+        "markdown fences, no lyric text anywhere in it."
+    )
 
 
 def build_repair_prompt(errors: str, lyric_refs: bool = True) -> str:

@@ -73,6 +73,13 @@ class LLMProvider:
     #: provider in the registry sets this — asserted in tests, so a new one
     #: cannot quietly inherit "no".
     emits_lyric_refs: bool = False
+    #: Same shape, for the patch protocol (reconcile/patch_ops.py): does this
+    #: provider actually get sent the patch system prompt when engine.py asks
+    #: for one? A provider with its own separate prompt pipeline (the
+    #: in-process agent ignores the `system` argument entirely and builds its
+    #: own) would silently try to reconcile a whole Song instead of returning
+    #: ops — worse than not attempting the patch path at all.
+    supports_patch_ops: bool = False
 
     def complete(
         self,
@@ -93,6 +100,7 @@ class AnthropicProvider(LLMProvider):
     default_model = "claude-opus-4-8"
     supports_audio = False  # unclear/inconsistent support — baseline is structured-only
     emits_lyric_refs = True
+    supports_patch_ops = True
 
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         import anthropic
@@ -140,6 +148,7 @@ class OpenAIProvider(LLMProvider):
     audio_model = "gpt-4o-audio-preview"
     supports_audio = True
     emits_lyric_refs = True
+    supports_patch_ops = True
 
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         model = self._model(model)
@@ -187,6 +196,7 @@ class GeminiProvider(LLMProvider):
     default_model = "gemini-2.5-pro"
     supports_audio = True
     emits_lyric_refs = True
+    supports_patch_ops = True
 
     def complete(self, system, turns, model=None, max_tokens=None, audio=None):
         model = self._model(model)

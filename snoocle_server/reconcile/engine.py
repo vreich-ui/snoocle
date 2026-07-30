@@ -11,6 +11,13 @@ all: it emits REFERENCES into the sources already in this run's context, and
 validation. See that module for why (a Song document IS the complete lyrics
 of a copyrighted song) and for the four rules that make it a guarantee
 rather than a request.
+
+A targeted correction in notes-only scope is a THIRD path, not a smaller
+version of the first two: the model doesn't reconcile or reference anything,
+it names a short list of OPERATIONS against the prior document
+(``patch_ops.py``), and this module applies them in local code. Unlike a
+schema-validation slip or an unresolvable lyric ref, a patch failure is
+never retried — see ``_attempt_patch``'s docstring for why.
 """
 
 from __future__ import annotations
@@ -43,7 +50,14 @@ from .lyric_refs import (
     build_ref_index,
     splice_lyrics,
 )
-from .prompt import build_repair_prompt, build_system_prompt, build_user_prompt
+from .patch_ops import AppliedOp, PatchError, apply_patch, parse_ops_response
+from .prompt import (
+    build_patch_system_prompt,
+    build_patch_user_prompt,
+    build_repair_prompt,
+    build_system_prompt,
+    build_user_prompt,
+)
 from .providers import AudioAttachment, LLMProvider, get_provider
 from .trace import RunTrace, TraceRecorder, clock
 
@@ -77,6 +91,18 @@ class LyricProvenanceError(ReconcileError):
     error_code = "lyric_provenance"
 
 
+class PatchApplicationError(ReconcileError):
+    """A patch op didn't apply cleanly, or the response wasn't a valid patch
+    at all (unknown op, over the cap, malformed). Deliberately NOT repaired
+    — see patch_ops.py's module docstring and ``_attempt_patch`` below: a
+    wrong op is not the kind of mistake a retry fixes, and "try again, maybe
+    you'll guess differently" is exactly the fuzziness this path exists to
+    refuse. Distinct from the model explicitly declining the patch path
+    (``needsFullReconcile``), which is not an error at all."""
+
+    error_code = "patch_failed"
+
+
 @dataclass
 class ReconcileResult:
     song: Song
@@ -86,6 +112,11 @@ class ReconcileResult:
     audio_attached: bool
     usage: dict = field(default_factory=dict)
     trace: RunTrace | None = None  # the run's step-by-step logic (if recorded)
+    # >0 only when the patch path (patch_ops.py) produced this song: the
+    # pipeline reads this to skip timing carry-forward/snap/LRC entirely —
+    # nothing was regenerated, so there is nothing for those passes to do
+    # except risk disturbing what a patch deliberately left alone.
+    patch_ops_applied: int = 0
 
 
 def extract_json(text: str) -> str:
@@ -135,6 +166,7 @@ def _finalize(
     mir_cache=None,
     lyric_refs_resolved: int = 0,
     lyric_overrides: tuple[LyricOverride, ...] = (),
+    patch_ops_applied: tuple[AppliedOp, ...] = (),
 ) -> Song:
     """Server-side guardrails + append provenance (never trusted to the LLM)."""
     updates: dict = {"id": song_id, "provenance": []}
@@ -206,6 +238,9 @@ def _finalize(
             f"; lyrics spliced from {lyric_refs_resolved} source reference(s)"
             + (f" with {len(overrides)} override(s)" if overrides else "")
         )
+    patch_note = (
+        f"; patch: {len(patch_ops_applied)} op(s) applied" if patch_ops_applied else ""
+    )
     prov.append(
         ProvenanceEntry(
             timestamp=_now(),
@@ -218,6 +253,7 @@ def _finalize(
                 + guidance_note
                 + scope_note
                 + lyric_note
+                + patch_note
             ),
         )
     )
@@ -236,7 +272,98 @@ def _finalize(
                 ),
             )
         )
+    # Same reasoning, one entry per op: a correction history has to be
+    # readable op by op, not collapsed into a count.
+    for applied in patch_ops_applied:
+        prov.append(
+            ProvenanceEntry(
+                timestamp=_now(),
+                actor=f"reconcile:{provider.name}/{model}",
+                action="patch-applied",
+                confidence=None,
+                notes=(
+                    applied.description
+                    + (f"; reason: {applied.reason}" if applied.reason else "")
+                ),
+            )
+        )
     return song.model_copy(update={"provenance": prov})
+
+
+def _attempt_patch(
+    provider: LLMProvider,
+    model: str | None,
+    title: str,
+    artist: str,
+    song_id: str,
+    prior_song: dict,
+    prior_song_obj: Song,
+    guidance: str,
+    trace: TraceRecorder | None,
+) -> tuple[Song, list[AppliedOp], str, dict] | None:
+    """One model call, patch-shaped. Returns ``(song, applied_ops,
+    resolved_model, usage)`` on success.
+
+    Returns ``None`` when the model explicitly declined the patch path
+    (``needsFullReconcile`` — the correction genuinely needs different words,
+    or is otherwise bigger than a targeted fix): the caller falls through to
+    the normal reconcile prompt, in the SAME run, rather than failing it.
+    That is the visible fallback the brief asks for — not a silent one, and
+    not a failure.
+
+    Raises :class:`PatchApplicationError` for anything that actually went
+    wrong (malformed JSON, an op that doesn't apply, an unknown op, over the
+    cap). Never retried: seeing a WRONG op and being asked to guess again is
+    the fuzziness this whole path exists to refuse. One call, one verdict.
+    """
+    system_prompt = build_patch_system_prompt()
+    user_prompt = build_patch_user_prompt(title, artist, song_id, prior_song, guidance)
+    started = clock()
+    response = provider.complete(system_prompt, [{"role": "user", "text": user_prompt}], model=model)
+    usage: dict = {}
+    for k, v in (response.usage or {}).items():
+        if isinstance(v, (int, float)):
+            usage[k] = usage.get(k, 0) + v
+    resolved_model = response.model
+
+    try:
+        document = json.loads(extract_json(response.text))
+    except (ValueError, json.JSONDecodeError) as e:
+        if trace is not None:
+            trace.step(
+                "patch", "patch-parse-failed", f"patch response was not valid JSON: {e}",
+                detail={"errors": str(e)[:2000]}, duration_seconds=clock() - started,
+            )
+        raise PatchApplicationError(f"patch response was not valid JSON: {e}") from e
+
+    if isinstance(document, dict) and document.get("needsFullReconcile"):
+        reason = document.get("reason") or "the model reported it needs a full reconcile"
+        if trace is not None:
+            trace.step(
+                "patch", "needs-full-reconcile",
+                f"falling back to full reconcile: {reason}",
+                detail={"reason": reason}, duration_seconds=clock() - started,
+            )
+        return None
+
+    try:
+        ops = parse_ops_response(document)
+        patched_song, applied = apply_patch(prior_song_obj, ops)
+    except PatchError as e:
+        if trace is not None:
+            trace.step(
+                "patch", "patch-failed", str(e),
+                detail={"errors": str(e)[:2000]}, duration_seconds=clock() - started,
+            )
+        raise PatchApplicationError(str(e)) from e
+
+    if trace is not None:
+        trace.step(
+            "patch", "patch-applied", f"{len(applied)} op(s) applied",
+            detail={"ops": [a.description for a in applied]},
+            duration_seconds=clock() - started,
+        )
+    return patched_song, applied, resolved_model, usage
 
 
 def reconcile(
@@ -259,6 +386,7 @@ def reconcile(
     scope: AnalysisScope | None = None,
     evidence_manifest: dict | None = None,
     mir_cache=None,
+    patch_ops_eligible: bool = False,
 ) -> ReconcileResult:
     song_id = song_id or slugify_song_id(artist, title)
     provider = get_provider(provider_name)
@@ -287,6 +415,77 @@ def reconcile(
 
     if media_url is None and youtube_video_id:
         media_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
+
+    # The patch protocol (patch_ops.py): a targeted correction in notes-only
+    # scope doesn't reconcile anything — it names exact changes, and this
+    # replaces the WHOLE reconcile prompt with a much smaller, closed-set
+    # ask. `supports_patch_ops` mirrors `emits_lyric_refs`: the contract is
+    # between this server's prompt and a model actually told it, and
+    # providers with their own prompt pipeline (the in-process agent, which
+    # ignores the `system` argument entirely and builds its own) or none at
+    # all (mock) are not party to it.
+    prior_song_obj: Song | None = None
+    if prior_song:
+        try:
+            prior_song_obj = Song.model_validate(prior_song)
+        except Exception:  # noqa: BLE001 — a malformed prior can't be patched;
+            prior_song_obj = None  # demote to the full-reconcile path below.
+    uses_patch_ops = bool(
+        scope is not None and scope.notes_only
+        and patch_ops_eligible
+        and prior_song_obj is not None
+        and getattr(provider, "supports_patch_ops", False)
+    )
+
+    if uses_patch_ops:
+        if trace is not None:
+            trace.step(
+                "inputs", "read-inputs",
+                f"patch mode: correcting {song_id!r} in place; human corrections attached",
+                detail={"provider": provider.name, "mode": "patch", "guidance": guidance},
+            )
+        attempt = _attempt_patch(
+            provider, model, title, artist, song_id, prior_song, prior_song_obj,
+            guidance or "", trace,
+        )
+        if attempt is not None:
+            patched_song, applied_ops, resolved_model, usage = attempt
+            song = _finalize(
+                patched_song,
+                song_id=song_id,
+                title=title,
+                artist=artist,
+                youtube_video_id=youtube_video_id,
+                candidates=[],
+                mir=None,
+                provider=provider,
+                model=resolved_model,
+                attempts=1,
+                guidance=guidance,
+                guidance_origin=guidance_origin,
+                scope=scope,
+                patch_ops_applied=tuple(applied_ops),
+            )
+            if trace is not None:
+                trace.step(
+                    "final", "reconciled",
+                    f"produced Song via patch: {len(applied_ops)} op(s) applied",
+                    detail={"opsApplied": len(applied_ops), "usage": usage},
+                )
+            return ReconcileResult(
+                song=song,
+                provider=provider.name,
+                model=resolved_model,
+                attempts=1,
+                audio_attached=False,
+                usage=usage,
+                trace=trace.trace if trace is not None else None,
+                patch_ops_applied=len(applied_ops),
+            )
+        # else: the model explicitly asked for a full reconcile. Falls
+        # through to EXACTLY today's notes-only path below (full-Song
+        # regeneration via the lyric-reference protocol) — visibly (the
+        # trace step _attempt_patch already recorded), not silently.
 
     # The lyric-reference protocol (lyric_refs.py). `emits_lyric_refs` is a
     # PROVIDER capability, not a global switch: the contract is between this

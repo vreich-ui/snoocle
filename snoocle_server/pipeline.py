@@ -61,9 +61,10 @@ from .identity import IdentityError, SongIdentity, resolve_identity
 from .manifest import build_evidence_manifest, lrc_block
 from .mir import MirAnalysis, analyze_audio
 from .mir.cache import MirCacheInfo, analyze_cached
-from .quality import Attribution, Escalation, Grade, attribute_fault, grade_song, plan_escalation
+from .quality import Grade, QualityDecision, evaluate as evaluate_quality
 from .quality.escalation import build_retry_feedback, search_found_better
 from .quality.grader import grade_provenance_entry, timing_unreliable_provenance_entry
+from .recordings import RecordingSuggestions, suggest_recordings
 from .reconcile import ReconcileResult, provider_preflight, reconcile
 from .reconcile.match import score_candidates
 from .reconcile.depth import resolve_depth
@@ -142,6 +143,10 @@ class PipelineReport:
     evidence_manifest: dict = field(default_factory=dict)
     mir_cache: MirCacheInfo | None = None
     discovery_cache: DiscoveryCacheInfo | None = None
+    # Alternative recordings found because THIS one graded as an audio fault
+    # (see recordings.py). Reported, never acted on: analyzing one is an
+    # explicit operator action, because it is a full second analysis.
+    recording_suggestions: RecordingSuggestions | None = None
 
 
 def get_store() -> SongRepository:
@@ -825,12 +830,15 @@ async def run_pipeline_async(
     # a second attempt to do differently.
     if settings.quality_enabled:
         try:
-            grade, attribution, escalation = _grade_document(
+            decision = _grade_document(
                 report,
                 can_search=want_sources,
                 can_retry=settings.quality_retry_enabled and not patched,
                 retries_spent=quality_retries_spent,
                 searches_spent=quality_searches_spent,
+            )
+            grade, attribution, escalation = (
+                decision.grade, decision.attribution, decision.escalation
             )
             report.steps["quality"] = f"{grade.describe()} | fault: {attribution.describe()}"
             recorder.step(
@@ -860,12 +868,15 @@ async def run_pipeline_async(
                     # 1, so plan_escalation cannot plan another retry — that is
                     # the ceiling, enforced by the same function that granted
                     # the first one.
-                    grade, attribution, escalation = _grade_document(
+                    decision = _grade_document(
                         report,
                         can_search=want_sources,
                         can_retry=settings.quality_retry_enabled and not patched,
                         retries_spent=quality_retries_spent,
                         searches_spent=quality_searches_spent,
+                    )
+                    grade, attribution, escalation = (
+                        decision.grade, decision.attribution, decision.escalation
                     )
                     report.steps["quality"] = (
                         f"{grade.describe()} | fault: {attribution.describe()} "
@@ -893,6 +904,24 @@ async def run_pipeline_async(
             if escalation.mark_timing_unreliable:
                 entries.append(timing_unreliable_provenance_entry(attribution))
                 report.steps["timing-reliability"] = "marked unreliable (audio fault)"
+                # This recording cannot be timed reliably, so the fix is a
+                # different recording (Mode B, realign.py). Look for one and
+                # REPORT it: one search, no download, no analysis. Skipped for
+                # the mock provider, which is the fully-offline path and must
+                # make zero external calls of any kind.
+                if settings.quality_suggest_recordings and resolved_provider != "mock":
+                    report.recording_suggestions = await run_in_threadpool(
+                        lambda: suggest_recordings(
+                            result.song,
+                            reason=(
+                                f"{song_id!r} graded as an audio fault on its current "
+                                f"recording: {attribution.reason}"
+                            ),
+                        )
+                    )
+                    report.steps["recording-suggestions"] = (
+                        report.recording_suggestions.describe()
+                    )
             result.song = result.song.model_copy(
                 update={"provenance": list(result.song.provenance) + entries}
             )
@@ -976,25 +1005,22 @@ def _grade_document(
     can_retry: bool,
     retries_spent: int,
     searches_spent: int,
-) -> tuple[Grade, Attribution, Escalation]:
-    """Grade this run's document, attribute the fault, and plan the escalation.
+) -> QualityDecision:
+    """This run's document through the shared quality gate (``quality.gate``).
 
-    Pure apart from reading `report` — all three steps are deterministic
-    functions of (document, MIR, candidates), which is what makes a grade
-    reproducible from the stored run trace.
+    Shared rather than local so Mode B (``realign.py``) grades identically —
+    two callers measuring the same document differently would make their grade
+    histories incomparable for no reason anyone would notice.
     """
-    song = report.reconcile.song
-    grade = grade_song(song, report.mir, report.candidates)
-    attribution = attribute_fault(grade, report.mir, report.candidates)
-    escalation = plan_escalation(
-        grade,
-        attribution,
-        retries_spent=retries_spent,
-        searches_spent=searches_spent,
+    return evaluate_quality(
+        report.reconcile.song,
+        report.mir,
+        report.candidates,
         can_search=can_search,
         can_retry=can_retry,
+        retries_spent=retries_spent,
+        searches_spent=searches_spent,
     )
-    return grade, attribution, escalation
 
 
 async def _quality_targeted_search(

@@ -412,7 +412,9 @@ def test_a_grader_failure_never_fails_the_run(monkeypatch, store):
     def boom(*a, **k):
         raise RuntimeError("grader exploded")
 
-    monkeypatch.setattr(pipeline_mod, "grade_song", boom)
+    # The gate is shared with Mode B (quality/gate.py) — patch it there, which
+    # is also where a real bug would live.
+    monkeypatch.setattr(pipeline_mod, "evaluate_quality", boom)
 
     report = _analyze()
 

@@ -302,6 +302,73 @@ than in a prompt (a prompt can only ask):
    `allow_timing_loss` (MCP) is the explicit opt-out, and also waives the
    precondition in 1.
 
+## A targeted correction is a PATCH, not a rewrite
+
+A one-chord correction used to run the full pipeline: rediscover sources,
+re-listen, and ask the model for a complete Song — the same shape as a
+first-ever analysis. Reproduced case: "change the C to a B" on Paint It
+Black re-discovered three sources and was blocked by the content filter
+asking the model to reproduce the whole lyric sheet again, over one chord.
+Regenerating the document is also the ONLY way timing loss can happen at
+all — carry-forward (above) exists to repair that, after the fact.
+
+**Routing (`correction_routing.py`).** `classify_correction(guidance)` looks
+at guidance text and decides two independent things: is this a *targeted*
+correction (infer `scope.listen=false, reconcile=false` when the caller left
+scope unset), and — separately — does it name lyrics (never patch-eligible,
+regardless of how targeted it is). Deterministic regexes run first and are
+free: a chord symbol, a line/section reference, or an explicit "X to Y"
+replacement is targeted; naming a lyric word sets `targets_lyrics` and
+therefore blocks patching even if a chord rule also fired. Only when no
+deterministic rule fires does a cheap LLM classification get a vote, and it
+can only ever grant `is_targeted_correction` — never `patch_eligible`,
+because a generic yes/no isn't trustworthy enough for the one property that
+must never be wrong. An explicit caller-supplied `scope` always wins over
+inference, and inference never fires with no prior document to correct
+against. Whichever rule fired is logged and lands in the `scope` step's
+text (`pipeline.py`), e.g. `inferred: targeted (rule=chord-symbol+
+line-reference)`.
+
+**The op protocol (`reconcile/patch_ops.py`).** In notes-only scope, when the
+provider opts in (`supports_patch_ops`) and the correction is patch-eligible,
+the model is asked for a list of operations against the PRIOR document
+instead of a Song:
+
+    {"ops": [{"op": "replace_chord", "lineIndex": 12, "charIndex": 21,
+               "from": "C", "to": "B", "reason": "..."}]}
+
+The op set is closed and small — chord replace/insert/remove/move, section
+rename/bounds change, line split/merge — and an unknown op fails the run
+rather than being interpreted. Lyric text can never appear in an op; that is
+what makes lyrics categorically unpatchable rather than merely discouraged.
+`apply_patch` applies each op to the prior Song and re-validates the result;
+an op whose `from` doesn't match, or that targets an out-of-range index, is
+NOT fuzzy-matched or silently skipped — it fails the run and names the op.
+Over `MAX_OPS` (20) fails and tells the caller to use full re-analysis. Every
+applied op lands in provenance individually, `action="patch-applied"`, with
+its own reason — a single-op provenance trail rather than one entry for a
+whole regenerated document.
+
+**Untouched by construction.** A patch only ever mutates what an op names.
+`audio.syncMap` is regenerated only if a structural op (split/merge) ran;
+otherwise the applied document is byte-identical to the prior one apart from
+the named field. This is stronger than carry-forward: carry-forward repairs
+timing loss after a regeneration by matching placements back up; a patch
+never regenerates, so there is nothing for carry-forward to repair and
+`timing`/`lrc`/`confidence` (the passes that exist to guard a regenerated
+document) are skipped — their step text says so (`skipped (patch: ...)`)
+rather than silently no-opping.
+
+**Visible fallback, never silent.** The model can still decline to patch —
+a correction that looked targeted but, on reading the prior document, needs
+different words — by returning `needsFullReconcile` instead of an ops list.
+That is a normal, expected outcome, not an error: `reconcile()` falls
+through to the ordinary full-reconcile path for that run, and
+`patch_ops_applied` stays 0, which is exactly what routes it back through
+carry-forward and the guarding passes above. What must never happen is a
+silent one — a patch attempt that quietly widens into a rewrite without the
+caller being able to tell from the response which path ran.
+
 ## Cross-video offset alignment (master plan B3)
 
 `timing/offset.py`'s `estimate_offset(ref, other)` cross-correlates onset-

@@ -219,7 +219,14 @@ async def analyze_and_store_song(
     run may do. listen=false reuses the existing audio analysis instead of
     re-downloading and re-analyzing; reconcile=false skips web source
     discovery. Both false means "apply the notes to the prior song and gather
-    nothing". OMIT it for the full pipeline (the default).
+    nothing". OMIT it for the full pipeline (the default) — when guidance
+    names a specific chord, line, or section and scope is omitted, notes-only
+    scope is INFERRED automatically (an explicit scope always overrides
+    inference). A targeted, non-lyric correction in notes-only scope is
+    applied as a PATCH against the prior document rather than a regenerated
+    Song — see docs/ARCHITECTURE.md, "A targeted correction is a PATCH, not a
+    rewrite" — which is what makes a one-chord fix immune to both the content
+    filter and timing loss.
 
     listen=false carries the prior version's timing (beat grid, bpm, chord and
     line times, section times) forward onto the new document, and fails if

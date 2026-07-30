@@ -91,6 +91,20 @@ def test_beats_roundtrip_and_cap():
         Song.model_validate(data)
 
 
+def test_beats_carry_whether_they_were_heard_or_inferred():
+    data = make_song()
+    data["audio"]["beats"] = [
+        {"time": 0.5, "measure": 1, "beatInMeasure": 1},
+        {"time": 1.0, "measure": 1, "beatInMeasure": 2, "detected": False},
+    ]
+    song = Song.model_validate(data)
+    # every beat stored before the field existed WAS detected -- that is what
+    # the default has to mean, or old grids would read as fabricated.
+    assert song.audio.beats[0].detected is True
+    assert song.audio.beats[1].detected is False
+    assert Song.model_validate(song.model_dump()) == song
+
+
 def test_video_offsets_roundtrip_and_key_validation():
     data = make_song()
     data["audio"]["analyzedVideoId"] = "QDYfEBY9NM4"

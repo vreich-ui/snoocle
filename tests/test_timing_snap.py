@@ -124,6 +124,21 @@ def test_provenance_entry_records_match_stats():
     assert set(entry.sources) == {"beats:madmom", "chords:chord-cnn-lstm"}
 
 
+def test_provenance_separates_measured_beats_from_inferred_ones():
+    # A grid whose tail was continued at the established tempo across a
+    # fade-out (mir/beat_fill.py) must not read as if the audio was heard
+    # there. The store's bob-marley--three-little-birds is this shape.
+    song = Song.model_validate(make_song())
+    mir = MirAnalysis(
+        beats=[Beat(time=i * 0.5, position=(i % 4) + 1) for i in range(8)]
+        + [Beat(time=4.0 + i * 0.5, position=(i % 4) + 1, detected=False) for i in range(3)],
+        chords=[ChordSegment(start=0.0, end=3.0, chord="C")],
+    )
+    result = snap_chords(song, mir)
+    assert "(8 measured, 3 tempo-inferred)" in result.provenance[-1].notes
+    assert [b.detected for b in result.audio.beats] == [True] * 8 + [False] * 3
+
+
 def test_beat_snap_attaches_beatref_within_tolerance():
     song = Song.model_validate(make_song())
     mir = MirAnalysis(

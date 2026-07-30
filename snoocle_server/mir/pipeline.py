@@ -11,6 +11,7 @@ from ..audio.utils import probe, to_analysis_wav, trim
 from ..chords import PITCH_CLASSES_SHARP, ChordParseError, parse_chord
 from ..config import settings
 from .base import AnalyzedWindow, Beat, ChordSegment, MirAnalysis
+from .beat_fill import fill_beat_gaps
 from .beats import track_beats
 from .chordrec import recognize_chords
 from .structure import segment_structure
@@ -109,7 +110,7 @@ def _analyze_windows(
     track's time coordinates so the timeline still aligns with the video.
     Structure segmentation is skipped — text sources carry section names, and
     fragments would only produce misleading labels."""
-    all_beats: list[tuple[float, int]] = []
+    all_beats: list[Beat] = []
     all_chords: list[ChordSegment] = []
     bpms: list[tuple[int, float]] = []  # (beat count, bpm) per window
     time_signature = None
@@ -120,13 +121,20 @@ def _analyze_windows(
         trim(audio_path, clip, start, end)
         to_analysis_wav(clip, wav)
         beats, bpm, ts, beats_engine = track_beats(str(wav))
-        chords, chords_engine = recognize_chords(str(wav), [t for t, _ in beats])
-        all_beats.extend((t + start, p) for t, p in beats)
+        # In clip coordinates: the window is its own audio file, and a window
+        # that ends at the track's end fades out like the track does.
+        window_beats, fill = fill_beat_gaps(
+            [Beat(time=t, position=p) for t, p in beats], end - start, ts
+        )
+        if fill.inferred:
+            log.info("window %.0f-%.0fs beat grid: %s", start, end, fill.describe())
+        chords, chords_engine = recognize_chords(str(wav), [b.time for b in window_beats])
+        all_beats.extend(b.model_copy(update={"time": b.time + start}) for b in window_beats)
         all_chords.extend(
             c.model_copy(update={"start": c.start + start, "end": c.end + start}) for c in chords
         )
         if bpm:
-            bpms.append((len(beats), bpm))
+            bpms.append((fill.detected, bpm))
         time_signature = time_signature or ts
     best_bpm = max(bpms, default=(0, None))[1]
     return MirAnalysis(
@@ -140,7 +148,7 @@ def _analyze_windows(
         bpm=best_bpm,
         time_signature=time_signature,
         key=estimate_key(all_chords),
-        beats=[Beat(time=t, position=p) for t, p in all_beats],
+        beats=all_beats,
         chords=all_chords,
         sections=[],
         analyzed_windows=[AnalyzedWindow(start=s, end=e) for s, e in windows],
@@ -193,7 +201,17 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         to_analysis_wav(src, wav)
 
         beats, bpm, time_signature, beats_engine = track_beats(str(wav))
-        beat_times = [t for t, _ in beats]
+        # Onset-driven trackers lose lock on fade-outs and near-silent
+        # intros, leaving the ends of the track with no grid at all — and,
+        # because chord recognition is beat-synchronous, no chord timeline
+        # either. Continue the established tempo across those spans BEFORE
+        # the downstream engines read the beat times. See mir/beat_fill.py.
+        beat_list, fill = fill_beat_gaps(
+            [Beat(time=t, position=p) for t, p in beats], duration, time_signature
+        )
+        if fill.inferred:
+            log.info("beat grid extended by tempo continuation: %s", fill.describe())
+        beat_times = [b.time for b in beat_list]
         chord_segments, chords_engine = recognize_chords(str(wav), beat_times)
         sections, structure_engine = segment_structure(str(wav), beat_times)
 
@@ -207,7 +225,7 @@ def analyze_audio(audio_path: str | Path, accuracy: str = "standard") -> MirAnal
         bpm=bpm,
         time_signature=time_signature,
         key=estimate_key(chord_segments),
-        beats=[Beat(time=t, position=p) for t, p in beats],
+        beats=beat_list,
         chords=chord_segments,
         sections=sections,
         # duration was already reduced to the cap when the clip was trimmed, so

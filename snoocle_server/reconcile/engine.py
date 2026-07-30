@@ -521,6 +521,7 @@ def reconcile(
                         "durationSeconds": mir.duration_seconds,
                         "chordSegments": len(mir.chords),
                         "beatCount": len(mir.beats),
+                        "beatCountDetected": mir.detected_beat_count,
                         "analyzedWindows": [
                             {"start": w.start, "end": w.end} for w in mir.analyzed_windows
                         ],

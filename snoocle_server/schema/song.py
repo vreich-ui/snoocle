@@ -168,6 +168,13 @@ class BeatMark(_Model):
     time: float = Field(ge=0)
     measure: int = Field(ge=1)
     beatInMeasure: int = Field(ge=1)
+    # False when this beat was not heard in the audio but continued from the
+    # established tempo across a span the beat tracker could not follow — a
+    # fade-out tail, a near-silent intro. Consumers that need audio truth
+    # (offset measurement, evaluation) must filter on it; a metronome click
+    # can use the whole grid. Absent in v1/v2 documents written before the
+    # field existed, where every stored beat WAS detected — hence the default.
+    detected: bool = True
 
 
 class AudioInfo(_Model):

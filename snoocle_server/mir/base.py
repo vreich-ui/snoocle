@@ -14,6 +14,11 @@ from pydantic import BaseModel, Field
 class Beat(BaseModel):
     time: float  # seconds
     position: int = 0  # beat within bar (1 = downbeat); 0 = unknown
+    # False when the beat was not heard by an engine but continued from the
+    # established tempo across a span where tracking lost lock (a fade-out
+    # tail, a near-silent intro) — see mir/beat_fill.py. Legacy payloads
+    # without the field decode as True, which is what they were.
+    detected: bool = True
 
 
 class ChordSegment(BaseModel):
@@ -49,6 +54,12 @@ class MirAnalysis(BaseModel):
     # unknown/legacy (treat as full-track).
     analyzed_windows: list[AnalyzedWindow] = Field(default_factory=list)
 
+    @property
+    def detected_beat_count(self) -> int:
+        """Beats an engine actually heard (the rest were continued from the
+        established tempo where tracking lost lock — see mir/beat_fill.py)."""
+        return sum(1 for b in self.beats if b.detected)
+
     def to_prompt_payload(self, max_beats: int = 64) -> dict:
         """Compact JSON for the reconciliation prompt: full chord/section
         timeline, beats summarized (they matter as tempo/downbeat evidence,
@@ -63,8 +74,11 @@ class MirAnalysis(BaseModel):
             "timeSignature": self.time_signature,
             "estimatedKey": self.key,
             "beatCount": len(beats),
+            "beatCountDetected": self.detected_beat_count,
+            "beatCountInferred": len(beats) - self.detected_beat_count,
             "beatsSampled": [
-                {"time": round(b.time, 2), "position": b.position} for b in beats[::stride]
+                {"time": round(b.time, 2), "position": b.position, "detected": b.detected}
+                for b in beats[::stride]
             ],
             "chordTimeline": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}
@@ -101,8 +115,14 @@ class MirAnalysis(BaseModel):
             "timeSignature": self.time_signature,
             "estimatedKey": self.key,
             "beatCount": len(self.beats),
+            # Beats the engines heard vs. beats continued from the established
+            # tempo across a span they couldn't follow (mir/beat_fill.py). The
+            # GUI timeline must be able to draw the difference.
+            "beatCountDetected": self.detected_beat_count,
+            "beatCountInferred": len(self.beats) - self.detected_beat_count,
             "beatsSampled": [
-                {"time": round(b.time, 2), "position": b.position} for b in beats
+                {"time": round(b.time, 2), "position": b.position, "detected": b.detected}
+                for b in beats
             ],
             "chordTimeline": [
                 {"start": round(c.start, 2), "end": round(c.end, 2), "chord": c.chord}

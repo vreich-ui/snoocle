@@ -25,7 +25,9 @@ snoocle_server/
 │   │                (never AI — pdf-tool local-first routing)
 │   └── acquire.py   step 4a: yt-dlp search+download, video-id cache
 │                    (personal-use only, see README)
-├── mir/             step 4b: beats (madmom ACTIVE / librosa fallback),
+├── mir/             step 4b: beats (madmom ACTIVE / librosa fallback, with
+│                    beat_fill.py continuing the grid across fade-outs and
+│                    quiet intros the onset trackers can't follow),
 │                    chords (Chord-CNN-LSTM runner adapter / chroma-template
 │                    fallback), structure (SongFormer runner adapter /
 │                    agglomerative fallback), key vote; engines recorded in
@@ -210,6 +212,34 @@ not a placement whose chord is "no chord". The iOS app's older model treated
 client-side (see the iOS dev plan, task F1) in favor of rendering a gap
 glyph when a timed instrumental hole exceeds the scroll model's
 `maxGlideSeconds`. Do not reintroduce N.C. as a storable chord identity.
+
+## The beat grid outlives the beat tracker (fade-outs, quiet intros)
+
+Both beat engines are onset-driven, so they stop producing beats wherever the
+signal stops producing transients — a fade-out. Measured in the store:
+`bob-marley--three-little-birds` had 440 beats ending at 177.31s of a 192.18s
+track (8% of the song with no grid) while the structure engine had sections
+through the full 192s. Because chord recognition is beat-synchronous, the
+dead window collapsed into one chord segment, so `timing/snap.py` found
+nothing to match there and every placement in it interpolated onto the same
+timestamp at confidence 0.3. The same hole appears at the START of a track
+with a near-silent intro — verified with the librosa fallback, which places
+its first beat only when the music arrives.
+
+`mir/beat_fill.py` closes both: when detected beats stop more than ~2 bars
+short of the analyzed span (or start that far into it), and at least 16 beats
+were detected, the grid is continued at the established tempo — the median
+interval over the last/first 32 beats, outlier-trimmed — keeping the bar
+phase. It runs BEFORE chordrec and the structure engine read the beat times,
+so the whole downstream stack sees a complete grid. It never re-runs
+detection over the quiet region: that signal is exactly where onset detection
+is unreliable, and continuing 400 confident beats is the more accurate answer
+there.
+
+Inferred beats are never presented as measured. `Beat.detected=False` rides
+through `build_beat_grid` into the stored `BeatMark.detected`, the MIR
+payloads carry `beatCountDetected`/`beatCountInferred`, and the `timing-snap`
+provenance entry states the split outright ("94 measured, 26 tempo-inferred").
 
 ## The model never writes the lyrics
 

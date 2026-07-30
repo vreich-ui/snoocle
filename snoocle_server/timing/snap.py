@@ -37,6 +37,13 @@ Algorithm, in order:
    metadata.bpm and audio.beats are filled from MIR when the song doesn't
    already have them.
 
+Beats reaching this pass are not all audio-measured: where the tracker lost
+lock (fade-outs, near-silent intros) the grid is continued at the established
+tempo, marked ``detected=False`` (see ``mir/beat_fill.py``). That marking
+survives into ``AudioInfo.beats``, and the provenance entry below states the
+measured/inferred split outright -- a placement snapped to an inferred beat
+must stay traceable as such.
+
 A ProvenanceEntry documents the pass (action="timing-snap") whenever `mir`
 is given, even when nothing matched -- callers rely on this to distinguish
 "MIR was unavailable" from "MIR ran and found nothing to snap to".
@@ -293,6 +300,8 @@ def snap_chords(song: Song, mir: Optional[MirAnalysis]) -> Song:
     total = len(flat)
     matched_count = len(matches)
     sources = [f"{slot}:{impl}" for slot, impl in sorted(mir.engines.items())]
+    measured_beats = sum(1 for b in beat_grid if b.detected)
+    inferred_beats = len(beat_grid) - measured_beats
     provenance_entry = ProvenanceEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
         actor="snoocle-server/timing",
@@ -302,7 +311,8 @@ def snap_chords(song: Song, mir: Optional[MirAnalysis]) -> Song:
         notes=(
             f"matched {matched_count}/{total} chord placement(s) to the MIR "
             f"timeline; {len(sync_map)}/{len(final_lines)} line(s) timed; "
-            f"beats={'filled' if 'beats' in audio_update else 'kept/empty'}"
+            f"beats={'filled' if 'beats' in audio_update else 'kept/empty'} "
+            f"({measured_beats} measured, {inferred_beats} tempo-inferred)"
         ),
     )
 

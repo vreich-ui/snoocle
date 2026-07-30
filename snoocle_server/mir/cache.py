@@ -146,7 +146,13 @@ def mir_cache_key(
 ) -> str:
     """A hex key over every input that can change the analysis."""
     components = {
-        "v": 1,  # key-scheme version: bump to invalidate everything at once
+        # Key-scheme version: bump to invalidate everything at once. v2 = the
+        # beat grid is continued across spans the trackers lost lock on
+        # (mir/beat_fill.py), so the same audio through the same engines now
+        # yields a different — and differently-shaped — analysis. Without the
+        # bump every already-analyzed song would keep serving its truncated
+        # grid from cache and never see the fix.
+        "v": 2,
         "audio": audio_hash,
         "engines": engine_fingerprint(engines),
         "accuracy": accuracy,

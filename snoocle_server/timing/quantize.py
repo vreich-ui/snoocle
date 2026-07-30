@@ -81,7 +81,18 @@ def build_beat_grid(
             if beat_in_measure > bpm_count:
                 measure += 1
                 beat_in_measure = 1
-        grid.append(BeatMark(time=b.time, measure=measure, beatInMeasure=beat_in_measure))
+        grid.append(
+            BeatMark(
+                time=b.time,
+                measure=measure,
+                beatInMeasure=beat_in_measure,
+                # Carries through from mir/beat_fill.py: a beat continued from
+                # the established tempo across a span the tracker couldn't
+                # follow stays labelled as inferred all the way into the
+                # stored song.
+                detected=b.detected,
+            )
+        )
     return grid
 
 

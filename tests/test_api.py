@@ -108,7 +108,10 @@ def test_full_pipeline_and_versioning():
     assert body1["song"]["lines"]  # a real, schema-valid song was produced
 
     # re-run: new stored version, prior one preserved and diffable
-    r2 = client.post("/v1/songs/analyze", json=req)
+    r2 = client.post(
+        "/v1/songs/analyze",
+        json={**req, "force": True, "forceReason": "versioning test intentionally reruns"},
+    )
     assert r2.status_code == 200, r2.text
     v1, v2 = body1["storedVersion"], r2.json()["storedVersion"]
     assert v1 != v2

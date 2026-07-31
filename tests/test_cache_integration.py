@@ -193,7 +193,11 @@ def test_run_trace_records_the_manifest():
 def test_refresh_cache_defaults_off_and_is_accepted():
     """The per-request bypass exists and does not disturb an ordinary run."""
     assert _analyze()["songId"] == "tester--cache"
-    assert _analyze(refreshCache=True)["songId"] == "tester--cache"
+    assert _analyze(
+        refreshCache=True,
+        force=True,
+        forceReason="test intentionally verifies an explicit refresh request",
+    )["songId"] == "tester--cache"
 
 
 # --- orthogonality with scope ---------------------------------------------------

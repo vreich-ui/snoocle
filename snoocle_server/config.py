@@ -305,6 +305,11 @@ class Settings(BaseSettings):
     mir_timeout_seconds: float = 1500.0
     reconcile_timeout_seconds: float = 900.0
     store_timeout_seconds: float = 60.0
+    # Duplicate reconciliation admission. A completed retry:false run blocks
+    # identical evidence for one day; an in-flight lock self-expires even if a
+    # Cloud Run instance dies before it can release it.
+    duplicate_run_ttl_seconds: float = 86400.0
+    run_lock_lease_seconds: float = 3600.0
 
     # --- API ---
     host: str = "127.0.0.1"

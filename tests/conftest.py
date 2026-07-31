@@ -23,8 +23,16 @@ from __future__ import annotations
 import pytest
 
 from snoocle_server.config import settings
+from snoocle_server.store.run_admission import reset_run_admission_store
 
 
 @pytest.fixture(autouse=True)
 def _ug_source_off_unless_a_test_asks_for_it(monkeypatch):
     monkeypatch.setattr(settings, "source_ug_enabled", False)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_run_admission_store():
+    reset_run_admission_store()
+    yield
+    reset_run_admission_store()

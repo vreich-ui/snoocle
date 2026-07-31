@@ -96,6 +96,10 @@ class RunTrace:
     # a song's grade history is what makes non-convergence visible. Small and
     # flat, so it stays in list views too.
     quality: dict | None = None
+    idempotency_key: str | None = None
+    evidence_hash: str | None = None
+    forced: bool = False
+    force_reason: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +120,10 @@ class RunTrace:
             "reviewQueue": self.review_queue,
             "evidenceManifest": self.evidence_manifest,
             "quality": self.quality,
+            "idempotencyKey": self.idempotency_key,
+            "evidenceHash": self.evidence_hash,
+            "forced": self.forced,
+            "forceReason": self.force_reason,
         }
 
 
@@ -214,14 +222,31 @@ def get_live_run(run_id: str) -> RunTrace | None:
         return LIVE_RUNS.get(run_id)
 
 
-def start_run(song_id: str, provider: str, depth: str, model: str = "") -> TraceRecorder:
+def start_run(
+    song_id: str,
+    provider: str,
+    depth: str,
+    model: str = "",
+    *,
+    run_id: str | None = None,
+    config_version: str | None = None,
+    idempotency_key: str | None = None,
+    evidence_hash: str | None = None,
+    forced: bool = False,
+    force_reason: str | None = None,
+) -> TraceRecorder:
     """Create a recorder + live-registered RunTrace for a new reconciliation."""
     trace = RunTrace(
-        run_id=new_run_id(),
+        run_id=run_id or new_run_id(),
         song_id=song_id,
         provider=provider,
         model=model,
         depth=depth,
+        config_version=config_version,
+        idempotency_key=idempotency_key,
+        evidence_hash=evidence_hash,
+        forced=forced,
+        force_reason=force_reason,
     )
     _publish(trace)
     return TraceRecorder(trace)

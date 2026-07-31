@@ -379,8 +379,15 @@ def test_a_standing_preference_alone_never_infers_notes_only_scope(monkeypatch, 
     recorder = _Recorder(_gold_song())
     monkeypatch.setattr(pipeline_mod, "reconcile", recorder)
 
-    for _ in range(2):
-        r = _analyze(skipAudio=True)
+    for attempt in range(2):
+        r = _analyze(
+            skipAudio=True,
+            **(
+                {"force": True, "forceReason": "preference replay test requires a second run"}
+                if attempt
+                else {}
+            ),
+        )
         assert r.status_code == 200, r.text
         assert recorder.last["guidance"] == "capo-free voicings please"
         assert "scope" not in r.json()["steps"]

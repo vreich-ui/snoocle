@@ -46,6 +46,7 @@ from .reconcile import (
     reconcile,
 )
 from .reconcile.engine import ReconcileError
+from .reconcile.admission import reconcile_admitted
 from .reconcile.providers import ProviderError
 from .scope import AnalysisScope
 from .export import to_chordpro, to_txt
@@ -68,6 +69,7 @@ from .store import (
     backend_label,
     count_cookie_lines,
 )
+from .store.run_admission import DuplicateRunError
 
 # --- Single-service topology: embed the MCP endpoint in this FastAPI app -----
 # One Cloud Run service / container / process serves BOTH the REST API and the
@@ -353,6 +355,7 @@ def post_discover(req: DiscoverRequest) -> dict:
 # Clients key UI actions off errorCode (e.g. "youtube_auth_required" -> the
 # in-app Reconnect YouTube flow) and show `reason` as the headline message.
 _ERROR_REASONS = {
+    "duplicate_run": "An identical reconciliation is already running or recently completed.",
     "youtube_auth_required": (
         "YouTube connection expired or was blocked. Reconnect YouTube "
         "(sign in again in the app) and retry."
@@ -377,6 +380,18 @@ def _error_response(status_code: int, detail: str, error_code: str | None) -> JS
         if reason:
             body["reason"] = reason
     return JSONResponse(body, status_code=status_code)
+
+
+def _duplicate_response(error: DuplicateRunError) -> JSONResponse:
+    body: dict = {
+        "detail": "duplicate reconciliation refused",
+        "errorCode": error.code,
+        "blockingRunId": error.blocking_run_id,
+        "reason": _ERROR_REASONS[error.code],
+    }
+    if error.summary is not None:
+        body["existingRun"] = error.summary
+    return JSONResponse(body, status_code=409)
 
 
 def _acquisition_error_response(e: AcquisitionError) -> JSONResponse:
@@ -478,6 +493,14 @@ class ReconcileRequest(BaseModel):
     # For the "agent" provider: the media the song came from (YouTube watch URL
     # or another media URL). Defaults to the YouTube URL when youtubeVideoId set.
     mediaUrl: Optional[str] = None
+    force: bool = False
+    forceReason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _forced_reason(self) -> "ReconcileRequest":
+        if self.force and not (self.forceReason or "").strip():
+            raise ValueError("forceReason is required when force=true")
+        return self
 
 
 def _reconcile_response(result: ReconcileResult) -> dict:
@@ -499,21 +522,30 @@ def post_reconcile(req: ReconcileRequest) -> dict:
     # A MIR in the request is evidence for the reconciliation, not a promise
     # that something downstream is about to re-time the result.
     try:
-        result = reconcile(
+        admitted = reconcile_admitted(
             req.title,
             req.artist,
             req.candidates,
             req.mir,
-            provider_name=req.provider,
+            provider=req.provider,
             model=req.model,
             audio_path=req.audioPath,
             attach_audio=req.attachAudio,
             youtube_video_id=req.youtubeVideoId,
             media_url=req.mediaUrl,
+            force=req.force,
+            force_reason=req.forceReason,
         )
+        result = admitted.result
+    except DuplicateRunError as e:
+        return _duplicate_response(e)
     except (ReconcileError, ProviderError) as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
-    return _reconcile_response(result)
+    return {
+        **_reconcile_response(result),
+        "runId": admitted.recorder.trace.run_id,
+        "evidenceManifest": admitted.evidence_manifest,
+    }
 
 
 # --- full pipeline -----------------------------------------------------------
@@ -606,11 +638,15 @@ class PipelineRequest(BaseModel):
     # from. Both are silent-data-loss shapes, so they are refused by default
     # and only ever happen when a caller says explicitly that it means it.
     allowTimingLoss: bool = False
+    force: bool = False
+    forceReason: Optional[str] = None
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
         if not ((self.title and self.artist) or self.youtubeUrlOrId):
             raise ValueError("provide title and artist, or youtubeUrlOrId to derive them from")
+        if self.force and not (self.forceReason or "").strip():
+            raise ValueError("forceReason is required when force=true")
         return self
 
 
@@ -646,7 +682,11 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             scope=req.scope.to_scope() if req.scope is not None else None,
             refresh_cache=req.refreshCache,
             allow_timing_loss=req.allowTimingLoss,
+            force=req.force,
+            force_reason=req.forceReason,
         )
+    except DuplicateRunError as e:
+        return _duplicate_response(e)
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except PipelineStepError as e:

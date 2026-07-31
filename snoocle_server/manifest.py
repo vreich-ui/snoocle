@@ -89,6 +89,11 @@ def _sources_block(candidates, cache_info, mir=None) -> dict:
         "status": f"cache-{cache_info.status}" if cache_info is not None else "absent",
         "count": len(candidates or []),
     }
+    if candidates:
+        # Stable content identifiers used by run admission. Cache status,
+        # confidence, and scores are descriptive and deliberately excluded
+        # from the idempotency digest.
+        block["ids"] = [str(candidate.sourceId) for candidate in candidates]
     if cache_info is not None:
         block["gatheredAt"] = cache_info.gathered_at
         age = _age_days(cache_info.gathered_at)

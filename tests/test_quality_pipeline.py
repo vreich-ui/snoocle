@@ -597,11 +597,11 @@ def test_a_full_accuracy_low_coverage_run_is_unaffected(monkeypatch, store):
 # --- SOURCE fault: one targeted search --------------------------------------
 
 
-def test_a_source_fault_searches_once_and_only_retries_on_better_evidence(
+def test_a_source_fault_search_cannot_override_retry_false(
     monkeypatch, store
 ):
-    """The sheets contradict each other, so a retry against them buys nothing —
-    but a search that turns up sheets agreeing with the audio does."""
+    """Search may improve evidence, but escalation.retry=false is authoritative:
+    no internally generated path may turn that into another model call."""
     _wire(monkeypatch, mir=_mir(TRUE_PROGRESSION),
           candidates=[_candidate(TRUE_PROGRESSION, "web-1"), _candidate(OTHER_SONG, "web-2")])
     searches: list[bool] = []
@@ -626,10 +626,11 @@ def test_a_source_fault_searches_once_and_only_retries_on_better_evidence(
     report = _analyze()
 
     assert searches == [False, True], "exactly one extra, cache-bypassing search"
-    assert len(reconciler.calls) == 2
-    assert [c.sourceId for c in reconciler.calls[1]["candidates"]] == ["web-3", "web-4"]
+    assert len(reconciler.calls) == 1
     assert "reconciling once more" in report.steps["quality-search"]
-    assert "freshly gathered sheets" in reconciler.feedbacks[1]
+    assert report.steps["quality-retry"] == "skipped: escalation.retry=false"
+    run = pipeline_mod.get_run_store().get_run(report.run_id)
+    assert any(step["label"] == "quality-retry-suppressed" for step in run["steps"])
 
 
 def test_a_source_fault_search_that_finds_nothing_better_stores_with_the_grade(

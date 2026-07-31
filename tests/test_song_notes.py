@@ -638,8 +638,15 @@ def test_a_durable_preference_keeps_replaying_across_runs(client, reconcile_call
     """A note curated through the notes surface is a STANDING instruction: it
     replays on every later analyze that sends none, and no run consumes it."""
     client.put(f"/v1/songs/{SONG_ID}/notes", json={"notes": "capo-free voicings please"})
-    for _ in range(3):
-        body = _analyze(client)
+    for attempt in range(3):
+        body = _analyze(
+            client,
+            **(
+                {"force": True, "forceReason": "standing-preference replay test"}
+                if attempt
+                else {}
+            ),
+        )
         assert reconcile_calls[-1]["guidance"] == "capo-free voicings please"
         assert "stored notes" in _reconciled_notes(body)
 

@@ -76,14 +76,21 @@ from .reconcile import (
     provider_preflight,
     reconcile,
 )
-from .reconcile.engine import TIMING_RESTORE_ACTION
+from .reconcile.agent_config import config_version
+from .reconcile.engine import TIMING_RESTORE_ACTION, _load_agent_config
 from .reconcile.match import score_candidates
 from .reconcile.depth import resolve_depth
-from .reconcile.trace import TraceRecorder, start_run
+from .reconcile.trace import TraceRecorder, new_run_id, start_run
 from .schema.song import ProvenanceEntry, Song, slugify_song_id
 from .scope import AnalysisScope
 from .store import SaveResult, SongRepository, VersionConflictError, get_repository
 from .store.runs import get_run_store
+from .store.run_admission import (
+    Admission,
+    DuplicateRunError,
+    get_run_admission_store,
+    idempotency_key,
+)
 from .store.song_notes import length_error as notes_length_error
 from .timing.carry_forward import audio_data_lost, carry_forward_timing
 from .timing.collapse_guard import guard_against_collapsed_timing
@@ -335,6 +342,8 @@ async def run_pipeline_async(
     scope: AnalysisScope | None = None,
     refresh_cache: bool = False,
     allow_timing_loss: bool = False,
+    force: bool = False,
+    force_reason: str | None = None,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
     # analysisDepth is the canonical control; the older `accuracy` field is
@@ -343,6 +352,9 @@ async def run_pipeline_async(
     depth = resolve_depth(analysis_depth or accuracy)
     accuracy = depth.accuracy
     steps: dict[str, str] = {}
+
+    if force and not (force_reason or "").strip():
+        raise ValueError("forceReason is required when force=true")
 
     # Provider preflight (FATAL, instant). A provider that can't serve ANY
     # request — unknown name or missing credential/endpoint — must fail here,
@@ -699,7 +711,42 @@ async def run_pipeline_async(
         guidance=model_guidance,
         guidance_origin=guidance_origin,
     )
-    recorder = start_run(song_id, resolved_provider, depth.name)
+    resolved_config_version = config_version(_load_agent_config())
+    admission_key, admission_evidence_hash = idempotency_key(
+        song_id, resolved_config_version, report.evidence_manifest
+    )
+    admitted_run_id = new_run_id()
+    admission_store = get_run_admission_store()
+    try:
+        admission = admission_store.admit(
+            key=admission_key,
+            evidence_hash=admission_evidence_hash,
+            run_id=admitted_run_id,
+            lease_seconds=settings.run_lock_lease_seconds,
+            completed_ttl_seconds=settings.duplicate_run_ttl_seconds,
+            force=force,
+            force_reason=force_reason,
+        )
+    except DuplicateRunError as duplicate:
+        # `_resolve_guidance` deliberately persists a request correction before
+        # expensive work. A client retry after a completed run writes that same
+        # correction again before reaching this gate; restore its consumed
+        # marker so a refused duplicate cannot reopen already-applied guidance.
+        completed_version = (duplicate.summary or {}).get("storedVersion")
+        if pending_correction and completed_version:
+            _consume_applied_correction(song_id, pending_correction, completed_version)
+        raise
+    recorder = start_run(
+        song_id,
+        resolved_provider,
+        depth.name,
+        run_id=admitted_run_id,
+        config_version=resolved_config_version,
+        idempotency_key=admission_key,
+        evidence_hash=admission_evidence_hash,
+        forced=force,
+        force_reason=(force_reason or "").strip() or None,
+    )
     report.run_id = recorder.trace.run_id
 
     # A withheld preference is a DECISION, and it has to outlive the HTTP
@@ -798,6 +845,8 @@ async def run_pipeline_async(
         except asyncio.TimeoutError as e:
             recorder.finish("error", error=f"timed out after {settings.reconcile_timeout_seconds:.0f}s")
             _persist_trace(recorder)
+            if quality_feedback is None:
+                _abandon_admission(admission_store, admission)
             raise PipelineStepError(
                 "reconcile",
                 f"timed out after {settings.reconcile_timeout_seconds:.0f}s",
@@ -806,6 +855,8 @@ async def run_pipeline_async(
         except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
             recorder.finish("error", error=str(e)[:2000])
             _persist_trace(recorder)
+            if quality_feedback is None:
+                _abandon_admission(admission_store, admission)
             # A classified provider error (e.g. content_filtered) carries its own
             # code; otherwise fall back to any code an upstream step recorded.
             code = getattr(e, "error_code", None) or report.error_code
@@ -1119,7 +1170,10 @@ async def run_pipeline_async(
                     report, title, artist, max_candidates, grade, attribution
                 )
 
-            if retry_feedback is not None:
+            # The escalation decision is the server-side authority. Search may
+            # produce useful evidence, but it may not manufacture a retry after
+            # the quality gate explicitly returned retry=false.
+            if retry_feedback is not None and escalation.retry:
                 try:
                     patched = await _reconcile_and_time(quality_feedback=retry_feedback)
                     result = report.reconcile
@@ -1158,6 +1212,13 @@ async def run_pipeline_async(
                         f"the quality retry failed; storing the first attempt: {e.message}",
                     )
                     recorder.finish("ok", model=result.model)
+            elif retry_feedback is not None:
+                report.steps["quality-retry"] = "skipped: escalation.retry=false"
+                recorder.step(
+                    "quality",
+                    "quality-retry-suppressed",
+                    "internally-generated retry suppressed: escalation.retry=false",
+                )
 
             entries = [grade_provenance_entry(grade, attribution=attribution)]
             if escalation.reanalyze_full_accuracy:
@@ -1247,6 +1308,7 @@ async def run_pipeline_async(
     if guard_baseline is not None:
         lost = audio_data_lost(guard_baseline, result.song)
         if lost and not allow_timing_loss:
+            _abandon_admission(admission_store, admission)
             raise PipelineStepError(
                 "timing-guard",
                 f"refusing to store {song_id}: this run drops audio-derived data "
@@ -1270,14 +1332,17 @@ async def run_pipeline_async(
             settings.store_timeout_seconds,
         )
     except VersionConflictError:
+        _abandon_admission(admission_store, admission)
         raise  # -> HTTP 409, not a 502
     except asyncio.TimeoutError as e:
+        _abandon_admission(admission_store, admission)
         raise PipelineStepError(
             "store",
             f"timed out after {settings.store_timeout_seconds:.0f}s",
             steps=report.steps,
         ) from e
     except Exception as e:  # noqa: BLE001
+        _abandon_admission(admission_store, admission)
         raise PipelineStepError("store", str(e), steps=report.steps) from e
     report.stored_version = saved.version
     report.stored_timestamp = saved.timestamp
@@ -1293,6 +1358,27 @@ async def run_pipeline_async(
     # store's compare-and-set stamps a correction by matching its OWN stored
     # text exactly — comparing the combined string would never match, and a
     # correction that can never be marked applied would replay forever.
+    quality_retry = bool(
+        (((recorder.trace.quality or {}).get("escalation") or {}).get("retry", False))
+    )
+    admission_store.complete(
+        admission,
+        retry=quality_retry,
+        summary={
+            "runId": report.run_id,
+            "songId": report.song_id,
+            "status": recorder.trace.status,
+            "storedVersion": report.stored_version,
+            "finishedAt": recorder.trace.finished_at,
+            "quality": recorder.trace.quality,
+            "evidenceManifest": report.evidence_manifest,
+            "forced": recorder.trace.forced,
+        },
+    )
+    # Complete admission BEFORE stamping the correction. A duplicate arriving
+    # in this tiny post-store window now sees the completed version in the lock
+    # and can restore the stamp after `_resolve_guidance` rewrites the same
+    # correction; stamping first left a race where that retry reopened it.
     if pending_correction:
         _consume_applied_correction(song_id, pending_correction, saved.version)
     return report
@@ -1573,6 +1659,16 @@ def _persist_trace(recorder: TraceRecorder) -> None:
         log.warning("run trace persistence failed (continuing): %s", e)
 
 
+def _abandon_admission(store, admission: Admission) -> None:
+    """Release a failed run without hiding the original pipeline error."""
+    try:
+        store.abandon(admission)
+    except Exception as e:  # noqa: BLE001
+        # The lease remains the crash-safety backstop when Firestore itself is
+        # unavailable during cleanup.
+        log.warning("run admission cleanup failed (lease will expire): %s", e)
+
+
 def run_pipeline(
     title: str | None,
     artist: str | None,
@@ -1591,6 +1687,8 @@ def run_pipeline(
     scope: AnalysisScope | None = None,
     refresh_cache: bool = False,
     allow_timing_loss: bool = False,
+    force: bool = False,
+    force_reason: str | None = None,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -1614,5 +1712,7 @@ def run_pipeline(
             scope=scope,
             refresh_cache=refresh_cache,
             allow_timing_loss=allow_timing_loss,
+            force=force,
+            force_reason=force_reason,
         )
     )

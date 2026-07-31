@@ -38,7 +38,8 @@ from .config import settings
 from .discovery import CandidateSource, discover_sources
 from .mir import MirAnalysis, analyze_audio as _analyze_audio
 from .pipeline import get_store, run_pipeline_async
-from .reconcile import provider_capabilities, reconcile as _reconcile
+from .reconcile import provider_capabilities
+from .reconcile.admission import reconcile_admitted
 from .schema import Song, song_json_schema
 from .scope import AnalysisScope
 from .store import backend_label as _store_backend_label
@@ -151,6 +152,8 @@ def reconcile_song(
     attach_audio: Optional[bool] = None,
     youtube_video_id: Optional[str] = None,
     media_url: Optional[str] = None,
+    force: bool = False,
+    force_reason: Optional[str] = None,
 ) -> dict:
     """Reconcile candidate text sources + MIR analysis into a schema-compliant
     Song JSON via the configured reconciler (step 5). candidates_json/mir_json
@@ -173,24 +176,29 @@ def reconcile_song(
     # persists nothing (save_song is a separate call that runs no timing pass
     # either), so no deterministic pass will re-time it and the model's timing
     # must survive intact. See reconcile/engine.py's TimingAuthority.
-    result = _reconcile(
+    admitted = reconcile_admitted(
         title,
         artist,
         candidates,
         mir,
-        provider_name=provider,
+        provider=provider,
         model=model,
         audio_path=audio_path,
         attach_audio=attach_audio,
         youtube_video_id=youtube_video_id,
         media_url=media_url,
+        force=force,
+        force_reason=force_reason,
     )
+    result = admitted.result
     return {
         "song": result.song.model_dump(),
         "provider": result.provider,
         "model": result.model,
         "attempts": result.attempts,
         "audioAttached": result.audio_attached,
+        "runId": admitted.recorder.trace.run_id,
+        "evidenceManifest": admitted.evidence_manifest,
     }
 
 
@@ -207,6 +215,8 @@ async def analyze_and_store_song(
     guidance: Optional[str] = None,
     scope: Optional[dict] = None,
     allow_timing_loss: bool = False,
+    force: bool = False,
+    force_reason: Optional[str] = None,
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
@@ -281,12 +291,15 @@ async def analyze_and_store_song(
         # down, or every MCP caller silently starts getting a "scope" step.
         scope=AnalysisScope.parse(scope),
         allow_timing_loss=allow_timing_loss,
+        force=force,
+        force_reason=force_reason,
     )
     assert report.reconcile is not None
     return {
         "songId": report.song_id,
         "steps": report.steps,
         "storedVersion": report.stored_version,
+        "runId": report.run_id,
         "song": report.reconcile.song.model_dump(),
     }
 

@@ -103,12 +103,14 @@ ENV PYTHONUNBUFFERED=1 \
 # Runtime-only OS deps discovered in the code:
 #   ffmpeg      -> provides ffmpeg + ffprobe (yt-dlp audio extraction, audio utils)
 #   libsndfile1 -> libsndfile for soundfile (insurance; wheels usually bundle it)
+#   tesseract-ocr -> local text extraction for image chord sheets
 # (yt-dlp is a Python dep installed into the venv; the song store is Firestore,
 #  so `git` is no longer a runtime dependency.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         libsndfile1 \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the fully-built virtualenv, the chord model, and the deno runtime

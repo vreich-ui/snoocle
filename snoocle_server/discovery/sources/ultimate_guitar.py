@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 # --- constants block: every URL/selector UG-specific lives here, so a real
 # layout change only ever needs an edit in this one place. ------------------
 _SEARCH_URL = "https://www.ultimate-guitar.com/search.php"
-_TAB_TYPES = ("Chords",)  # UG also indexes Tab/Bass/Ukulele/Pro — chords only
+_TAB_TYPES = ("Official", "Chords")  # exclude Tab/Bass/Ukulele/Pro
 _JS_STORE_RE = re.compile(r'class="js-store"[^>]*data-content="(?P<blob>[^"]*)"')
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -145,6 +145,13 @@ def search_ultimate_guitar(title: str, artist: str, max_results: int = 5) -> lis
             for hit in results
             if isinstance(hit, dict) and hit.get("type") in _TAB_TYPES and hit.get("tab_url")
         ]
+        hits.sort(
+            key=lambda hit: (
+                0 if str(hit.get("type", "")).casefold() == "official" else 1,
+                -float(hit.get("rating") or 0),
+                -int(hit.get("votes") or 0),
+            )
+        )
         return hits[:max_results]
     except Exception as e:  # noqa: BLE001 — best-effort, never raises
         log.info("ultimate-guitar search failed (continuing without it): %s", e)
@@ -227,7 +234,14 @@ def discover_ultimate_guitar(title: str, artist: str, max_candidates: int = 3) -
     """
     if not settings.source_ug_enabled:
         return []
-    hits = search_ultimate_guitar(title, artist, max_results=max_candidates * 2)
+    hits = search_ultimate_guitar(title, artist, max_results=max_candidates * 3)
+    hits.sort(
+        key=lambda hit: (
+            0 if str(hit.get("type", "")).casefold() == "official" else 1,
+            -float(hit.get("rating") or 0),
+            -int(hit.get("votes") or 0),
+        )
+    )
     candidates: list[CandidateSource] = []
     for hit in hits:
         if len(candidates) >= max_candidates:
@@ -236,43 +250,67 @@ def discover_ultimate_guitar(title: str, artist: str, max_candidates: int = 3) -
         tab = fetch_tab(tab_url) if tab_url else None
         if tab is None:
             continue
-        sheet = parse_chord_sheet(_ug_markup_to_bracket(tab["content"]))
-        if not sheet.is_plausible:
-            continue
-
-        declared_capo = int(tab["capo"] or 0) or sheet.declared_capo
-        lines = sheet.lines
-        if declared_capo and not sheet.declared_capo:
-            # the sheet text carried no "capo" line of its own -- UG's
-            # separate metadata field is the only place it was declared.
-            lines = _retranspose(lines, declared_capo)
-
-        notes_parts = [f"ultimate-guitar rating={tab.get('rating')} votes={tab.get('votes')}"]
-        if declared_capo:
-            notes_parts.append(
-                f"source declared capo {declared_capo}; chords transposed to sounding "
-                f"pitch at ingestion (+{declared_capo} semitones)"
-            )
-        tuning = tab.get("tuning")
-        if tuning and str(tuning).strip().lower() not in ("", "standard", "e a d g b e"):
-            notes_parts.append(f"declared tuning: {tuning}")
-
-        candidates.append(
-            CandidateSource(
-                sourceId=f"ultimate-guitar-{hit.get('id') or len(candidates) + 1}",
-                url=tab_url,
-                title=f"{tab.get('artist_name') or artist} - {tab.get('song_name') or title}",
-                declaredCapo=declared_capo,
-                declaredKey=sheet.declared_key,
-                confidence=_confidence_prior(tab.get("rating"), tab.get("votes")),
-                sectionsHint=sheet.sections_hint,
-                sectionStarts=[
-                    SectionStart(name=n, startLineIndex=i)
-                    for n, i in sheet.section_starts
-                    if i < len(lines)
-                ],
-                lines=lines,
-                notes="; ".join(notes_parts),
-            )
+        candidate = candidate_from_ug_tab(
+            hit, tab, title=title, artist=artist,
+            source_id=f"ultimate-guitar-{hit.get('id') or len(candidates) + 1}",
         )
+        if candidate is not None:
+            candidates.append(candidate)
     return candidates
+
+
+def candidate_from_ug_tab(
+    hit: dict,
+    tab: dict,
+    *,
+    title: str,
+    artist: str,
+    source_id: str,
+) -> CandidateSource | None:
+    """Parse one already-fetched UG tab; shared by discovery and prefetch."""
+    sheet = parse_chord_sheet(_ug_markup_to_bracket(tab["content"]))
+    if not sheet.is_plausible:
+        return None
+
+    declared_capo = int(tab.get("capo") or 0) or sheet.declared_capo
+    lines = sheet.lines
+    if declared_capo and not sheet.declared_capo:
+        lines = _retranspose(lines, declared_capo)
+
+    rating = tab.get("rating") if tab.get("rating") is not None else hit.get("rating")
+    votes = tab.get("votes") if tab.get("votes") is not None else hit.get("votes")
+    confidence = _confidence_prior(rating, votes)
+    notes_parts = [
+        f"ultimate-guitar type={hit.get('type')} rating={rating} votes={votes}"
+    ]
+    if declared_capo:
+        notes_parts.append(
+            f"source declared capo {declared_capo}; chords transposed to sounding "
+            f"pitch at ingestion (+{declared_capo} semitones)"
+        )
+    tuning = tab.get("tuning")
+    if tuning and str(tuning).strip().lower() not in ("", "standard", "e a d g b e"):
+        notes_parts.append(f"declared tuning: {tuning}")
+    full_song = (
+        len(lines) >= 8
+        and sheet.placement_count >= 8
+        and (len(sheet.sections_hint) >= 2 or sheet.lyric_line_count >= 12)
+    )
+    return CandidateSource(
+        sourceId=source_id,
+        url=hit.get("tab_url"),
+        title=f"{tab.get('artist_name') or artist} - {tab.get('song_name') or title}",
+        declaredCapo=declared_capo,
+        declaredKey=sheet.declared_key,
+        confidence=confidence,
+        parseConfidence=confidence,
+        coverage="full-song" if full_song else "partial",
+        sectionsHint=sheet.sections_hint,
+        sectionStarts=[
+            SectionStart(name=n, startLineIndex=i)
+            for n, i in sheet.section_starts
+            if i < len(lines)
+        ],
+        lines=lines,
+        notes="; ".join(notes_parts),
+    )

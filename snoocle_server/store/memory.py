@@ -27,6 +27,7 @@ from .base import (
     YouTubeCookieRecord,
     check_provenance_append_only,
     count_cookie_lines,
+    guard_audio_identity_collision,
     next_timestamp,
     now_iso,
     song_has_timing,
@@ -163,6 +164,7 @@ class InMemorySongRepository(SongRepository):
                     f"but store has {current!r}"
                 )
             if rec is not None:
+                guard_audio_identity_collision(rec.versions[current].song, song)
                 check_provenance_append_only(rec.versions[current].song, song)
 
             sha = version_sha(song)

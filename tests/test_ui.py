@@ -42,6 +42,13 @@ def test_ui_static_assets_served():
     assert client.get("/ui/style.css").status_code == 200
 
 
+def test_workbench_exposes_ranked_source_preferences():
+    script = client.get("/ui/app.js").text
+    assert "Ranked source sites" in script
+    assert "source_site_preferences" in script
+    assert all(locale in script for locale in ("global", "russian", "hebrew"))
+
+
 def test_ui_assets_revalidate_so_deploys_are_not_stale():
     # no-cache => the browser revalidates each load (cheap 304 when unchanged),
     # so a deploy shipping new app.js is never masked by a cached old one.

@@ -23,6 +23,7 @@ from pathlib import Path
 import httpx
 
 from ..config import settings
+from ..usage import normalize_usage
 
 log = logging.getLogger(__name__)
 
@@ -135,10 +136,7 @@ class AnthropicProvider(LLMProvider):
         if response.stop_reason == "refusal":
             raise ProviderError("anthropic: request refused by safety classifiers")
         text = "".join(b.text for b in response.content if b.type == "text")
-        usage = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-        }
+        usage = normalize_usage(response.usage, provider=self.name)
         return LLMResponse(text=text, provider=self.name, model=response.model, usage=usage)
 
 
@@ -187,7 +185,7 @@ class OpenAIProvider(LLMProvider):
             text=data["choices"][0]["message"]["content"] or "",
             provider=self.name,
             model=data.get("model", model),
-            usage=data.get("usage", {}),
+            usage=normalize_usage(data.get("usage", {}), provider=self.name),
         )
 
 
@@ -244,7 +242,7 @@ class GeminiProvider(LLMProvider):
             text=text,
             provider=self.name,
             model=model,
-            usage=data.get("usageMetadata", {}),
+            usage=normalize_usage(data.get("usageMetadata", {}), provider=self.name),
         )
 
 

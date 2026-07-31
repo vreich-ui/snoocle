@@ -183,6 +183,12 @@ class BeatMark(_Model):
 
 class AudioInfo(_Model):
     youtubeVideoId: Optional[str] = None
+    # SHA-256 of the exact audio bytes analyzed for this song. This is separate
+    # from a YouTube video id: a re-upload can change bytes under a familiar
+    # label, while two video ids can carry the same recording. It lets the
+    # store refuse a destructive identity collision before one song's versions
+    # are appended to another's history.
+    contentHash: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     durationSeconds: Optional[float] = Field(default=None, ge=0)
     syncMap: list[SyncPoint] = Field(default_factory=list)
     # --- schema v2, optional --------------------------------------------
@@ -318,8 +324,24 @@ def song_json_schema() -> dict[str, Any]:
 
 
 def slugify_song_id(artist: str, title: str) -> str:
+    # Kept here because the schema owns the public id shape; the policy itself
+    # lives in identity.py so all entry points return one structured error.
+    from ..identity import require_resolved_identity
+
+    artist, title = require_resolved_identity(artist, title)
+
     def slug(s: str) -> str:
         s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
-        return s or "unknown"
+        return s
 
-    return f"{slug(artist)}--{slug(title)}"
+    artist_slug, title_slug = slug(artist), slug(title)
+    # A non-ASCII-only value would otherwise turn into the old sentinel after
+    # slugging. Treat it exactly like an empty identity rather than writing a
+    # permanent placeholder id.
+    if not artist_slug or not title_slug:
+        require_resolved_identity(
+            artist_slug or None,
+            title_slug or None,
+            evidence_tried=["songId slugification"],
+        )
+    return f"{artist_slug}--{title_slug}"

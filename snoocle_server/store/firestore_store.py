@@ -34,6 +34,7 @@ from .base import (
     YouTubeCookieRecord,
     check_provenance_append_only,
     count_cookie_lines,
+    guard_audio_identity_collision,
     next_timestamp,
     now_iso,
     summarize_song,
@@ -79,6 +80,7 @@ class FirestoreSongRepository(SongRepository):
         project: str | None = None,
         database: str = "(default)",
         collection: str = "songs",
+        credentials=None,
     ) -> None:
         # Lazy import so the store package (and the in-memory backend) works in
         # environments without google-cloud-firestore installed.
@@ -90,6 +92,8 @@ class FirestoreSongRepository(SongRepository):
             kwargs["project"] = project
         if database and database != "(default)":
             kwargs["database"] = database
+        if credentials is not None:
+            kwargs["credentials"] = credentials
         self._client = firestore.Client(**kwargs)
         self._collection_name = collection
         log.info(
@@ -234,6 +238,7 @@ class FirestoreSongRepository(SongRepository):
                     f"but store has {current!r}"
                 )
             if data:
+                guard_audio_identity_collision(data.get("song") or {}, song)
                 check_provenance_append_only(data.get("song") or {}, song)
 
             sha = version_sha(song)

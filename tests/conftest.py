@@ -24,6 +24,7 @@ import pytest
 
 from snoocle_server.config import settings
 from snoocle_server.store.run_admission import reset_run_admission_store
+from snoocle_server.discovery.source_cache import reset_source_cache
 
 
 @pytest.fixture(autouse=True)
@@ -36,3 +37,10 @@ def _isolated_run_admission_store():
     reset_run_admission_store()
     yield
     reset_run_admission_store()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_parsed_source_cache():
+    reset_source_cache()
+    yield
+    reset_source_cache()

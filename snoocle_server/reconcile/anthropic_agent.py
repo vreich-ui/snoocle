@@ -1,10 +1,11 @@
 """In-process agentic reconciler (provider "anthropic-agent").
 
 Unlike the "agent" provider (which delegates to an EXTERNAL agent workspace
-over MCP), this runs the agentic loop INSIDE this server: the Anthropic SDK
-drives Claude through server-side web search + web fetch and two local tools
-(chord-sheet fetch/parse, windowed MIR) until it emits the final Song JSON.
-No external agent service, no MCP hop — one Cloud Run container.
+over MCP), this runs the agentic loop INSIDE this server. Chord-sheet URLs are
+chosen and parsed by Snoocle's deterministic prefetch; Claude can request one
+more pass through that same recipe, plus bounded windowed MIR, until it emits
+the final Song JSON. No external agent service, no MCP hop — one Cloud Run
+container.
 
 The loop is written by hand rather than using the SDK's beta tool runner:
 server-side tools (web_search/web_fetch) can pause a turn (stop_reason
@@ -18,12 +19,13 @@ import logging
 import time
 
 from ..config import settings
-from ..discovery.fetch import extract_sheet_text, fetch_page
-from ..discovery.service import candidate_from_text
+from ..discovery.prefetch import gather_chord_sheets, infer_recording_variant
 from ..mir.cache import WINDOW_ACCURACY, analyze_cached
 from ..mir.pipeline import analyze_window
 from .providers import ContentFilterError, LLMProvider, LLMResponse, ProviderError
+from .tiering import anthropic_effort, normalize_effort_level, unresolved_sheet_conflict
 from .trace import TraceRecorder
+from ..usage import BudgetExceededError, add_usage, empty_usage, normalize_usage, persisted_usage
 
 log = logging.getLogger(__name__)
 
@@ -62,20 +64,23 @@ displayPreferences.capo MUST be 0."""
 
 _PROMPT_RECIPE = """\
 Retrieval recipe (follow it; do not improvise a research plan):
-1. Read the provided candidates and MIR timeline FIRST. If two or more \
-candidates agree with each other and with the MIR timeline on the key and \
-the core progression, SKIP the web entirely and write the Song now.
-2. Otherwise run ONE web_search: `<title> <artist> chords lyrics`. From the \
-results pick the 2-3 most promising chord pages and call `fetch_chord_sheet` \
-on each (never web_fetch a chord page — fetch_chord_sheet parses and \
-capo-normalizes in one step).
-3. At most ONE more web_search, only if the lyrics are still incomplete.
-4. Call `analyze_audio_window` only when text sources disagree about a \
+1. Read the provided parsed sheets and MIR timeline FIRST. If two or more \
+full-song sheets agree with each other and the MIR timeline on the key and \
+core progression, write the Song now; retrieval will be disabled.
+2. If the supplied sheets are genuinely insufficient and the tool is \
+available, call `search_and_fetch_sheet(query, reason)` within toolBudget \
+(normally once). It searches, \
+ranks, fetches, parses, and capo-normalizes sources deterministically. You \
+never choose, invent, or fetch a URL.
+3. Call `analyze_audio_window` only when parsed sheets disagree about a \
 specific passage AND the provided MIR timeline does not cover it."""
 
 _PROMPT_BUDGET = """\
-Hard budget: at most 2 web_search calls, 4 page fetches, and 2 \
-analyze_audio_window calls per song. Disagreements are settled by the MIR \
+Hard budget: obey the request's toolBudget exactly (normally at most 1 \
+search_and_fetch_sheet call and 2 analyze_audio_window calls per song). \
+Sheet retrieval is disabled entirely \
+when the manifest already contains at least two full-song sheets. \
+Disagreements are settled by the MIR \
 timeline and music theory — NOT by more searching. When you have enough \
 information to act, act: produce the Song instead of continuing to verify. \
 Two agreeing sources plus the provided MIR is always enough."""
@@ -110,15 +115,31 @@ and no lyricRef.
   {"lineIndex": 8, "lyrics": "", "chordPlacements": [{"charIndex": 0, \
 "chord": "Am"}, {"charIndex": 1, "chord": "G"}]}
 - Referenceable sourceIds are the candidates in this request, "prior-song" \
-when one is given, and any sheet you fetch with fetch_chord_sheet (it \
+when one is given, and any sheet returned by search_and_fetch_sheet (it \
 returns the sourceId to use). A ref to anything else, or to a line outside \
 that source, FAILS the run — it is not repaired and it does not fall back \
 to your own recollection of the song.
 - charIndex is an index into the REFERENCED line's text as it appears in \
 that source. Count characters there; do not estimate."""
 
+_PATCH_OUTPUT_CONTRACT = """\
+Output contract:
+- A prior Song exists. Your FINAL message must be EXACTLY ONE compact
+reconciliation patch conforming to songSchema. Never repeat the full Song.
+- lineChanges names only lines that change. Omitted lines stay unchanged.
+Replace a changed line's chordPlacements as a compact array. To change its
+words, use lyricRef, or the rare lyricOverride + lyricOverrideReason; omit all
+lyric fields when the prior words stay unchanged.
+- Omit sections, metadata, and displayPreferences when unchanged. If sections
+is present it replaces the prior section list.
+- Never emit timeSeconds, confidence, beat, audio.syncMap, audio.beats, or
+metadata.bpm. Deterministic server post-passes own those fields. Section
+startTime/endTime remain allowed because the current snap pass does not always
+reconstruct them.
+- No markdown fences, commentary, prose, or full Song before or after."""
 
-def build_system_blocks(cfg=None) -> list[dict]:
+
+def build_system_blocks(cfg=None, output_format: str = "full") -> list[dict]:
     """Assemble the cached system block from the default sections plus any
     operator overrides in ``cfg`` (an AgentConfig). ``_OUTPUT_CONTRACT`` is
     always appended last, regardless of overrides."""
@@ -133,7 +154,9 @@ def build_system_blocks(cfg=None) -> list[dict]:
     parts = [base]
     if cfg is not None and cfg.instructions_extra:
         parts.append(cfg.instructions_extra)
-    parts.append(_OUTPUT_CONTRACT)  # always, never editable
+    parts.append(
+        _PATCH_OUTPUT_CONTRACT if output_format == "patch" else _OUTPUT_CONTRACT
+    )  # always, never editable
     return [{"type": "text", "text": "\n\n".join(parts), "cache_control": {"type": "ephemeral"}}]
 
 
@@ -141,10 +164,18 @@ def build_system_blocks(cfg=None) -> list[dict]:
 SYSTEM_BLOCKS = build_system_blocks(None)
 SYSTEM_PROMPT = SYSTEM_BLOCKS[0]["text"]
 
-_FETCH_TOOL = {
-    "name": "fetch_chord_sheet",
-    "description": "Fetch a URL and parse it as a chord sheet. Returns a structured candidate (lines with chord placements at sounding pitch, declared key/capo, confidence) or an error if the page has no usable transcription. Call this for chord/tab pages found via web_search; prefer it over web_fetch for chord sites because it parses and capo-normalizes.",
-    "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"], "additionalProperties": False},
+_SEARCH_FETCH_TOOL = {
+    "name": "search_and_fetch_sheet",
+    "description": "Search through Snoocle's deterministic ranked source recipe and return parsed, capo-normalized sheets. Provide a query and evidence-gap reason. The server chooses and fetches URLs.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["query", "reason"],
+        "additionalProperties": False,
+    },
 }
 _WINDOW_TOOL = {
     "name": "analyze_audio_window",
@@ -157,12 +188,7 @@ def _build_tools(max_web_search: int, max_fetch: int, disabled=frozenset()) -> l
     """Tools with the server-tool budget set by the analysis-depth profile;
     any tool named in ``disabled`` (an operator AgentConfig) is omitted — an
     undeclared tool simply cannot be called."""
-    candidates = [
-        {"type": "web_search_20260209", "name": "web_search", "max_uses": max_web_search},
-        {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": max_fetch},
-        _FETCH_TOOL,
-        _WINDOW_TOOL,
-    ]
+    candidates = [*([_SEARCH_FETCH_TOOL] if max_fetch > 0 else []), _WINDOW_TOOL]
     return [t for t in candidates if t["name"] not in disabled]
 
 
@@ -318,11 +344,11 @@ def _tool_summary(name: str, tool_input: dict, result: dict, is_error: bool) -> 
     """One human-readable line describing a tool call and its outcome."""
     if is_error:
         return f"{name} failed: {result.get('error')}"
-    if name == "fetch_chord_sheet":
-        lines = result.get("lines")
-        n = len(lines) if isinstance(lines, list) else "?"
-        key = result.get("declaredKey") or result.get("key") or "?"
-        return f"fetched {tool_input.get('url', '?')} → {n} lines, key={key}"
+    if name == "search_and_fetch_sheet":
+        return (
+            f"deterministic sheet search for {tool_input.get('query', '?')!r} "
+            f"→ {result.get('count', 0)} parsed sheet(s)"
+        )
     if name == "analyze_audio_window":
         chords = result.get("chords") or []
         return (
@@ -332,21 +358,75 @@ def _tool_summary(name: str, tool_input: dict, result: dict, is_error: bool) -> 
     return f"{name} ok"
 
 
-def fetch_chord_sheet(url: str, source_id: str = "agent-1") -> dict:
-    """Fetch a URL, extract chord-sheet text, and parse it into a candidate.
-
-    Returns the candidate's serialized dict, or an ``{"error": ...}`` object
-    (never raises) when the page can't be fetched or isn't a plausible sheet.
-    """
+def search_and_fetch_sheet(context: dict, query: str, reason: str) -> tuple[dict, dict]:
+    """Agent-facing retrieval: parsed evidence out, URL decisions only in trace."""
+    cfg = context.get("agent_config")
     try:
-        page = fetch_page(url)
-    except Exception as e:  # noqa: BLE001 — a dead/blocked page is a tool error, not a crash
-        return {"error": f"fetch failed: {e}"}
-    text = extract_sheet_text(page)
-    candidate = candidate_from_text(text, source_id=source_id, url=url)
-    if candidate is None:
-        return {"error": "page is not a plausible chord sheet"}
-    return candidate.model_dump(exclude_none=True)
+        gathered = gather_chord_sheets(
+            str(context.get("song_id") or ""),
+            str(context.get("artist") or ""),
+            str(context.get("title") or ""),
+            str(context.get("recording_variant") or infer_recording_variant(
+                str(context.get("title") or "")
+            )),
+            query=(query or "").strip(),
+            max_sheets=settings.source_prefetch_max,
+            site_preferences=(cfg.source_site_preferences if cfg else None),
+        )
+    except Exception as error:  # noqa: BLE001 — tool errors go back as structured results
+        return {"error": str(error)}, {
+            "query": query, "reason": reason, "rankedResults": [],
+            "chosenUrls": [], "outcomes": [{"status": "failed", "error": str(error)}],
+        }
+
+    candidates = context.setdefault("candidates", [])
+    known = {candidate.sourceId for candidate in candidates}
+    public_sheets: list[dict] = []
+    manifest = context.get("evidence_manifest")
+    if manifest is None:
+        manifest = {}
+        context["evidence_manifest"] = manifest
+    source_block = manifest.setdefault("sources", {})
+    manifest_sheets = source_block.setdefault("sheets", [])
+    manifest_ids = source_block.setdefault("ids", [])
+    for candidate in gathered.candidates:
+        if candidate.sourceId not in known:
+            candidates.append(candidate)
+            known.add(candidate.sourceId)
+        if candidate.sourceId not in manifest_ids:
+            manifest_ids.append(candidate.sourceId)
+        if not any(sheet.get("sourceId") == candidate.sourceId for sheet in manifest_sheets):
+            manifest_sheets.append({
+                "sourceId": candidate.sourceId,
+                "url": candidate.url,
+                "contentHash": candidate.contentHash,
+                "contentType": candidate.contentType,
+                "gatheredAt": candidate.retrievedAt,
+                "cacheStatus": candidate.cacheStatus,
+                "parseConfidence": (
+                    candidate.parseConfidence
+                    if candidate.parseConfidence is not None
+                    else candidate.confidence
+                ),
+                "parseStatus": "parsed",
+                "declaredCapo": candidate.declaredCapo,
+                "normalizedCapo": 0,
+                "coverage": candidate.coverage,
+                "lineCount": len(candidate.lines),
+                "origin": "agent-search-and-fetch",
+            })
+        # The model receives parsed musical evidence, not the URL/ranking data.
+        public_sheets.append(candidate.model_dump(
+            exclude={"url", "retrievedAt", "contentHash", "contentType", "cacheStatus"},
+            exclude_none=True,
+        ))
+    source_block["count"] = len(manifest_ids)
+    source_block["fullSongSheets"] = sum(
+        1 for sheet in manifest_sheets if sheet.get("coverage") == "full-song"
+    )
+    return {"count": len(public_sheets), "sheets": public_sheets}, {
+        **gathered.report, "reason": reason,
+    }
 
 
 def analyze_audio_window(audio_path: str | None, start_seconds: float, end_seconds: float) -> dict:
@@ -399,6 +479,7 @@ class AnthropicAgentProvider(LLMProvider):
     supports_audio = False  # audio is reached through analyze_audio_window, not attached
     wants_context = True
     emits_lyric_refs = True  # see _OUTPUT_CONTRACT and reconcile/lyric_refs.py
+    records_usage_in_trace = True
 
     # engine.py injects the structured inputs (incl. audio_path) here before complete()
     context: dict | None = None
@@ -412,6 +493,9 @@ class AnthropicAgentProvider(LLMProvider):
         # (and its cached prefix) carries forward.
         self._messages: list[dict] = []
         self._fetch_count = 0
+        self._sheet_search_count = 0
+        self._sheet_search_budget = 0
+        self._opus_escalation_spent = False
 
     def _create_client(self):
         # Lazy import + isolated in a method so tests can monkeypatch it.
@@ -430,8 +514,15 @@ class AnthropicAgentProvider(LLMProvider):
             "youtubeVideoId": ctx.get("youtube_video_id"),
             "mediaUrl": ctx.get("media_url"),
             "mir": mir.to_prompt_payload() if mir is not None else None,
-            "candidates": [c.model_dump(exclude_none=True) for c in ctx.get("candidates") or []],
+            "candidates": [
+                c.model_dump(
+                    exclude={"url", "retrievedAt", "contentHash", "contentType", "cacheStatus"},
+                    exclude_none=True,
+                )
+                for c in ctx.get("candidates") or []
+            ],
             "songSchema": ctx.get("song_schema"),
+            "outputFormat": ctx.get("output_format") or "full",
         }
         # Exactly which ids a lyricRef may name, and how many lines each has.
         # Stated rather than left to be inferred from `candidates`, because an
@@ -444,7 +535,16 @@ class AnthropicAgentProvider(LLMProvider):
         # Descriptive context: what this run reused vs recomputed, and how good
         # each input is. See manifest.py — never a source of song content.
         if ctx.get("evidence_manifest"):
-            payload["evidenceManifest"] = ctx["evidence_manifest"]
+            # The persisted manifest retains retrieval provenance, including
+            # URLs. Claude gets the same metadata with chord-source URLs
+            # removed: it can reason over parsed sheets and stable sourceIds,
+            # but cannot memorize, invent, or directly re-fetch a URL.
+            manifest = json.loads(json.dumps(ctx["evidence_manifest"]))
+            source_block = manifest.get("sources") or {}
+            for sheet in source_block.get("sheets") or []:
+                if isinstance(sheet, dict):
+                    sheet.pop("url", None)
+            payload["evidenceManifest"] = manifest
         if getattr(self, "_effective_budget", None):
             payload["toolBudget"] = self._effective_budget
         if depth is not None and depth.time_align:
@@ -503,15 +603,29 @@ class AnthropicAgentProvider(LLMProvider):
     def _run_tool(self, block) -> dict:
         name = block.name
         tool_input = block.input or {}
-        if name == "fetch_chord_sheet":
-            self._fetch_count += 1
-            source_id = f"agent-{self._fetch_count}"
-            result = fetch_chord_sheet(tool_input.get("url", ""), source_id=source_id)
-            # A sheet fetched mid-run is evidence like any other, so its lines
-            # have to become REFERENCEABLE — otherwise the agent finds a better
-            # source than the ones it was handed and then cannot point at it,
-            # and an unresolvable ref fails the run (lyric_refs.py rule 3).
-            self._register_ref_source(source_id, result)
+        trace_result: dict | None = None
+        if name == "search_and_fetch_sheet":
+            if self._sheet_search_count >= self._sheet_search_budget:
+                result = {
+                    "error": "search_and_fetch_sheet budget exhausted",
+                    "code": "tool_budget_exceeded",
+                }
+                trace_result = {
+                    "query": tool_input.get("query"),
+                    "reason": tool_input.get("reason"),
+                    "budget": self._sheet_search_budget,
+                    "used": self._sheet_search_count,
+                    "outcomes": [{"status": "refused", "error": result["error"]}],
+                }
+            else:
+                self._sheet_search_count += 1
+                result, trace_result = search_and_fetch_sheet(
+                    self.context or {},
+                    str(tool_input.get("query") or ""),
+                    str(tool_input.get("reason") or ""),
+                )
+                for fetched in result.get("sheets") or []:
+                    self._register_ref_source(str(fetched.get("sourceId") or ""), fetched)
         elif name == "analyze_audio_window":
             audio_path = (self.context or {}).get("audio_path")
             result = analyze_audio_window(
@@ -524,7 +638,12 @@ class AnthropicAgentProvider(LLMProvider):
             self.trace.step(
                 "tool", f"tool:{name}",
                 _tool_summary(name, tool_input, result, is_error),
-                detail={"tool": name, "input": tool_input, "result": result},
+                detail={
+                    "tool": name,
+                    "input": tool_input,
+                    "result": result,
+                    **({"retrieval": trace_result} if trace_result is not None else {}),
+                },
             )
             if name == "analyze_audio_window" and not is_error:
                 # The probe also lands on the run's MIR record (un-truncated)
@@ -706,17 +825,35 @@ class AnthropicAgentProvider(LLMProvider):
                 return getattr(depth, depth_attr)
             return default
 
-        resolved_model = (
-            model or (cfg.model if cfg else None)
-            or settings.llm_model or settings.anthropic_agent_model
-        )
-        effort = (
+        requested_effort = (
             (cfg.effort if cfg else None) or (depth.effort if depth is not None else None)
             or settings.anthropic_agent_effort
         )
+        effort_level = normalize_effort_level(requested_effort)
+        effort = anthropic_effort(effort_level)
+        explicit_model = model or (cfg.model if cfg else None) or settings.llm_model
+        tier_model = {
+            "low": settings.anthropic_agent_low_model,
+            "standard": settings.anthropic_agent_standard_model,
+            "high": settings.anthropic_agent_model,
+        }[effort_level]
+        resolved_model = explicit_model or tier_model
+        escalation_reason = None
+        if effort_level == "standard" and not explicit_model:
+            escalation_reason = unresolved_sheet_conflict(
+                (self.context or {}).get("candidates") or [],
+                (self.context or {}).get("mir"),
+            )
+        if self.trace is not None and len(turns) == 1:
+            self.trace.set_model_routing(
+                effort_level=effort_level,
+            )
         max_turns = (cfg.max_turns if cfg else None) or settings.anthropic_agent_max_turns
         web = _pick(cfg.max_web_search if cfg else None, "max_web_search", 2)
-        fetch = _pick(cfg.max_fetch if cfg else None, "max_fetch", 3)
+        # `max_fetch` is now the count of deterministic search+fetch calls.
+        # It defaults to one independently of the old depth profile; an
+        # operator may explicitly raise or lower it in runtime agent config.
+        fetch = cfg.max_fetch if cfg is not None and cfg.max_fetch is not None else 1
         windows = _pick(cfg.max_windows if cfg else None, "max_windows", 2)
         disabled = set(cfg.disabled_tools) if cfg else set()
         # Scope must REMOVE tools, not merely ask the model not to use them.
@@ -730,16 +867,25 @@ class AnthropicAgentProvider(LLMProvider):
             if not scope.listen:
                 disabled.add("analyze_audio_window")
             if not scope.reconcile:
-                disabled.update(("web_search", "web_fetch", "fetch_chord_sheet"))
-        tools = _build_tools(web, fetch, frozenset(disabled))
-        system_blocks = build_system_blocks(cfg)
+                disabled.add("search_and_fetch_sheet")
+        manifest_sources = (((self.context or {}).get("evidence_manifest") or {}).get("sources") or {})
+        full_song_sheets = int(manifest_sources.get("fullSongSheets") or 0)
+        self._sheet_search_budget = 0 if full_song_sheets >= 2 else int(fetch)
+        tools = _build_tools(web, self._sheet_search_budget, frozenset(disabled))
+        output_format = (self.context or {}).get("output_format") or "full"
+        system_blocks = build_system_blocks(cfg, output_format=output_format)
         # Budget the first user message advertises to the model (see _build...).
-        self._effective_budget = {"webSearch": web, "pageFetch": fetch, "audioWindow": windows}
+        self._effective_budget = {
+            "sheetSearch": self._sheet_search_budget,
+            "audioWindow": windows,
+        }
 
         if len(turns) == 1:
             # First attempt: build a fresh conversation from the injected context.
             self._messages = [self._build_first_user_message()]
             self._fetch_count = 0
+            self._sheet_search_count = 0
+            self._opus_escalation_spent = False
         else:
             # Repair round: the engine passed [user, assistant, repair-user, ...].
             # The assistant's previous final answer is already in self._messages;
@@ -759,8 +905,9 @@ class AnthropicAgentProvider(LLMProvider):
                 self._messages.append({"role": "user", "content": turns[-1]["text"]})
 
         client = self._create_client()
-        usage: dict = {}
+        usage = empty_usage()
         response = None
+        last_model = resolved_model
         # The server-side tools (web_search / web_fetch) execute in an
         # API-managed container. Once one has run, EVERY subsequent turn of the
         # same conversation must name that container, or the API rejects the
@@ -770,6 +917,22 @@ class AnthropicAgentProvider(LLMProvider):
         # that allocated it, so it has to be carried forward by hand.
         container_id: str | None = None
         for turn in range(1, max_turns + 1):
+            run_cap = (
+                cfg.run_cost_cap_usd
+                if cfg is not None and cfg.run_cost_cap_usd is not None
+                else settings.run_cost_cap_usd
+            )
+            current_cost = self.trace.trace.cost_usd if self.trace is not None else 0.0
+            if current_cost >= run_cap:
+                if self.trace is not None:
+                    self.trace.step(
+                        "budget", "run-budget-refusal",
+                        "model turn refused by the per-run cost cap",
+                        detail={"currentSpendUSD": current_cost, "capUSD": run_cap},
+                    )
+                raise BudgetExceededError(
+                    "run", current_cost, run_cap, refused=f"model turn {turn}"
+                )
             # Every request has to be internally consistent, and this loop is
             # what breaks that: a turn that stopped with `tool_use` while also
             # carrying an open server block stops being trailing the moment its
@@ -779,9 +942,21 @@ class AnthropicAgentProvider(LLMProvider):
             # only point that sees the history exactly as the API will.
             self._close_open_assistant_turn()
             turn_start = time.monotonic()
+            turn_model = (
+                settings.anthropic_agent_model
+                if escalation_reason and not self._opus_escalation_spent else resolved_model
+            )
+            if escalation_reason and not self._opus_escalation_spent:
+                self._opus_escalation_spent = True
+                if self.trace is not None:
+                    self.trace.set_model_routing(
+                        effort_level=effort_level,
+                        opus_escalation_reason=escalation_reason,
+                    )
+            last_model = turn_model
             request: dict = {
-                "model": resolved_model,
-                "max_tokens": 16000,
+                "model": turn_model,
+                "max_tokens": 6000 if output_format == "patch" else 16000,
                 "thinking": {"type": "adaptive"},
                 # effort is the dominant wall-clock lever for this loop; the
                 # analysis-depth profile sets it (see reconcile/depth.py).
@@ -810,9 +985,12 @@ class AnthropicAgentProvider(LLMProvider):
             if allocated is not None and getattr(allocated, "id", None):
                 container_id = allocated.id
             u = getattr(response, "usage", None)
-            if u is not None:
-                usage["input_tokens"] = usage.get("input_tokens", 0) + (getattr(u, "input_tokens", 0) or 0)
-                usage["output_tokens"] = usage.get("output_tokens", 0) + (getattr(u, "output_tokens", 0) or 0)
+            turn_usage = normalize_usage(u, provider=self.name)
+            add_usage(usage, turn_usage)
+            step_cost = (
+                self.trace.record_model_usage(turn_model, turn_usage)
+                if self.trace is not None else 0.0
+            )
             tool_names = [b.name for b in response.content if getattr(b, "type", "") == "tool_use"]
             turn_dur = time.monotonic() - turn_start
             log.info(
@@ -835,14 +1013,32 @@ class AnthropicAgentProvider(LLMProvider):
                     ),
                     detail={
                         "turn": turn,
+                        "model": turn_model,
                         "stopReason": response.stop_reason,
                         "toolsRequested": tool_names,
                         "reasoning": thinking[:2000] or None,
                         "inputTokens": getattr(u, "input_tokens", None),
                         "outputTokens": getattr(u, "output_tokens", None),
-                        "cachedInputTokens": getattr(u, "cache_read_input_tokens", None),
+                        "cacheCreationInputTokens": turn_usage["cache_creation_input_tokens"],
+                        "cacheReadInputTokens": turn_usage["cache_read_input_tokens"],
+                        "usage": persisted_usage(turn_usage),
+                        "costUSD": step_cost,
                     },
                     duration_seconds=turn_dur,
+                )
+            if self.trace is not None and self.trace.trace.cost_usd > run_cap:
+                self.trace.step(
+                    "budget", "run-budget-exceeded",
+                    "model response crossed the per-run cost cap; no further work admitted",
+                    detail={
+                        "currentSpendUSD": self.trace.trace.cost_usd,
+                        "capUSD": run_cap,
+                        "refusedAfterTurn": turn,
+                    },
+                )
+                raise BudgetExceededError(
+                    "run", self.trace.trace.cost_usd, run_cap,
+                    refused=f"continuation after model turn {turn}",
                 )
             if response.stop_reason == "refusal":
                 raise ProviderError("anthropic-agent: model refused the request")
@@ -885,6 +1081,6 @@ class AnthropicAgentProvider(LLMProvider):
         return LLMResponse(
             text=final_text,
             provider=self.name,
-            model=resolved_model,
+            model=last_model,
             usage=usage,
         )

@@ -11,6 +11,7 @@ import threading
 from ..config import settings
 from .base import (  # noqa: F401
     CorruptSongError,
+    IdentityCollisionError,
     SaveResult,
     SongRepository,
     SongSummary,

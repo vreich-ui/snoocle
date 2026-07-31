@@ -48,6 +48,19 @@ class LrcLine:
     text: str
 
 
+@dataclass(frozen=True)
+class LrcMatch:
+    """A lyrics match plus the catalogue identity that named it.
+
+    Timing callers use ``lines``; identity resolution uses ``track_name`` and
+    ``artist_name`` before it ever mints a song id.
+    """
+
+    track_name: str
+    artist_name: str
+    lines: list[LrcLine]
+
+
 def _parse_synced_lyrics(raw: str) -> list[LrcLine]:
     lines: list[LrcLine] = []
     for raw_line in raw.splitlines():
@@ -62,9 +75,9 @@ def _parse_synced_lyrics(raw: str) -> list[LrcLine]:
     return lines
 
 
-def fetch_lrc(
+def fetch_lrc_match(
     title: str, artist: str, duration_seconds: Optional[float]
-) -> Optional[list[LrcLine]]:
+) -> Optional[LrcMatch]:
     """Best-effort: None on ANY failure — network error, disabled via
     config, no exact match, or no synced-lyrics fallback match either.
     Callers never need to distinguish why; they just skip this evidence."""
@@ -77,11 +90,16 @@ def fetch_lrc(
             params["duration"] = round(duration_seconds)
         r = httpx.get(f"{_LRCLIB_BASE}/get", params=params, timeout=_TIMEOUT_SECONDS, headers=headers)
         if r.status_code == 200:
-            synced = (r.json() or {}).get("syncedLyrics")
+            payload = r.json() or {}
+            synced = payload.get("syncedLyrics")
             if synced:
                 parsed = _parse_synced_lyrics(synced)
                 if parsed:
-                    return parsed
+                    return LrcMatch(
+                        track_name=str(payload.get("trackName") or title).strip(),
+                        artist_name=str(payload.get("artistName") or artist).strip(),
+                        lines=parsed,
+                    )
 
         # /api/get is an exact (title, artist, duration) lookup; fall back to
         # /api/search and pick the closest-duration synced-lyrics result.
@@ -103,10 +121,26 @@ def fetch_lrc(
             ]
         if not candidates:
             return None
-        return _parse_synced_lyrics(candidates[0]["syncedLyrics"]) or None
+        chosen = candidates[0]
+        parsed = _parse_synced_lyrics(chosen["syncedLyrics"])
+        if not parsed:
+            return None
+        return LrcMatch(
+            track_name=str(chosen.get("trackName") or title).strip(),
+            artist_name=str(chosen.get("artistName") or artist).strip(),
+            lines=parsed,
+        )
     except Exception as e:  # noqa: BLE001 — best-effort, must never raise
         log.info("lrclib fetch failed (continuing without it): %s", e)
         return None
+
+
+def fetch_lrc(
+    title: str, artist: str, duration_seconds: Optional[float]
+) -> Optional[list[LrcLine]]:
+    """Compatibility timing wrapper around :func:`fetch_lrc_match`."""
+    match = fetch_lrc_match(title, artist, duration_seconds)
+    return match.lines if match is not None else None
 
 
 def _normalize(text: str) -> str:

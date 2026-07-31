@@ -50,7 +50,7 @@ def isolated_stores(monkeypatch):
 def test_depth_presets_expand_to_distinct_knobs():
     fast, standard, thorough = (resolve_depth(x) for x in ("fast", "standard", "thorough"))
     assert (fast.accuracy, fast.effort, fast.time_align) == ("fast", "low", False)
-    assert (standard.accuracy, standard.effort) == ("standard", "medium")
+    assert (standard.accuracy, standard.effort) == ("standard", "standard")
     assert (thorough.accuracy, thorough.effort, thorough.time_align) == ("thorough", "high", True)
     # budgets grow with depth
     assert fast.max_web_search < thorough.max_web_search

@@ -137,6 +137,38 @@ def test_discover_end_to_end_against_fixtures(monkeypatch):
     assert "votes=29000" in c.notes
 
 
+def test_search_limit_keeps_an_official_version_even_when_it_appears_later(monkeypatch):
+    data = json.loads(json.dumps(_SEARCH_JSON))
+    results = data["store"]["page"]["data"]["results"]
+    results.insert(0, {
+        "id": 1111,
+        "song_name": "Let It Be",
+        "artist_name": "The Beatles",
+        "tab_url": "https://tabs.ultimate-guitar.com/tab/a/community-1111",
+        "rating": 5.0,
+        "votes": 99999,
+        "type": "Chords",
+    })
+    results.append({
+        "id": 2222,
+        "song_name": "Let It Be",
+        "artist_name": "The Beatles",
+        "tab_url": "https://tabs.ultimate-guitar.com/tab/a/official-2222",
+        "rating": 4.0,
+        "votes": 10,
+        "type": "Official",
+    })
+
+    monkeypatch.setattr(
+        ug_mod.httpx,
+        "get",
+        lambda *args, **kwargs: _FakeResponse(200, _js_store_html(data)),
+    )
+    hits = ug_mod.search_ultimate_guitar("Let It Be", "The Beatles", max_results=1)
+    assert hits[0]["type"] == "Official"
+    assert hits[0]["id"] == 2222
+
+
 def test_metadata_capo_retransposes_when_sheet_text_has_no_capo_line(monkeypatch):
     def fake_get(url, params=None, headers=None, timeout=None):
         if url == ug_mod._SEARCH_URL:

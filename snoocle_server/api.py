@@ -50,6 +50,7 @@ from .reconcile.admission import reconcile_admitted
 from .reconcile.providers import ProviderError
 from .scope import AnalysisScope
 from .export import to_chordpro, to_txt
+from .identity import IdentityUnresolvedError, require_resolved_song_id, song_id_has_unknown_segment
 from .schema import ProvenanceEntry, Song, song_json_schema
 from .timing.offset import estimate_offset
 from .store.jobs import (
@@ -63,6 +64,7 @@ from .oauth import router as oauth_router
 from .oauth.protocol import www_authenticate as oauth_www_authenticate
 from .store import (
     CorruptSongError,
+    IdentityCollisionError,
     StoreError,
     StoreUnavailableError,
     VersionConflictError,
@@ -70,6 +72,8 @@ from .store import (
     count_cookie_lines,
 )
 from .store.run_admission import DuplicateRunError
+from .store.identity_rename import IdentityRenameError, rename_song_identity
+from .store.runs import get_run_store
 
 # --- Single-service topology: embed the MCP endpoint in this FastAPI app -----
 # One Cloud Run service / container / process serves BOTH the REST API and the
@@ -356,6 +360,14 @@ def post_discover(req: DiscoverRequest) -> dict:
 # in-app Reconnect YouTube flow) and show `reason` as the headline message.
 _ERROR_REASONS = {
     "duplicate_run": "An identical reconciliation is already running or recently completed.",
+    "identity_unresolved": (
+        "Snoocle could not determine both artist and title from the available evidence. "
+        "Name the song manually before retrying."
+    ),
+    "identity_collision": (
+        "A different audio recording is already stored under this song id. "
+        "Choose the correct identity instead of overwriting its history."
+    ),
     "youtube_auth_required": (
         "YouTube connection expired or was blocked. Reconnect YouTube "
         "(sign in again in the app) and retry."
@@ -368,6 +380,9 @@ _ERROR_REASONS = {
         "The model blocked its output under its content-filtering policy for "
         "this song. Try again (it isn't always deterministic), a different "
         "source/upload, or a lower analysis depth."
+    ),
+    "budget_exceeded": (
+        "The configured model-spend budget has been reached. The server refused new work."
     ),
 }
 
@@ -392,6 +407,14 @@ def _duplicate_response(error: DuplicateRunError) -> JSONResponse:
     if error.summary is not None:
         body["existingRun"] = error.summary
     return JSONResponse(body, status_code=409)
+
+
+def _identity_unresolved_response(
+    error: IdentityUnresolvedError, detail: str | None = None
+) -> JSONResponse:
+    body = {"detail": detail or str(error), **error.to_dict()}
+    body["reason"] = _ERROR_REASONS[error.code]
+    return JSONResponse(body, status_code=422)
 
 
 def _acquisition_error_response(e: AcquisitionError) -> JSONResponse:
@@ -495,6 +518,9 @@ class ReconcileRequest(BaseModel):
     mediaUrl: Optional[str] = None
     force: bool = False
     forceReason: Optional[str] = None
+    batchId: Optional[str] = None
+    effortLevel: Optional[Literal["low", "standard", "high"]] = None
+    priorSong: Optional[dict] = None
 
     @model_validator(mode="after")
     def _forced_reason(self) -> "ReconcileRequest":
@@ -535,12 +561,25 @@ def post_reconcile(req: ReconcileRequest) -> dict:
             media_url=req.mediaUrl,
             force=req.force,
             force_reason=req.forceReason,
+            batch_id=req.batchId,
+            effort_level=req.effortLevel,
+            prior_song=req.priorSong,
         )
         result = admitted.result
     except DuplicateRunError as e:
         return _duplicate_response(e)
-    except (ReconcileError, ProviderError) as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
+    except IdentityUnresolvedError as e:
+        return _identity_unresolved_response(e)
+    except Exception as e:
+        from .usage import BudgetExceededError
+        if isinstance(e, BudgetExceededError):
+            return JSONResponse(
+                status_code=429,
+                content={"errorCode": e.error_code, "reason": str(e), **e.to_dict()},
+            )
+        if isinstance(e, (ReconcileError, ProviderError)):
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        raise
     return {
         **_reconcile_response(result),
         "runId": admitted.recorder.trace.run_id,
@@ -591,6 +630,9 @@ class PipelineRequest(BaseModel):
     # accuracy + agent effort + tool budget + time alignment. Supersedes
     # `accuracy` when set; the app sends this one field.
     analysisDepth: Optional[Literal["fast", "standard", "thorough"]] = None
+    # Public iOS/Web effort picker. Maps 1:1 to model tiering; when present it
+    # also selects the corresponding low/standard/high analysis profile.
+    effortLevel: Optional[Literal["low", "standard", "high"]] = None
     # Human-in-the-loop re-run: free-text correction notes and/or the prior
     # human-edited Song, fed to the reconciler as high-priority evidence so a
     # re-analysis honors the user's fixes instead of rediscovering from scratch.
@@ -684,6 +726,7 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             allow_timing_loss=req.allowTimingLoss,
             force=req.force,
             force_reason=req.forceReason,
+            effort_level=req.effortLevel,
         )
     except DuplicateRunError as e:
         return _duplicate_response(e)
@@ -694,7 +737,26 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
         # the per-step outcomes (str(e) carries the "[steps: ...]" summary),
         # and when the root cause is classified (e.g. dead YouTube session),
         # add errorCode + reason so the client can offer the fix action.
-        return _error_response(502, str(e), e.error_code)
+        if e.error_code == "identity_unresolved" and isinstance(e.__cause__, IdentityUnresolvedError):
+            return _identity_unresolved_response(e.__cause__, str(e))
+        if e.error_code == "budget_exceeded":
+            from .usage import BudgetExceededError
+            cause = e.__cause__
+            body = cause.to_dict() if isinstance(cause, BudgetExceededError) else {
+                "code": "budget_exceeded"
+            }
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": str(e), "errorCode": "budget_exceeded",
+                    "reason": _ERROR_REASONS["budget_exceeded"], **body,
+                },
+            )
+        return _error_response(
+            409 if e.error_code == "identity_collision" else 502,
+            str(e),
+            e.error_code,
+        )
     assert report.reconcile is not None
     return {
         "songId": report.song_id,
@@ -743,6 +805,46 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
 
 class NotesRequest(BaseModel):
     notes: str = ""
+
+
+class SetSongIdentityRequest(BaseModel):
+    artist: str
+    title: str
+
+
+@app.get("/v1/songs/needs-identity")
+def list_songs_needing_identity() -> dict:
+    """Legacy rows that must be manually named before another analysis."""
+    songs = [
+        {
+            "songId": summary.id,
+            "artist": summary.artist,
+            "title": summary.title,
+            "needsIdentity": True,
+        }
+        for summary in get_store().list_song_summaries()
+        if song_id_has_unknown_segment(summary.id)
+    ]
+    return {"songs": songs}
+
+
+@app.post("/v1/songs/{song_id}/identity")
+def set_song_identity(song_id: str, req: SetSongIdentityRequest) -> dict:
+    """Manually name a legacy needs-identity song and atomically move it.
+
+    This is intentionally a rename, not an in-place edit: every historical
+    version receives its new content hash and all run traces are repointed in
+    the same transaction.
+    """
+    try:
+        result = rename_song_identity(
+            get_store(), get_run_store(), song_id, artist=req.artist, title=req.title
+        )
+    except IdentityUnresolvedError as error:
+        return _identity_unresolved_response(error)
+    except IdentityRenameError as error:
+        return _error_response(409, str(error), "identity_rename_failed")
+    return result.to_dict()
 
 
 def _component(doc: dict | None) -> dict | None:
@@ -857,6 +959,21 @@ def get_song_runs(song_id: str) -> dict:
     return {"songId": song_id, "runs": runs}
 
 
+@app.get("/v1/usage/summary")
+def get_usage_summary(window: str = "7d") -> dict:
+    """Compact cost/token rollups; intentionally excludes individual steps."""
+    from .reconcile.engine import _load_agent_config
+    from .store.runs import get_run_store
+    from .usage_summary import build_usage_summary
+
+    try:
+        return build_usage_summary(
+            get_run_store(), window=window, cfg=_load_agent_config()
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 # --- evaluation: score the agent against human-approved gold versions --------
 
 
@@ -876,8 +993,7 @@ def _run_process_metrics(song_id: str) -> dict:
     steps = run.get("steps") or []
     repairs = sum(1 for s in steps if s.get("kind") == "repair")
     tool_calls = sum(1 for s in steps if s.get("kind") == "tool")
-    final = next((s for s in steps if s.get("kind") == "final"), {})
-    usage = (final.get("detail") or {}).get("usage") or {}
+    usage = run.get("usage") or {}
     return {
         "runId": run.get("runId"),
         "depth": run.get("depth"),
@@ -886,8 +1002,12 @@ def _run_process_metrics(song_id: str) -> dict:
         "firstPassValid": repairs == 0,
         "attempts": repairs + 1,
         "toolCalls": tool_calls,
-        "inputTokens": usage.get("input_tokens"),
-        "outputTokens": usage.get("output_tokens"),
+        "inputTokens": usage.get("inputTokens"),
+        "outputTokens": usage.get("outputTokens"),
+        "cacheCreationInputTokens": usage.get("cacheCreationInputTokens"),
+        "cacheReadInputTokens": usage.get("cacheReadInputTokens"),
+        "costUSD": run.get("costUSD"),
+        "usageReliable": run.get("usageReliable", False),
     }
 
 
@@ -1037,11 +1157,14 @@ def post_queue(req: QueueRequest) -> dict:
             status_code=400,
             detail=f"too many items: {len(specs)} (max {MAX_ITEMS_PER_SUBMIT} per submit)",
         )
+    batch_id = secrets.token_hex(8)
+    for spec in specs:
+        spec["batchId"] = batch_id
     jobs = get_job_store().submit(
         specs, provider=req.provider, analysis_depth=req.analysisDepth,
         wants=req.wants,
     )
-    return {"queued": len(jobs), "jobs": [j.to_json() for j in jobs]}
+    return {"queued": len(jobs), "batchId": batch_id, "jobs": [j.to_json() for j in jobs]}
 
 
 @app.get("/v1/queue")
@@ -1383,7 +1506,12 @@ def post_song(song_id: str, req: SaveSongRequest) -> dict:
     if req.song.id != song_id:
         raise HTTPException(status_code=400, detail="song.id does not match URL")
     try:
+        require_resolved_song_id(song_id)
         saved = get_store().save(req.song, req.message, expected_version=req.expectedVersion)
+    except IdentityUnresolvedError as e:
+        return _identity_unresolved_response(e)
+    except IdentityCollisionError as e:
+        return _error_response(409, str(e), e.code)
     except VersionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except StoreError as e:
@@ -1680,15 +1808,22 @@ def _effective_agent_defaults() -> dict:
     override) — kept in one place so the Workbench never hardcodes them."""
     from .reconcile.agent_config import KNOWN_TOOLS
     from .reconcile.anthropic_agent import _OUTPUT_CONTRACT, _PROMPT_RECIPE, _PROMPT_THEORY
+    from .discovery.prefetch import DEFAULT_SITE_PREFERENCES
 
     return {
         "theoryRules": _PROMPT_THEORY,
         "retrievalRecipe": _PROMPT_RECIPE,
         "maxTurns": settings.anthropic_agent_max_turns,
-        "effort": settings.anthropic_agent_effort,
-        "model": settings.llm_model or settings.anthropic_agent_model,
-        "budgets": {"maxWebSearch": 2, "maxFetch": 3, "maxWindows": 2},
+        "effort": "standard" if settings.anthropic_agent_effort == "medium" else settings.anthropic_agent_effort,
+        "model": settings.llm_model or settings.anthropic_agent_standard_model,
+        "modelsByEffort": {
+            "low": settings.anthropic_agent_low_model,
+            "standard": settings.anthropic_agent_standard_model,
+            "high": settings.anthropic_agent_model,
+        },
+        "budgets": {"maxFetch": 1, "maxWindows": 2},
         "tools": sorted(KNOWN_TOOLS),
+        "sitePreferences": DEFAULT_SITE_PREFERENCES,
         "lockedOutputContract": _OUTPUT_CONTRACT,
     }
 

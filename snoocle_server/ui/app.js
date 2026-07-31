@@ -1100,15 +1100,29 @@ async function workbenchModal() {
   var recipe = ta(cfg.retrieval_recipe, def.retrievalRecipe || "");
   var override = ta(cfg.instructions_override, "");
 
-  var effort = el("select", {}, ["", "low", "medium", "high"].map(function (e) {
+  var effort = el("select", {}, ["", "low", "standard", "high"].map(function (e) {
     return optionEl(e || "(default " + def.effort + ")", e, cfg.effort === e);
   }));
   var model = el("input", { type: "text", value: cfg.model || "", placeholder: def.model || "" });
   var maxTurns = el("input", { type: "number", min: "1", max: "30", value: cfg.max_turns != null ? cfg.max_turns : "", placeholder: String(def.maxTurns) });
   var budgets = def.budgets || {};
-  var web = el("input", { type: "number", min: "0", max: "10", value: cfg.max_web_search != null ? cfg.max_web_search : "", placeholder: String(budgets.maxWebSearch) });
   var fetch_ = el("input", { type: "number", min: "0", max: "10", value: cfg.max_fetch != null ? cfg.max_fetch : "", placeholder: String(budgets.maxFetch) });
   var windows = el("input", { type: "number", min: "0", max: "10", value: cfg.max_windows != null ? cfg.max_windows : "", placeholder: String(budgets.maxWindows) });
+  var siteDefaults = def.sitePreferences || {};
+  var sitePrefs = cfg.source_site_preferences || {};
+  function siteInput(locale) {
+    var domains = Object.prototype.hasOwnProperty.call(sitePrefs, locale)
+      ? sitePrefs[locale]
+      : (siteDefaults[locale] || []);
+    return el("input", {
+      type: "text",
+      value: domains.join(", "),
+      placeholder: (siteDefaults[locale] || []).join(", "),
+    });
+  }
+  var globalSites = siteInput("global");
+  var russianSites = siteInput("russian");
+  var hebrewSites = siteInput("hebrew");
 
   var disabled = cfg.disabled_tools || [];
   var toolBoxes = (def.tools || []).map(function (name) {
@@ -1139,9 +1153,15 @@ async function workbenchModal() {
     el("div", {}, [el("label", {}, ["Max turns"]), maxTurns]),
   ]));
   bodyEl.appendChild(el("div", { class: "row" }, [
-    el("div", {}, [el("label", {}, ["web_search budget"]), web]),
-    el("div", {}, [el("label", {}, ["fetch budget"]), fetch_]),
+    el("div", {}, [el("label", {}, ["sheet-search calls (default 1)"]), fetch_]),
     el("div", {}, [el("label", {}, ["audio-window budget"]), windows]),
+  ]));
+
+  bodyEl.appendChild(el("label", {}, ["Ranked source sites (comma-separated, first wins)"]));
+  bodyEl.appendChild(el("div", { class: "row" }, [
+    el("div", {}, [el("label", {}, ["Global"]), globalSites]),
+    el("div", {}, [el("label", {}, ["Russian"]), russianSites]),
+    el("div", {}, [el("label", {}, ["Hebrew"]), hebrewSites]),
   ]));
 
   bodyEl.appendChild(el("label", {}, ["Enabled tools"]));
@@ -1168,6 +1188,9 @@ async function workbenchModal() {
   bodyEl.appendChild(status);
 
   async function save() {
+    function domains(input) {
+      return input.value.split(",").map(function (v) { return v.trim(); }).filter(Boolean);
+    }
     var payload = {
       instructions_extra: extra.value.trim(),
       theory_rules: theory.value.trim(),
@@ -1176,10 +1199,14 @@ async function workbenchModal() {
       effort: effort.value || null,
       model: model.value.trim() || null,
       max_turns: maxTurns.value !== "" ? parseInt(maxTurns.value, 10) : null,
-      max_web_search: web.value !== "" ? parseInt(web.value, 10) : null,
       max_fetch: fetch_.value !== "" ? parseInt(fetch_.value, 10) : null,
       max_windows: windows.value !== "" ? parseInt(windows.value, 10) : null,
       disabled_tools: toolBoxes.filter(function (t) { return !t.cb.checked; }).map(function (t) { return t.name; }),
+      source_site_preferences: {
+        global: domains(globalSites),
+        russian: domains(russianSites),
+        hebrew: domains(hebrewSites),
+      },
     };
     var res = await apiJson("/v1/config/agent", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),

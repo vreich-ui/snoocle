@@ -27,18 +27,27 @@ _PROFILES = {
     # Quick pass: windowed MIR, cheap effort, minimal web work. For a fast draft.
     "fast": DepthProfile("fast", "fast", "low", 1, 2, 1, False),
     # The default: full-track MIR, consolidated tool use.
-    "standard": DepthProfile("standard", "standard", "medium", 2, 3, 2, False),
+    "standard": DepthProfile("standard", "standard", "standard", 2, 3, 2, False),
     # Deep pass: full-track MIR (never capped), high effort, a larger budget,
     # AND time alignment (fills syncMap so the app can scroll/​highlight in time).
     "thorough": DepthProfile("thorough", "thorough", "high", 3, 4, 3, True),
 }
 
 DEFAULT_DEPTH = "standard"
+EFFORT_LEVELS = frozenset({"low", "standard", "high"})
+
+
+def require_effort_level(effort: str | None) -> str | None:
+    if effort is not None and effort not in EFFORT_LEVELS:
+        raise ValueError(f"effortLevel must be one of {sorted(EFFORT_LEVELS)}")
+    return effort
 
 
 def resolve_depth(depth: str | None) -> DepthProfile:
     """Return the profile for a depth name, falling back to standard."""
-    return _PROFILES.get((depth or DEFAULT_DEPTH).lower(), _PROFILES[DEFAULT_DEPTH])
+    name = (depth or DEFAULT_DEPTH).lower()
+    name = {"low": "fast", "high": "thorough"}.get(name, name)
+    return _PROFILES.get(name, _PROFILES[DEFAULT_DEPTH])
 
 
 def depth_names() -> list[str]:

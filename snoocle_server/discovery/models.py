@@ -27,6 +27,12 @@ class CandidateSource(BaseModel):
     declaredCapo: int = 0  # capo the sheet declared; chords BELOW are already sounding-pitch
     declaredKey: Optional[str] = None
     confidence: float = Field(default=0.5, ge=0, le=1)
+    # Deterministic retrieval provenance. Optional for legacy candidates.
+    parseConfidence: Optional[float] = Field(default=None, ge=0, le=1)
+    contentHash: Optional[str] = None
+    contentType: Optional[str] = None
+    cacheStatus: Optional[str] = None
+    coverage: Optional[str] = None  # full-song | partial
     sectionsHint: list[str] = Field(default_factory=list)  # e.g. ["Verse 1", "Chorus"]
     sectionStarts: list[SectionStart] = Field(default_factory=list)  # header positions
     lines: list[Line] = Field(default_factory=list)

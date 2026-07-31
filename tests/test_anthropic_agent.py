@@ -235,20 +235,36 @@ def _referencing_draft(source_id: str, line: int = 0) -> dict:
     return draft
 
 
-def test_happy_path_tool_call_then_valid_song(monkeypatch):
-    # fetch_chord_sheet reaches no network: fetch_page returns a real fixture
-    # sheet, then the real extract/parse turn it into a candidate.
+def _mock_sheet_search(monkeypatch, source_id: str = "agent-1") -> None:
+    """Make the deterministic agent tool return a parsed fixture, never a URL."""
+    from snoocle_server.discovery.service import candidate_from_text
+
     sheet = (_FIXTURES / "sheet_over_lyrics.txt").read_text()
-    fetched = {}
+    candidate = candidate_from_text(sheet, source_id=source_id)
+    assert candidate is not None
 
-    def _fake_fetch_page(url: str) -> str:
-        fetched["url"] = url
-        return sheet
+    def fake_search(context: dict, query: str, reason: str):
+        public = candidate.model_dump(exclude_none=True)
+        context.setdefault("candidates", []).append(candidate)
+        return {"count": 1, "sheets": [public]}, {
+            "query": query,
+            "reason": reason,
+            "rankedResults": [{"rank": 1, "url": "https://trace-only.invalid/sheet"}],
+            "chosenUrls": ["https://trace-only.invalid/sheet"],
+            "outcomes": [{"rank": 1, "status": "parsed"}],
+        }
 
-    monkeypatch.setattr(agent_mod, "fetch_page", _fake_fetch_page)
+    monkeypatch.setattr(agent_mod, "search_and_fetch_sheet", fake_search)
+
+
+def test_happy_path_tool_call_then_valid_song(monkeypatch):
+    _mock_sheet_search(monkeypatch)
 
     queue = [
-        _response("tool_use", [_tool_use("t1", "fetch_chord_sheet", {"url": "https://ex/let-it-be"})]),
+        _response("tool_use", [_tool_use(
+            "t1", "search_and_fetch_sheet",
+            {"query": "Let It Be Beatles chords", "reason": "provided evidence is incomplete"},
+        )]),
         # The agent references the sheet it just fetched — mid-run sources are
         # registered as referenceable, or this would fail the run.
         _response("end_turn", [_text(json.dumps(_referencing_draft("agent-1")))]),
@@ -274,10 +290,11 @@ def test_happy_path_tool_call_then_valid_song(monkeypatch):
     # the lyric the model never wrote: spliced from the sheet it fetched
     assert result.song.lines[0].lyrics.strip() == "When I find myself in times of trouble"
 
-    # the fetch tool was actually invoked with the model's URL
-    assert fetched["url"] == "https://ex/let-it-be"
-    # and its tool_result went back in a user message
-    assert _tool_result_user_messages(captured["provider"]._messages)
+    # The model only receives parsed sheet data; URL choice remains in the
+    # server-side retrieval trace.
+    result_messages = _tool_result_user_messages(captured["provider"]._messages)
+    assert result_messages
+    assert "trace-only.invalid" not in json.dumps(result_messages)
 
     # request shape: consolidated effort + per-turn prefix caching — the two
     # wall-clock levers for the loop (see config.anthropic_agent_effort)
@@ -439,15 +456,16 @@ def _install_recording(monkeypatch, queue: list) -> dict:
 def test_container_id_is_carried_into_every_later_turn(monkeypatch):
     """The turn after a container is allocated must name it, and so must the
     one after that — the id is not re-sent by the API."""
-    sheet = (_FIXTURES / "sheet_over_lyrics.txt").read_text()
-    monkeypatch.setattr(agent_mod, "fetch_page", lambda url: sheet)
-
     queue = [
         # turn 1 allocates the container while requesting a tool
-        _response("tool_use", [_tool_use("t1", "fetch_chord_sheet", {"url": "https://ex/a"})],
+        _response("tool_use", [_tool_use(
+            "t1", "analyze_audio_window", {"start_seconds": 0, "end_seconds": 5}
+        )],
                   container_id="ctr_abc123"),
         # turn 2 asks for another tool; no container echoed back this time
-        _response("tool_use", [_tool_use("t2", "fetch_chord_sheet", {"url": "https://ex/b"})]),
+        _response("tool_use", [_tool_use(
+            "t2", "analyze_audio_window", {"start_seconds": 5, "end_seconds": 10}
+        )]),
         _response("end_turn", [_text(json.dumps(_SONG_DRAFT))]),
     ]
     captured = _install_recording(monkeypatch, queue)
@@ -509,7 +527,7 @@ def test_listen_off_removes_the_audio_window_tool(monkeypatch):
     )
     names = _tool_names(captured)
     assert "analyze_audio_window" not in names, "listening was switched off"
-    assert "web_search" in names, "source gathering was left on"
+    assert "search_and_fetch_sheet" in names, "source gathering was left on"
 
 
 def test_reconcile_off_removes_every_source_gathering_tool(monkeypatch):
@@ -520,7 +538,7 @@ def test_reconcile_off_removes_every_source_gathering_tool(monkeypatch):
         [_response("end_turn", [_text(json.dumps(_SONG_DRAFT))])],
     )
     names = _tool_names(captured)
-    for gone in ("web_search", "web_fetch", "fetch_chord_sheet"):
+    for gone in ("web_search", "web_fetch", "fetch_chord_sheet", "search_and_fetch_sheet"):
         assert gone not in names, f"{gone} should be undeclared"
     assert "analyze_audio_window" in names, "listening was left on"
 
@@ -652,10 +670,12 @@ def test_an_open_client_use_is_answered_inside_the_user_turn_that_follows_it():
 def test_closing_an_open_turn_is_inert_on_a_clean_conversation(monkeypatch):
     """Nothing was left open, so the stored history must come out identical —
     same dicts, same lists, same bytes — however many times it runs."""
-    sheet = (_FIXTURES / "sheet_over_lyrics.txt").read_text()
-    monkeypatch.setattr(agent_mod, "fetch_page", lambda url: sheet)
+    _mock_sheet_search(monkeypatch)
     queue = [
-        _response("tool_use", [_tool_use("t1", "fetch_chord_sheet", {"url": "https://ex/a"})]),
+        _response("tool_use", [_tool_use(
+            "t1", "search_and_fetch_sheet",
+            {"query": "Let It Be Beatles chords", "reason": "need a lyric source"},
+        )]),
         _response("end_turn", [_text(json.dumps(_referencing_draft("agent-1")))]),
     ]
     captured = _install(monkeypatch, queue)
@@ -857,4 +877,4 @@ def test_absent_scope_leaves_every_tool_declared(monkeypatch):
     reconcile("Let It Be", "The Beatles", candidates=[], mir=_mir(),
               provider_name="anthropic-agent", youtube_video_id="QDYfEBY9NM4")
     names = _tool_names(captured)
-    assert {"web_search", "web_fetch", "fetch_chord_sheet", "analyze_audio_window"} <= set(names)
+    assert set(names) == {"search_and_fetch_sheet", "analyze_audio_window"}

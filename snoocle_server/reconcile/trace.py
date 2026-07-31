@@ -20,6 +20,9 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from ..config import settings
+from ..usage import add_usage, cost_usd, empty_usage, persisted_usage
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -100,6 +103,19 @@ class RunTrace:
     evidence_hash: str | None = None
     forced: bool = False
     force_reason: str | None = None
+    batch_id: str | None = None
+    usage: dict[str, int] = field(default_factory=empty_usage)
+    cost_usd: float = 0.0
+    usage_reliable: bool = True
+    price_table_version: str = field(default_factory=lambda: settings.llm_price_table_version)
+    # The public three-level control and the exact routing decisions it caused.
+    effort_level: str = "standard"  # low | standard | high
+    model_per_turn: list[str] = field(default_factory=list)
+    opus_escalation: dict = field(
+        default_factory=lambda: {"fired": False, "reason": None}
+    )
+    output_format: str | None = None  # patch | full
+    patch_size_vs_full: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +140,16 @@ class RunTrace:
             "evidenceHash": self.evidence_hash,
             "forced": self.forced,
             "forceReason": self.force_reason,
+            "batchId": self.batch_id,
+            "usage": persisted_usage(self.usage),
+            "costUSD": round(self.cost_usd, 8),
+            "usageReliable": self.usage_reliable,
+            "priceTableVersion": self.price_table_version,
+            "effortLevel": self.effort_level,
+            "modelPerTurn": self.model_per_turn,
+            "opusEscalation": self.opus_escalation,
+            "outputFormat": self.output_format,
+            "patchSizeVsFull": self.patch_size_vs_full,
         }
 
 
@@ -187,6 +213,51 @@ class TraceRecorder:
             self.trace.review_queue = list(review_queue)
         _publish(self.trace)
 
+    def record_model_usage(self, model: str, usage: dict) -> float:
+        """Aggregate one API response and return that response's exact cost."""
+        step_cost = cost_usd(usage, model)
+        with self._lock:
+            add_usage(self.trace.usage, usage)
+            self.trace.cost_usd = round(self.trace.cost_usd + step_cost, 8)
+            if model:
+                self.trace.model = model
+                self.trace.model_per_turn.append(model)
+        _publish(self.trace)
+        return step_cost
+
+    def set_model_routing(
+        self, *, effort_level: str, opus_escalation_reason: str | None = None
+    ) -> None:
+        with self._lock:
+            self.trace.effort_level = effort_level
+            self.trace.opus_escalation = {
+                "fired": bool(opus_escalation_reason),
+                "reason": opus_escalation_reason,
+            }
+        _publish(self.trace)
+
+    def set_output_format(
+        self,
+        output_format: str,
+        *,
+        patch_bytes: int | None = None,
+        full_bytes: int | None = None,
+    ) -> None:
+        with self._lock:
+            self.trace.output_format = output_format
+            if patch_bytes is not None or full_bytes is not None:
+                ratio = (
+                    round(patch_bytes / full_bytes, 4)
+                    if patch_bytes is not None and full_bytes
+                    else None
+                )
+                self.trace.patch_size_vs_full = {
+                    "patchBytes": patch_bytes,
+                    "fullBytes": full_bytes,
+                    "ratio": ratio,
+                }
+        _publish(self.trace)
+
     def finish(self, status: str, model: str = "", error: str | None = None) -> None:
         with self._lock:
             self.trace.status = status
@@ -234,6 +305,8 @@ def start_run(
     evidence_hash: str | None = None,
     forced: bool = False,
     force_reason: str | None = None,
+    batch_id: str | None = None,
+    effort_level: str = "standard",
 ) -> TraceRecorder:
     """Create a recorder + live-registered RunTrace for a new reconciliation."""
     trace = RunTrace(
@@ -247,6 +320,8 @@ def start_run(
         evidence_hash=evidence_hash,
         forced=forced,
         force_reason=force_reason,
+        batch_id=batch_id,
+        effort_level=effort_level,
     )
     _publish(trace)
     return TraceRecorder(trace)

@@ -46,8 +46,10 @@ Your job: produce the single best reconciled song document as JSON conforming EX
 Reconciliation principles:
 - USE ALL CANDIDATE SOURCES. Agreement between independent sources is strong evidence. Where sources disagree, prefer the reading consistent with the MIR chord timeline and key.
 - The MIR analysis is audio ground truth for TIMING (bpm, section boundaries, syncMap times) and a strong signal for HARMONY, but its chord vocabulary may be coarser than the sheets (e.g. it may report C where the true chord is Cmaj7). Prefer a text source's richer chord quality when the root and family agree with the audio.
-- Sections: name and order them from the text sources' hints plus MIR structure; attach startTime/endTime from the MIR structure timeline where alignment is clear.
-- audio.syncMap: map line indexes to seconds using the MIR section boundaries and beat grid; include an entry at least for the first line of each section. Times must be non-decreasing.
+- Sections: name and order them from the text sources' hints plus MIR structure.
+- Never emit a field absent from the supplied schema. In particular, when MIR
+  is present the server removes timing/confidence/beat fields from the write
+  schema because deterministic post-passes fill them after your response.
 
 CHORD NORMALIZATION RULE (non-negotiable):
 Every chordPlacements.chord value MUST be the actual sounding harmony — never a fretboard shape, never a capo'd shape name, never tablature or fingering. Candidate sources have already been transposed to sounding pitch at ingestion (their declaredCapo is metadata about the original sheet, not an instruction to transpose again). displayPreferences.capo is a display-only preference — set it to 0; never bake a capo into chord identities. Valid chord symbols look like: C, F#m, Bbmaj7, Dm7/G, Esus4, A7, Gdim7, Cadd9. Invalid: x02210, 3-2-0-0-0-3, "Am shape", N.C. (omit no-chord positions instead)."""
@@ -74,8 +76,20 @@ _OUTPUT_RULES = """Output rules:
 - Leave "provenance" as an empty array — the server appends provenance entries itself.
 - Do not invent chords absent from all evidence."""
 
+_DELTA_OUTPUT_RULES = """Compact update contract:
+- A prior Song exists. Output ONLY the compact reconciliation patch described
+  by the supplied schema; never repeat the full Song.
+- lineChanges contains only prior line indexes whose lyrics or chord placements
+  actually change. An omitted line remains byte-for-byte unchanged.
+- To change words, use lyricRef or the rare lyricOverride + reason protocol.
+  Omit every lyric field when that line's words stay unchanged.
+- `sections`, `metadata`, and `displayPreferences` are optional. Omit each
+  whole block when unchanged. Supplying `sections` replaces the prior list.
+- Never emit timing/confidence/beat data: deterministic post-passes own it.
+- Output ONLY the JSON patch. No markdown fences and no commentary."""
 
-def build_system_prompt(lyric_refs: bool = True) -> str:
+
+def build_system_prompt(lyric_refs: bool = True, output_format: str = "full") -> str:
     """The system prompt, with or without the lyric-reference contract.
 
     Providers that are not prompted by this server (the deterministic mock)
@@ -90,7 +104,7 @@ def build_system_prompt(lyric_refs: bool = True) -> str:
             "- Lyrics come from the text sources; pick the most complete, "
             "correctly-ordered lyric set.\n- Do not invent lyrics."
         )
-    parts.append(_OUTPUT_RULES)
+    parts.append(_DELTA_OUTPUT_RULES if output_format == "patch" else _OUTPUT_RULES)
     return "\n\n".join(parts)
 
 
@@ -132,10 +146,12 @@ def build_user_prompt(
     ref_index: dict[str, list[str]] | None = None,
     quality_feedback: str | None = None,
     structure_feedback: str | None = None,
+    output_format: str = "full",
 ) -> str:
     parts: list[str] = []
     parts.append(
-        f"Reconcile the song {title!r} by {artist!r} into a single schema-compliant JSON document.\n"
+        f"Reconcile the song {title!r} by {artist!r} into a single schema-compliant "
+        f"{'compact patch' if output_format == 'patch' else 'JSON document'}.\n"
         f"Use song id {song_id!r}"
         + (f" and audio.youtubeVideoId {youtube_video_id!r}." if youtube_video_id else ".")
     )
@@ -170,7 +186,10 @@ def build_user_prompt(
             " intentional — do not treat it as missing evidence to fill in"
             " from memory."
         )
-    parts.append("## Song JSON schema (output must validate against this)\n" + json.dumps(song_schema, indent=1))
+    parts.append(
+        f"## {'Compact reconciliation patch' if output_format == 'patch' else 'Song JSON'} "
+        "schema (output must validate against this)\n" + json.dumps(song_schema, indent=1)
+    )
 
     # The exact ids and line ranges a lyricRef may name. Stated explicitly
     # rather than left to be inferred from the evidence sections below: an
@@ -261,7 +280,11 @@ def build_user_prompt(
     # open. See realign._structure_feedback.
     if structure_feedback:
         parts.append(structure_feedback)
-    if time_align:
+    audio_properties = (
+        (((song_schema.get("$defs") or {}).get("AudioInfo") or {}).get("properties") or {})
+        if isinstance(song_schema, dict) else {}
+    )
+    if time_align and "syncMap" in audio_properties:
         parts.append(
             "## Time alignment (thorough analysis)\n"
             "Populate audio.syncMap: map line indexes to seconds using the MIR"
@@ -269,8 +292,20 @@ def build_user_prompt(
             " first line of every section. Times must be non-decreasing."
         )
 
-    parts.append("Now output the reconciled Song JSON only.")
+    parts.append(
+        "Now output the compact reconciliation patch JSON only."
+        if output_format == "patch"
+        else "Now output the reconciled Song JSON only."
+    )
     return "\n\n".join(parts)
+
+
+def build_delta_repair_prompt(errors: str) -> str:
+    """The single allowed repair request for a malformed compact delta."""
+    return (
+        "Your compact reconciliation patch could not be applied. Return one corrected "
+        "patch JSON object only; do not return the full Song. Server error:\n" + errors
+    )
 
 
 # --- the patch protocol (notes-only, targeted corrections) ------------------

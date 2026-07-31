@@ -29,7 +29,10 @@ class RunRepository:
     def get_run(self, run_id: str) -> dict | None:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def list_runs(self, song_id: str, limit: int = 20) -> list[dict]:  # pragma: no cover
+    def list_runs(self, song_id: str, limit: int | None = 20) -> list[dict]:  # pragma: no cover
+        raise NotImplementedError
+
+    def list_all_runs(self, limit: int | None = None) -> list[dict]:  # pragma: no cover
         raise NotImplementedError
 
 
@@ -45,19 +48,29 @@ class InMemoryRunRepository(RunRepository):
     def get_run(self, run_id: str) -> dict | None:
         with self._lock:
             run = self._runs.get(run_id)
-            return dict(run) if run is not None else None
+            return _normalize_read(run) if run is not None else None
 
-    def list_runs(self, song_id: str, limit: int = 20) -> list[dict]:
+    def list_runs(self, song_id: str, limit: int | None = 20) -> list[dict]:
         with self._lock:
             runs = [r for r in self._runs.values() if r.get("songId") == song_id]
         runs.sort(key=lambda r: r.get("startedAt") or "", reverse=True)
-        return [_summary(r) for r in runs[:limit]]
+        selected = runs if limit is None else runs[:limit]
+        return [_summary(r) for r in selected]
+
+    def list_all_runs(self, limit: int | None = None) -> list[dict]:
+        with self._lock:
+            runs = list(self._runs.values())
+        runs.sort(key=lambda r: r.get("startedAt") or "", reverse=True)
+        selected = runs if limit is None else runs[:limit]
+        return [_normalize_read(r) for r in selected]
 
 
 class FirestoreRunRepository(RunRepository):
     _COLLECTION = "song_runs"
 
-    def __init__(self, project: str | None = None, database: str = "(default)") -> None:
+    def __init__(
+        self, project: str | None = None, database: str = "(default)", credentials=None
+    ) -> None:
         from google.cloud import firestore
 
         kwargs: dict = {}
@@ -65,6 +78,8 @@ class FirestoreRunRepository(RunRepository):
             kwargs["project"] = project
         if database and database != "(default)":
             kwargs["database"] = database
+        if credentials is not None:
+            kwargs["credentials"] = credentials
         self._client = firestore.Client(**kwargs)
         log.info("Firestore run store ready: collection=%s", self._COLLECTION)
 
@@ -77,14 +92,21 @@ class FirestoreRunRepository(RunRepository):
 
     def get_run(self, run_id: str) -> dict | None:
         snap = self._col.document(run_id).get()
-        return snap.to_dict() if snap.exists else None
+        return _normalize_read(snap.to_dict()) if snap.exists else None
 
-    def list_runs(self, song_id: str, limit: int = 20) -> list[dict]:
+    def list_runs(self, song_id: str, limit: int | None = 20) -> list[dict]:
         # Filter by song, sort in Python to avoid requiring a composite index.
         docs = self._col.where("songId", "==", song_id).stream()
         runs = [d.to_dict() for d in docs]
         runs.sort(key=lambda r: r.get("startedAt") or "", reverse=True)
-        return [_summary(r) for r in runs[:limit]]
+        selected = runs if limit is None else runs[:limit]
+        return [_summary(r) for r in selected]
+
+    def list_all_runs(self, limit: int | None = None) -> list[dict]:
+        runs = [d.to_dict() for d in self._col.stream()]
+        runs.sort(key=lambda r: r.get("startedAt") or "", reverse=True)
+        selected = runs if limit is None else runs[:limit]
+        return [_normalize_read(r) for r in selected]
 
 
 _LARGE_FIELDS = {"steps", "mir", "mirWindows"}
@@ -92,7 +114,15 @@ _LARGE_FIELDS = {"steps", "mir", "mirWindows"}
 
 def _summary(run: dict) -> dict:
     """A run without its large payloads (steps, MIR data) — for list views."""
-    return {k: v for k, v in run.items() if k not in _LARGE_FIELDS}
+    return {k: v for k, v in _normalize_read(run).items() if k not in _LARGE_FIELDS}
+
+
+def _normalize_read(run: dict | None) -> dict:
+    """Old traces are intentionally not backfilled; identify them on read."""
+    result = dict(run or {})
+    if "usageReliable" not in result:
+        result["usageReliable"] = False
+    return result
 
 
 _repo: RunRepository | None = None

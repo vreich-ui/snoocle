@@ -62,10 +62,17 @@ from .config import settings
 from .correction_routing import classify_correction
 from .discovery import CandidateSource, discover_sources
 from .discovery.cache import DiscoveryCacheInfo, discover_cached
-from .identity import IdentityError, SongIdentity, resolve_identity
+from .discovery.prefetch import infer_recording_variant
+from .identity import (
+    IdentityUnresolvedError,
+    SongIdentity,
+    missing_identity_fields,
+    resolve_identity_from_evidence,
+    require_resolved_song_id,
+)
 from .manifest import build_evidence_manifest, lrc_block
 from .mir import MirAnalysis, analyze_audio
-from .mir.cache import MirCacheInfo, analyze_cached
+from .mir.cache import MirCacheInfo, analyze_cached, audio_sha256
 from .quality import Grade, QualityDecision, evaluate as evaluate_quality
 from .quality.escalation import build_retry_feedback, search_found_better
 from .quality.grader import grade_provenance_entry, timing_unreliable_provenance_entry
@@ -83,8 +90,16 @@ from .reconcile.depth import resolve_depth
 from .reconcile.trace import TraceRecorder, new_run_id, start_run
 from .schema.song import ProvenanceEntry, Song, slugify_song_id
 from .scope import AnalysisScope
-from .store import SaveResult, SongRepository, VersionConflictError, get_repository
+from .store import (
+    IdentityCollisionError,
+    SaveResult,
+    SongRepository,
+    VersionConflictError,
+    get_repository,
+)
 from .store.runs import get_run_store
+from .usage import BudgetExceededError
+from .usage_summary import enforce_admission_budgets
 from .store.run_admission import (
     Admission,
     DuplicateRunError,
@@ -95,7 +110,7 @@ from .store.song_notes import length_error as notes_length_error
 from .timing.carry_forward import audio_data_lost, carry_forward_timing
 from .timing.collapse_guard import guard_against_collapsed_timing
 from .timing.confidence import build_review_queue, score_song
-from .timing.lrc import apply_lrc, fetch_lrc, match_lrc_to_lines
+from .timing.lrc import apply_lrc, fetch_lrc, fetch_lrc_match, match_lrc_to_lines
 from .timing.snap import snap_chords
 
 log = logging.getLogger(__name__)
@@ -150,6 +165,7 @@ class PipelineReport:
     steps: dict[str, str] = field(default_factory=dict)  # step -> status text
     candidates: list[CandidateSource] = field(default_factory=list)
     audio: AcquiredAudio | None = None
+    audio_content_hash: str | None = None
     mir: MirAnalysis | None = None
     reconcile: ReconcileResult | None = None
     stored_version: str | None = None
@@ -176,7 +192,7 @@ def get_store() -> SongRepository:
 # --- individual steps (pure, synchronous, blocking) -------------------------
 
 
-def _step_resolve(youtube_url_or_id: str) -> tuple[ResolvedMeta, SongIdentity]:
+def _step_resolve(youtube_url_or_id: str) -> tuple[ResolvedMeta, SongIdentity | None]:
     """Fetch the media's metadata and resolve a song identity from it.
 
     One step, not two: the metadata fetch and the (occasional) disambiguation
@@ -184,28 +200,75 @@ def _step_resolve(youtube_url_or_id: str) -> tuple[ResolvedMeta, SongIdentity]:
     whether an identity came out the other end.
     """
     meta = extract_metadata(youtube_url_or_id)
-    identity = resolve_identity(
-        video_title=meta.video_title,
-        channel=meta.uploader,
-        track=meta.track,
-        track_artist=meta.track_artist,
-    )
+    try:
+        identity = resolve_identity_from_evidence(
+            artist=None,
+            title=None,
+            media_metadata=meta,
+        )
+    except IdentityUnresolvedError:
+        # The caller may have supplied one good half, an LRC match may already
+        # be available, or source URLs may clarify it cheaply below. Metadata
+        # failing is a signal to keep gathering deterministic evidence, not a
+        # license to mint an `unknown` id.
+        identity = None
     return meta, identity
 
 
 def _step_discover(
-    title: str, artist: str, max_candidates: int | None, refresh: bool = False
+    title: str, artist: str, max_candidates: int | None, refresh: bool = False,
+    recording_variant: str | None = None,
 ) -> tuple[list[CandidateSource], DiscoveryCacheInfo]:
     # `discover_sources` stays the thing that searches — the cache wraps the
     # call rather than replacing the name, so every existing seam (and every
     # test that monkeypatches this module's `discover_sources`) is untouched.
-    resolved_max = max_candidates or settings.search_max_candidates
+    resolved_max = max_candidates or settings.source_prefetch_max
+    agent_cfg = _load_agent_config()
     return discover_cached(
         title, artist,
         max_candidates=resolved_max,
-        discover=lambda: discover_sources(title, artist, max_candidates=max_candidates),
+        discover=lambda: discover_sources(
+            title, artist, max_candidates=resolved_max,
+            site_preferences=agent_cfg.source_site_preferences,
+            with_report=True,
+            recording_variant=recording_variant,
+        ),
         refresh=refresh,
+        recording_variant=recording_variant,
+        site_preferences=agent_cfg.source_site_preferences,
     )
+
+
+def _record_prefetch_trace(
+    recorder: TraceRecorder, discovery_cache: DiscoveryCacheInfo | None
+) -> None:
+    """Replay the pre-admission gather decision into the admitted run."""
+    prefetch_report = discovery_cache.report if discovery_cache is not None else None
+    if not prefetch_report:
+        return
+    attempts = prefetch_report.get("attempts") or [prefetch_report]
+    for attempt_index, attempt in enumerate(attempts, start=1):
+        suffix = f":attempt-{attempt_index}" if len(attempts) > 1 else ""
+        recorder.step(
+            "tool", f"prefetch:rank{suffix}",
+            f"deterministic chord-sheet prefetch ranked "
+            f"{len(attempt.get('rankedResults') or [])} result(s) and chose "
+            f"{len(attempt.get('chosenUrls') or [])}",
+            detail={
+                "query": attempt.get("query"),
+                "recordingVariant": attempt.get("recordingVariant"),
+                "rankedResults": attempt.get("rankedResults") or [],
+                "chosenUrls": attempt.get("chosenUrls") or [],
+                "discoveryCacheStatus": discovery_cache.status,
+            },
+        )
+        for outcome in attempt.get("outcomes") or []:
+            recorder.step(
+                "tool",
+                f"prefetch:source-{outcome.get('rank', '?')}{suffix}",
+                f"prefetch {outcome.get('status', 'unknown')}: {outcome.get('url', '?')}",
+                detail={"query": attempt.get("query"), **outcome},
+            )
 
 
 def _step_acquire(
@@ -344,12 +407,17 @@ async def run_pipeline_async(
     allow_timing_loss: bool = False,
     force: bool = False,
     force_reason: str | None = None,
+    batch_id: str | None = None,
+    effort_level: str | None = None,
 ) -> PipelineReport:
     resolved_provider = (provider or settings.llm_provider).lower()
     # analysisDepth is the canonical control; the older `accuracy` field is
     # honored as its source when a depth isn't given explicitly. The chosen
     # profile drives MIR accuracy, agent effort, the tool budget, and syncMap.
-    depth = resolve_depth(analysis_depth or accuracy)
+    from .reconcile.depth import require_effort_level
+
+    require_effort_level(effort_level)
+    depth = resolve_depth(effort_level or analysis_depth or accuracy)
     accuracy = depth.accuracy
     steps: dict[str, str] = {}
 
@@ -364,6 +432,20 @@ async def run_pipeline_async(
     problem = provider_preflight(resolved_provider)
     if problem:
         raise PipelineStepError("reconcile", problem, error_code="provider_not_configured")
+
+    # Global/batch spend is independent of evidence identity, so enforce it at
+    # the true front door — before URL metadata resolution, discovery, audio,
+    # MIR, or any fallback identity-model call can spend work on a run that the
+    # server already knows it must refuse.
+    resolved_agent_config = _load_agent_config()
+    try:
+        enforce_admission_budgets(
+            get_run_store(), resolved_agent_config, batch_id=batch_id
+        )
+    except BudgetExceededError as e:
+        raise PipelineStepError(
+            "admission", str(e), steps=steps, error_code=e.error_code
+        ) from e
 
     # `guidance` becomes this song's stored CORRECTION (`_resolve_guidance`), so
     # it is a notes write and is bounded by the same per-slot ceiling as a
@@ -394,13 +476,22 @@ async def run_pipeline_async(
     # mints is permanent (content-hash versioned store), so an ambiguous title
     # fails here rather than becoming a wrong id forever. See `identity`.
     identity: SongIdentity | None = None
-    if not (title and artist):
+    resolved_meta: ResolvedMeta | None = None
+    identity_lrc_match = None
+    identity_candidates: list[CandidateSource] = []
+    identity_discovery_cache: DiscoveryCacheInfo | None = None
+    if missing_identity_fields(artist, title):
         if not youtube_url_or_id:
-            raise PipelineStepError(
-                "resolve", "provide title and artist, or a youtubeUrlOrId to derive them from"
+            error = IdentityUnresolvedError(
+                artist=artist,
+                title=title,
+                evidence_tried=["caller-supplied identity"],
             )
+            raise PipelineStepError(
+                "resolve", str(error), error_code=error.code
+            ) from error
         try:
-            meta, identity = await _timed_step(
+            resolved_meta, identity = await _timed_step(
                 "resolve",
                 lambda: _step_resolve(youtube_url_or_id),
                 settings.acquire_timeout_seconds,
@@ -409,21 +500,76 @@ async def run_pipeline_async(
             raise PipelineStepError(
                 "resolve", f"timed out after {settings.acquire_timeout_seconds:.0f}s"
             ) from e
-        except IdentityError as e:
-            raise PipelineStepError(
-                "resolve", str(e), error_code="identity_ambiguous"
-            ) from e
         except Exception as e:  # noqa: BLE001
             code = "youtube_auth_required" if isinstance(e, YouTubeAuthError) else None
             raise PipelineStepError("resolve", str(e), error_code=code) from e
         # An explicitly-supplied half always wins over the derived one.
-        title = title or identity.title
-        artist = artist or identity.artist
-        youtube_url_or_id = youtube_url_or_id or meta.video_id
-        steps["resolve"] = f"ok: {identity.describe()} (from {meta.video_id})"
+        if identity is not None:
+            title = title if not missing_identity_fields("ok", title) else identity.title
+            artist = artist if not missing_identity_fields(artist, "ok") else identity.artist
+            steps["resolve"] = f"ok: {identity.describe()} (from {resolved_meta.video_id})"
+        youtube_url_or_id = youtube_url_or_id or resolved_meta.video_id
 
-    song_id = slugify_song_id(artist, title)
+        # LRCLIB's catalogue record is already a deterministic identity
+        # source. Only ask it while metadata still left a field unresolved; a
+        # resolved identity never pays this extra lookup.
+        if missing_identity_fields(artist, title):
+            lrc_title = (title or resolved_meta.title or resolved_meta.video_title or "").strip()
+            lrc_artist = (artist or resolved_meta.track_artist or resolved_meta.uploader or "").strip()
+            if lrc_title and lrc_artist:
+                try:
+                    identity_lrc_match = await _timed_step(
+                        "identity-lrc",
+                        lambda: fetch_lrc_match(
+                            lrc_title, lrc_artist, resolved_meta.duration_seconds
+                        ),
+                        settings.discover_timeout_seconds,
+                    )
+                except Exception as e:  # noqa: BLE001 — evidence is best-effort
+                    log.info("pipeline identity LRC lookup failed: %s", e)
+
+        # A partial identity can still retrieve already-public chord/lyric
+        # pages. Their slugs are deterministic evidence (not an agent guess),
+        # and on amdm.ru they contain the exact artist/title pair. The normal
+        # discovery stage below reuses this result rather than searching again.
+        if missing_identity_fields(artist, title):
+            query_title = (title or resolved_meta.title or "").strip()
+            query_artist = (artist or resolved_meta.track_artist or resolved_meta.uploader or "").strip()
+            if query_title or query_artist:
+                try:
+                    identity_candidates, identity_discovery_cache = await _timed_step(
+                        "identity-discover",
+                        lambda: _step_discover(query_title, query_artist, max_candidates, refresh_cache),
+                        settings.discover_timeout_seconds,
+                    )
+                except Exception as e:  # noqa: BLE001 — final resolver records the attempted source path
+                    log.info("pipeline identity source lookup failed: %s", e)
+
+        try:
+            identity = resolve_identity_from_evidence(
+                artist=artist,
+                title=title,
+                media_metadata=resolved_meta,
+                lrc_match=identity_lrc_match,
+                candidates=identity_candidates,
+            )
+        except IdentityUnresolvedError as e:
+            steps["resolve"] = "needs-identity: deterministic evidence did not name both fields"
+            raise PipelineStepError("resolve", str(e), steps=steps, error_code=e.code) from e
+        title = identity.title
+        artist = identity.artist
+        steps["resolve"] = f"ok: {identity.describe()} (from {resolved_meta.video_id})"
+
+    try:
+        song_id = slugify_song_id(artist, title)
+        require_resolved_song_id(song_id)
+    except IdentityUnresolvedError as e:
+        steps["resolve"] = "needs-identity: artist and title must both be resolved"
+        raise PipelineStepError("resolve", str(e), steps=steps, error_code=e.code) from e
     report = PipelineReport(song_id=song_id, steps=steps)
+    recording_variant = infer_recording_variant(
+        title, is_cover=bool(identity is not None and identity.is_cover)
+    )
 
     # Reconciliation notes replay (contract §2). This has to happen HERE, not in
     # the API layer: when the caller gave only a media URL, the song id is not
@@ -602,8 +748,11 @@ async def run_pipeline_async(
     # document the reconciler is being asked to fix), else the stored latest
     # version stands in. Scoped narrowly to notes-only, not every reconcile —
     # a full re-analysis without an explicit priorSong is unchanged.
+    # Every subsequent reconciliation writes a compact delta against the latest
+    # valid version, not a repeated full Song. A request-supplied edited version
+    # still wins; otherwise the stored latest version is the base.
     effective_prior_song = prior_song
-    if scope is not None and scope.notes_only and effective_prior_song is None and stored_prior is not None:
+    if effective_prior_song is None and stored_prior is not None:
         effective_prior_song = stored_prior.model_dump(mode="json")
 
     if not want_listen and timing_prior is None and not allow_timing_loss:
@@ -637,11 +786,27 @@ async def run_pipeline_async(
         )
     elif resolved_provider == "mock":
         report.steps["discover"] = "skipped (mock: offline deterministic reconciler)"
+    elif identity_candidates:
+        report.candidates = identity_candidates
+        report.discovery_cache = identity_discovery_cache
+        report.steps["discover"] = (
+            f"ok: {len(report.candidates)} candidate source(s) (reused for identity)"
+            + _cache_suffix(report.discovery_cache.status)
+            if report.discovery_cache is not None
+            else f"ok: {len(report.candidates)} candidate source(s) (reused for identity)"
+        )
     else:
         try:
             report.candidates, report.discovery_cache = await _timed_step(
                 "discover",
-                lambda: _step_discover(title, artist, max_candidates, refresh_cache),
+                lambda: (
+                    _step_discover(title, artist, max_candidates, refresh_cache)
+                    if recording_variant == "studio"
+                    else _step_discover(
+                        title, artist, max_candidates, refresh_cache,
+                        recording_variant=recording_variant,
+                    )
+                ),
                 settings.discover_timeout_seconds,
             )
             report.steps["discover"] = (
@@ -673,6 +838,12 @@ async def run_pipeline_async(
                 report.error_code = "youtube_auth_required"
         if report.audio is not None:
             audio_path = report.audio.path
+            try:
+                report.audio_content_hash = audio_sha256(audio_path)
+            except OSError as e:
+                # The audio can still be analyzed; collision protection simply
+                # has no byte identity for this legacy/broken cache entry.
+                log.warning("pipeline could not hash acquired audio %s: %s", audio_path, e)
             try:
                 report.mir, report.mir_cache = await _timed_step(
                     "mir",
@@ -710,8 +881,9 @@ async def run_pipeline_async(
         # run and smuggle the withheld half to the model through the back door.
         guidance=model_guidance,
         guidance_origin=guidance_origin,
+        recording_variant=recording_variant,
     )
-    resolved_config_version = config_version(_load_agent_config())
+    resolved_config_version = config_version(resolved_agent_config)
     admission_key, admission_evidence_hash = idempotency_key(
         song_id, resolved_config_version, report.evidence_manifest
     )
@@ -746,8 +918,16 @@ async def run_pipeline_async(
         evidence_hash=admission_evidence_hash,
         forced=force,
         force_reason=(force_reason or "").strip() or None,
+        batch_id=batch_id,
+        effort_level=({"fast": "low", "thorough": "high"}.get(depth.name, "standard")),
     )
     report.run_id = recorder.trace.run_id
+
+    # Discovery happens before run admission because its content hashes are an
+    # input to the idempotency key. Replay its deterministic decision log into
+    # the newly-admitted trace so operators can inspect every ranked URL and
+    # parse/cache outcome without letting the model choose any of them.
+    _record_prefetch_trace(recorder, report.discovery_cache)
 
     # A withheld preference is a DECISION, and it has to outlive the HTTP
     # response. `report.steps` is returned to the caller and then thrown away —
@@ -853,13 +1033,17 @@ async def run_pipeline_async(
                 steps=report.steps,
             ) from e
         except Exception as e:  # noqa: BLE001 — ReconcileError/ProviderError/anything else
-            recorder.finish("error", error=str(e)[:2000])
+            error_code = getattr(e, "error_code", None)
+            recorder.finish(
+                "budget_exceeded" if error_code == "budget_exceeded" else "error",
+                error=str(e)[:2000],
+            )
             _persist_trace(recorder)
             if quality_feedback is None:
                 _abandon_admission(admission_store, admission)
             # A classified provider error (e.g. content_filtered) carries its own
             # code; otherwise fall back to any code an upstream step recorded.
-            code = getattr(e, "error_code", None) or report.error_code
+            code = error_code or report.error_code
             raise PipelineStepError(
                 "reconcile", str(e), steps=report.steps, error_code=code
             ) from e
@@ -1201,6 +1385,8 @@ async def run_pipeline_async(
                         detail={"grade": grade.to_dict(), "attribution": attribution.to_dict()},
                     )
                 except PipelineStepError as e:
+                    if e.error_code == "budget_exceeded":
+                        raise
                     # The retry failed. The first attempt's document is intact
                     # and gradeable, and losing a storable song to a failed
                     # OPTIONAL retry would be strictly worse than storing the
@@ -1282,6 +1468,11 @@ async def run_pipeline_async(
                     "searchesSpent": quality_searches_spent,
                 }
             )
+        except PipelineStepError as e:
+            if e.error_code == "budget_exceeded":
+                raise
+            report.steps["quality"] = f"failed: {e}"
+            log.warning("pipeline.step error step=quality err=%s", e)
         except Exception as e:  # noqa: BLE001 — grading must never fail a run
             report.steps["quality"] = f"failed: {e}"
             log.warning("pipeline.step error step=quality err=%s", e)
@@ -1323,6 +1514,15 @@ async def run_pipeline_async(
         elif guard_baseline.audio.beats or guard_baseline.metadata.bpm is not None:
             report.steps["timing-guard"] = "ok: audio.beats and metadata.bpm preserved"
 
+    if report.audio_content_hash:
+        result.song = result.song.model_copy(
+            update={
+                "audio": result.song.audio.model_copy(
+                    update={"contentHash": report.audio_content_hash}
+                )
+            }
+        )
+
     # 6-7. version-controlled persistence (FATAL, except a 409 conflict which
     # the API surfaces as-is). Every run is a new immutable version.
     try:
@@ -1334,6 +1534,11 @@ async def run_pipeline_async(
     except VersionConflictError:
         _abandon_admission(admission_store, admission)
         raise  # -> HTTP 409, not a 502
+    except IdentityCollisionError as e:
+        _abandon_admission(admission_store, admission)
+        raise PipelineStepError(
+            "store", str(e), steps=report.steps, error_code=e.code
+        ) from e
     except asyncio.TimeoutError as e:
         _abandon_admission(admission_store, admission)
         raise PipelineStepError(
@@ -1373,6 +1578,10 @@ async def run_pipeline_async(
             "quality": recorder.trace.quality,
             "evidenceManifest": report.evidence_manifest,
             "forced": recorder.trace.forced,
+            "usage": recorder.trace.to_dict()["usage"],
+            "costUSD": recorder.trace.cost_usd,
+            "usageReliable": recorder.trace.usage_reliable,
+            "priceTableVersion": recorder.trace.price_table_version,
         },
     )
     # Complete admission BEFORE stamping the correction. A duplicate arriving
@@ -1689,6 +1898,8 @@ def run_pipeline(
     allow_timing_loss: bool = False,
     force: bool = False,
     force_reason: str | None = None,
+    batch_id: str | None = None,
+    effort_level: str | None = None,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -1714,5 +1925,7 @@ def run_pipeline(
             allow_timing_loss=allow_timing_loss,
             force=force,
             force_reason=force_reason,
+            batch_id=batch_id,
+            effort_level=effort_level,
         )
     )

@@ -100,6 +100,7 @@ class Job:
     # analyze job doesn't have one yet, which is exactly why `song_id` below
     # is a RESULT field and this is a separate input.
     target_song_id: Optional[str] = None
+    batch_id: Optional[str] = None
 
     status: str = QUEUED
     queued_at: str = ""
@@ -143,6 +144,7 @@ class Job:
             "wants": data["wants"],
             "kind": data["kind"],
             "targetSongId": data["target_song_id"],
+            "batchId": data["batch_id"],
             "status": data["status"],
             "queuedAt": data["queued_at"],
             "startedAt": data["started_at"],
@@ -169,6 +171,7 @@ class Job:
             "wants": self.wants,
             "kind": self.kind,
             "targetSongId": self.target_song_id,
+            "batchId": self.batch_id,
             "leaseExpiresAt": self.lease_expires_at,
             "attempts": self.attempts,
         }
@@ -341,6 +344,7 @@ class InMemoryJobRepository(JobRepository):
                     wants=list(spec.get("wants") or wants or []),
                     kind=spec.get("kind") or "analyze",
                     target_song_id=spec.get("targetSongId"),
+                    batch_id=spec.get("batchId"),
                     queued_at=_iso(_now()) or "",
                 )
                 self._jobs[job.id] = job
@@ -513,6 +517,7 @@ class FirestoreJobRepository(JobRepository):
                     wants=list(spec.get("wants") or wants or []),
                     kind=spec.get("kind") or "analyze",
                     target_song_id=spec.get("targetSongId"),
+                    batch_id=spec.get("batchId"),
                     queued_at=_iso(_now()) or "",
                 )
                 created.append(self._save(job))

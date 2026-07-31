@@ -36,18 +36,34 @@ from .audio import utils as audio_utils
 from .audio.acquire import acquire as _acquire
 from .config import settings
 from .discovery import CandidateSource, discover_sources
+from .identity import (
+    IdentityUnresolvedError,
+    require_resolved_song_id,
+    resolve_identity_from_evidence,
+    song_id_has_unknown_segment,
+)
 from .mir import MirAnalysis, analyze_audio as _analyze_audio
-from .pipeline import get_store, run_pipeline_async
+from .pipeline import PipelineStepError, get_store, run_pipeline_async
 from .reconcile import provider_capabilities
 from .reconcile.admission import reconcile_admitted
 from .schema import Song, song_json_schema
 from .scope import AnalysisScope
-from .store import backend_label as _store_backend_label
+from .store import IdentityCollisionError, backend_label as _store_backend_label
+from .store.identity_rename import rename_song_identity
+from .store.runs import get_run_store
 
 def _now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _identity_error(error: IdentityUnresolvedError) -> dict:
+    return {"detail": str(error), **error.to_dict()}
+
+
+def _identity_collision_error(error: IdentityCollisionError) -> dict:
+    return {"detail": str(error), "errorCode": error.code}
 
 
 mcp = FastMCP(
@@ -154,6 +170,9 @@ def reconcile_song(
     media_url: Optional[str] = None,
     force: bool = False,
     force_reason: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    effort_level: Optional[str] = None,
+    prior_song: Optional[dict] = None,
 ) -> dict:
     """Reconcile candidate text sources + MIR analysis into a schema-compliant
     Song JSON via the configured reconciler (step 5). candidates_json/mir_json
@@ -167,6 +186,13 @@ def reconcile_song(
     if candidates_json:
         candidates = [CandidateSource.model_validate(c) for c in json.loads(candidates_json)]
     else:
+        # With no already-gathered page to recover from, reject an unresolved
+        # identity before a search can spend time or create a later run.
+        try:
+            identity = resolve_identity_from_evidence(artist=artist, title=title)
+        except IdentityUnresolvedError as error:
+            return _identity_error(error)
+        title, artist = identity.title, identity.artist
         candidates = discover_sources(title, artist)
     mir = None
     if mir_json:
@@ -176,20 +202,31 @@ def reconcile_song(
     # persists nothing (save_song is a separate call that runs no timing pass
     # either), so no deterministic pass will re-time it and the model's timing
     # must survive intact. See reconcile/engine.py's TimingAuthority.
-    admitted = reconcile_admitted(
-        title,
-        artist,
-        candidates,
-        mir,
-        provider=provider,
-        model=model,
-        audio_path=audio_path,
-        attach_audio=attach_audio,
-        youtube_video_id=youtube_video_id,
-        media_url=media_url,
-        force=force,
-        force_reason=force_reason,
-    )
+    try:
+        admitted = reconcile_admitted(
+            title,
+            artist,
+            candidates,
+            mir,
+            provider=provider,
+            model=model,
+            audio_path=audio_path,
+            attach_audio=attach_audio,
+            youtube_video_id=youtube_video_id,
+            media_url=media_url,
+            force=force,
+            force_reason=force_reason,
+            batch_id=batch_id,
+            effort_level=effort_level,
+            prior_song=prior_song,
+        )
+    except IdentityUnresolvedError as error:
+        return _identity_error(error)
+    except Exception as error:
+        from .usage import BudgetExceededError
+        if isinstance(error, BudgetExceededError):
+            return error.to_dict()
+        raise
     result = admitted.result
     return {
         "song": result.song.model_dump(),
@@ -217,6 +254,8 @@ async def analyze_and_store_song(
     allow_timing_loss: bool = False,
     force: bool = False,
     force_reason: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    effort_level: Optional[str] = None,
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
@@ -277,23 +316,40 @@ async def analyze_and_store_song(
     guidance_problem = notes_length_error(guidance)
     if guidance_problem:
         raise ValueError(guidance_problem)
-    report = await run_pipeline_async(
-        title,
-        artist,
-        youtube_url_or_id=youtube_url_or_id,
-        provider=provider,
-        model=model,
-        skip_audio=skip_audio,
-        expected_version=expected_version,
-        accuracy=accuracy,
-        guidance=guidance,
-        # None in -> None out: an omitted scope must stay omitted all the way
-        # down, or every MCP caller silently starts getting a "scope" step.
-        scope=AnalysisScope.parse(scope),
-        allow_timing_loss=allow_timing_loss,
-        force=force,
-        force_reason=force_reason,
-    )
+    try:
+        report = await run_pipeline_async(
+            title,
+            artist,
+            youtube_url_or_id=youtube_url_or_id,
+            provider=provider,
+            model=model,
+            skip_audio=skip_audio,
+            expected_version=expected_version,
+            accuracy=accuracy,
+            guidance=guidance,
+            # None in -> None out: an omitted scope must stay omitted all the way
+            # down, or every MCP caller silently starts getting a "scope" step.
+            scope=AnalysisScope.parse(scope),
+            allow_timing_loss=allow_timing_loss,
+            force=force,
+            force_reason=force_reason,
+            batch_id=batch_id,
+            effort_level=effort_level,
+        )
+    except PipelineStepError as error:
+        if error.error_code == "identity_unresolved" and isinstance(error.__cause__, IdentityUnresolvedError):
+            return _identity_error(error.__cause__)
+        if error.error_code == "identity_collision" and isinstance(error.__cause__, IdentityCollisionError):
+            return _identity_collision_error(error.__cause__)
+        if error.error_code == "budget_exceeded":
+            from .usage import BudgetExceededError
+            cause = error.__cause__
+            return (
+                cause.to_dict()
+                if isinstance(cause, BudgetExceededError)
+                else {"code": "budget_exceeded", "error": str(error)}
+            )
+        raise
     assert report.reconcile is not None
     return {
         "songId": report.song_id,
@@ -412,8 +468,47 @@ def save_song(song_json: str, message: str = "Manual save", expected_version: Op
     rejected if the stored version moved since you read it. Provenance is
     append-only — the new document must extend the stored history."""
     song = Song.model_validate_json(song_json)
-    saved = get_store().save(song, message, expected_version=expected_version)
+    try:
+        require_resolved_song_id(song.id)
+    except IdentityUnresolvedError as error:
+        return _identity_error(error)
+    try:
+        saved = get_store().save(song, message, expected_version=expected_version)
+    except IdentityCollisionError as error:
+        return _identity_collision_error(error)
     return dataclasses.asdict(saved)
+
+
+@mcp.tool()
+def set_song_identity(song_id: str, artist: str, title: str) -> dict:
+    """Manually name a legacy needs-identity song.
+
+    Moves the full version history and every run trace to the new permanent id
+    atomically. The target must not already exist; this tool never guesses or
+    merges two histories.
+    """
+    try:
+        return rename_song_identity(
+            get_store(), get_run_store(), song_id, artist=artist, title=title
+        ).to_dict()
+    except IdentityUnresolvedError as error:
+        return _identity_error(error)
+
+
+@mcp.tool()
+def list_songs_needing_identity() -> dict:
+    """List legacy songs with an unresolved id for manual naming."""
+    songs = [
+        {
+            "songId": summary.id,
+            "artist": summary.artist,
+            "title": summary.title,
+            "needsIdentity": True,
+        }
+        for summary in get_store().list_song_summaries()
+        if song_id_has_unknown_segment(summary.id)
+    ]
+    return {"songs": songs}
 
 
 # --- per-song reconciliation notes -------------------------------------------
@@ -655,7 +750,8 @@ def get_agent_config() -> dict:
 def set_agent_config(config_json: str) -> dict:
     """Program the agent: set instructions_extra / theory_rules /
     retrieval_recipe / instructions_override (all optional), max_turns, effort,
-    max_web_search / max_fetch / max_windows, disabled_tools, model. The output
+    max_fetch (deterministic sheet-search calls), max_windows, disabled_tools,
+    source_site_preferences, and model. The output
     contract and schema enforcement are NOT editable. Requires SNOOCLE_API_TOKEN
     to be configured on the server."""
     import json as _json
@@ -704,6 +800,21 @@ def get_run(run_id: str) -> dict:
     if run is None:
         return {"error": f"no such run: {run_id}"}
     return run
+
+
+@mcp.tool()
+def get_usage_summary(window: str = "7d") -> dict:
+    """Compact per-day, per-song, and per-model token/cost rollups."""
+    from .reconcile.engine import _load_agent_config
+    from .store.runs import get_run_store
+    from .usage_summary import build_usage_summary
+
+    try:
+        return build_usage_summary(
+            get_run_store(), window=window, cfg=_load_agent_config()
+        )
+    except ValueError as e:
+        return {"code": "invalid_window", "error": str(e)}
 
 
 @mcp.tool()

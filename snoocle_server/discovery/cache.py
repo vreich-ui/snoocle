@@ -12,9 +12,10 @@ Sources change slowly, though, so the window is generous (~30 days by default,
 the sheets rather than re-running a search that is rate-limited from a
 datacenter IP anyway.
 
-Keyed on the identity actually searched for plus the backend set, because
-changing which backends are enabled changes what comes back. ``max_candidates``
-is in the key too: asking for more must not be answered from a narrower run.
+Keyed on the identity actually searched for, recording variant, backend set,
+and ordered site preferences, because each can change what ranks into the top
+N. ``max_candidates`` is in the key too: asking for more must not be answered
+from a narrower run.
 """
 
 from __future__ import annotations
@@ -41,15 +42,26 @@ def _backend_set() -> list[str]:
     return backends
 
 
-def discovery_cache_key(title: str, artist: str, max_candidates: int) -> str:
+def discovery_cache_key(
+    title: str,
+    artist: str,
+    max_candidates: int,
+    *,
+    recording_variant: str | None = None,
+    site_preferences: dict[str, list[str]] | None = None,
+) -> str:
     components = {
-        "v": 1,  # key-scheme version: bump to invalidate everything at once
+        "v": 2,  # key-scheme version: bump to invalidate everything at once
         # Case/whitespace-insensitive: "let it be" and "Let It Be" search the
         # same web, and a stray space shouldn't cost a search.
         "title": " ".join(title.lower().split()),
         "artist": " ".join(artist.lower().split()),
         "backends": _backend_set(),
         "maxCandidates": int(max_candidates),
+        "recordingVariant": recording_variant or "studio",
+        # Ranking configuration changes WHICH top-N pages get parsed, so it is
+        # part of the query result just as much as the backend roster is.
+        "sitePreferences": site_preferences or {},
     }
     canonical = json.dumps(components, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -64,6 +76,7 @@ class DiscoveryCacheInfo:
     status: str  # "hit" | "miss" | "refresh" | "disabled"
     gathered_at: str  # ISO-8601 of the ORIGINAL search (== now for a miss)
     key: str = ""
+    report: dict | None = None
 
     @property
     def from_cache(self) -> bool:
@@ -102,6 +115,8 @@ def discover_cached(
     max_candidates: int,
     discover: Callable[[], list[CandidateSource]],
     refresh: bool = False,
+    recording_variant: str | None = None,
+    site_preferences: dict[str, list[str]] | None = None,
 ) -> tuple[list[CandidateSource], DiscoveryCacheInfo]:
     """Run ``discover`` unless an identical search is already cached.
 
@@ -114,11 +129,26 @@ def discover_cached(
     usually a throttled backend rather than a fact about the song, and freezing
     that for a month would turn a transient failure into a lasting one.
     """
+    def run_discover() -> tuple[list[CandidateSource], dict | None]:
+        result = discover()
+        if hasattr(result, "candidates") and hasattr(result, "report"):
+            return list(result.candidates), dict(result.report)
+        return result, None
+
     if not settings.discovery_cache_enabled:
-        return discover(), DiscoveryCacheInfo(status="disabled", gathered_at=_now_iso())
+        candidates, report = run_discover()
+        return candidates, DiscoveryCacheInfo(
+            status="disabled", gathered_at=_now_iso(), report=report
+        )
 
     store = get_discovery_cache()
-    key = discovery_cache_key(title, artist, max_candidates)
+    key = discovery_cache_key(
+        title,
+        artist,
+        max_candidates,
+        recording_variant=recording_variant,
+        site_preferences=site_preferences,
+    )
 
     if not refresh:
         hit = store.get(key)
@@ -134,19 +164,25 @@ def discover_cached(
                     key, len(candidates), stored_at,
                 )
                 return candidates, DiscoveryCacheInfo(
-                    status="hit", gathered_at=stored_at, key=key
+                    status="hit", gathered_at=stored_at, key=key,
+                    report=value.get("report"),
                 )
 
-    candidates = discover()
+    candidates, report = run_discover()
     if not candidates:
         return candidates, DiscoveryCacheInfo(
-            status="refresh" if refresh else "miss", gathered_at=_now_iso(), key=key
+            status="refresh" if refresh else "miss", gathered_at=_now_iso(), key=key,
+            report=report,
         )
     stored_at = store.put(
-        key, {"candidates": [c.model_dump(mode="json") for c in candidates]}
+        key, {
+            "candidates": [c.model_dump(mode="json") for c in candidates],
+            "report": report,
+        }
     ) or _now_iso()
     return candidates, DiscoveryCacheInfo(
-        status="refresh" if refresh else "miss", gathered_at=stored_at, key=key
+        status="refresh" if refresh else "miss", gathered_at=stored_at, key=key,
+        report=report,
     )
 
 

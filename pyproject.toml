@@ -36,6 +36,9 @@ dependencies = [
     # installs pick it up too. Imported lazily inside the provider, like the
     # other providers do with their deps.
     "anthropic>=0.66",
+    # Deterministic chord-sheet prefetch accepts PDF sources. Text extraction
+    # is local and never delegates document contents to the model.
+    "pypdf>=5.0",
 ]
 
 [project.optional-dependencies]

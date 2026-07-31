@@ -148,6 +148,26 @@ def test_ultimate_guitar_toggle_is_in_the_key(monkeypatch):
     assert discover.calls == 2
 
 
+def test_site_ranking_and_recording_variant_are_in_the_key():
+    discover = _Counter()
+    discover_cached(
+        "X", "Y", max_candidates=3, discover=discover,
+        recording_variant="studio",
+        site_preferences={"global": ["ultimate-guitar.com"]},
+    )
+    discover_cached(
+        "X", "Y", max_candidates=3, discover=discover,
+        recording_variant="live",
+        site_preferences={"global": ["ultimate-guitar.com"]},
+    )
+    discover_cached(
+        "X", "Y", max_candidates=3, discover=discover,
+        recording_variant="live",
+        site_preferences={"global": ["chordify.net"]},
+    )
+    assert discover.calls == 3
+
+
 def test_asking_for_more_candidates_misses():
     """A narrower run's results must not answer a wider request."""
     discover = _Counter()

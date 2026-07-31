@@ -450,6 +450,7 @@ def run_pipeline_job(job: dict) -> dict:
         youtube_url_or_id=job.get("youtubeUrlOrId"),
         provider=job.get("provider"),
         analysis_depth=job.get("analysisDepth"),
+        batch_id=job.get("batchId"),
     ))
     return {
         "songId": report.song_id,

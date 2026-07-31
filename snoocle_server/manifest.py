@@ -12,12 +12,12 @@ deliberate. The manifest generalizes the fix — state the evidence's provenance
 and quality explicitly instead of leaving the model to infer it from what's
 present.
 
-**The manifest is DESCRIPTIVE.** It is never a source of truth, is never parsed
-back, and nothing downstream branches on it. Delete it and every output stays
-correct — just arrived at less efficiently. That constraint is what lets it be
-generous: it can say "this MIR came from cache and the audio was actually
-listened to three weeks ago" without any risk that a bug in the manifest
-corrupts a song.
+**The manifest is evidence metadata, not song content.** It never supplies a
+lyric, chord, or identity. Admission hashes its stable identifiers, and the
+agent uses the deterministic ``fullSongSheets`` count only to turn optional
+retrieval off when enough parsed evidence is already present. The remaining
+fields are descriptive: they can say "this MIR came from cache and the audio
+was actually listened to three weeks ago" without becoming musical truth.
 
 On ordering: LRC alignment runs AFTER reconciliation (pipeline step 5c), so the
 copy injected into the prompt honestly reports it as ``"pending"``. The
@@ -94,6 +94,30 @@ def _sources_block(candidates, cache_info, mir=None) -> dict:
         # confidence, and scores are descriptive and deliberately excluded
         # from the idempotency digest.
         block["ids"] = [str(candidate.sourceId) for candidate in candidates]
+        block["sheets"] = [
+            {
+                "sourceId": str(candidate.sourceId),
+                "url": candidate.url,
+                "contentHash": candidate.contentHash,
+                "contentType": candidate.contentType,
+                "gatheredAt": candidate.retrievedAt,
+                "cacheStatus": candidate.cacheStatus,
+                "parseConfidence": (
+                    candidate.parseConfidence
+                    if candidate.parseConfidence is not None
+                    else candidate.confidence
+                ),
+                "parseStatus": "parsed" if candidate.lines else "metadata-only",
+                "declaredCapo": candidate.declaredCapo,
+                "normalizedCapo": 0,
+                "coverage": candidate.coverage,
+                "lineCount": len(candidate.lines),
+            }
+            for candidate in candidates
+        ]
+        block["fullSongSheets"] = sum(
+            1 for candidate in candidates if candidate.coverage == "full-song"
+        )
     if cache_info is not None:
         block["gatheredAt"] = cache_info.gathered_at
         age = _age_days(cache_info.gathered_at)
@@ -165,6 +189,7 @@ def build_evidence_manifest(
     scope=None,
     guidance: str | None = None,
     guidance_origin: str | None = None,
+    recording_variant: str | None = None,
     lrc: dict | None = None,
 ) -> dict:
     """Describe the state of every input this run is handing the reconciler.
@@ -181,6 +206,7 @@ def build_evidence_manifest(
                 else None
             ),
             "notes": guidance or None,
+            "recordingVariant": recording_variant or "studio",
         }
         if guidance and guidance_origin:
             request["notesOrigin"] = guidance_origin

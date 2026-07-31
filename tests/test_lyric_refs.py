@@ -462,7 +462,8 @@ def test_the_agent_output_contract_carries_the_same_protocol():
     assert '"lyricRef"' in text and '"lyricOverride"' in text
     assert '"lineIndex": 7, "lyricRef"' in text
     assert "prior-song" in text
-    assert "fetch_chord_sheet" in text, "sheets fetched mid-run are referenceable too"
+    assert "search_and_fetch_sheet" in text, "parsed sheets found mid-run are referenceable too"
+    assert "fetch_chord_sheet" not in text, "the agent must never choose a raw URL"
 
 
 def test_the_content_filter_message_no_longer_blames_missing_sources():

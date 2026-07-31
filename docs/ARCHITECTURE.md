@@ -196,10 +196,17 @@ song seconds.
 ## Reconciliation providers
 
 Provider is a runtime choice (`provider` request param or
-`SNOOCLE_LLM_PROVIDER`): `anthropic | openai | gemini | agent | mock`.
+`SNOOCLE_LLM_PROVIDER`): `anthropic | anthropic-agent | openai | gemini |
+agent | mock`.
 
 - `anthropic`/`openai`/`gemini` call the LLM APIs directly with Snoocle-held
   keys.
+- `anthropic-agent` runs the bounded tool loop inside Snoocle. Its public
+  effort levels route to Haiku-class (`low`), Sonnet-class (`standard`), and
+  Opus (`high`). Standard gets exactly one Opus turn only when the deterministic
+  source-agreement scorer finds that chord sheets conflict and MIR cannot
+  select a winner; the reason and every turn's actual model are stored on the
+  run trace.
 - **`agent` inverts the direction: Snoocle becomes an MCP *client*.** It calls
   one tool (`SNOOCLE_AGENT_MCP_TOOL`, default `reconcile_song`) on an external
   agent workspace's MCP server (`SNOOCLE_AGENT_MCP_URL`, e.g. a Claude Agent
@@ -284,6 +291,23 @@ for a lyric-dense one. A long `sourceId` is repeated on every line and eats
 into it — with Ultimate Guitar's ~23-character ids the dense case comes out
 slightly LARGER than before. Token reduction is a side effect here, not the
 point; the point is that no model-backed path can emit a lyric at all.
+
+## Existing songs reconcile as compact deltas
+
+When a valid prior version exists, a model-backed reconciliation emits a
+domain delta instead of another complete Song: changed per-line chord
+placements, rare lyric reference/override changes, and optional section,
+metadata, or display-preference blocks. `reconcile/delta.py` applies that delta
+to the validated prior locally. The result then follows the normal timing,
+collapse-guard, schema-validation, and store path. A malformed delta gets one
+repair turn and then fails; it never silently falls back to a full rewrite.
+
+On a first reconcile the model still emits a full document, but its temporary
+write schema omits the fields MIR-backed post-passes own (`timeSeconds`,
+`confidence`, `beat`, `audio.syncMap`, `audio.beats`, and `metadata.bpm`). The
+stored Song schema is unchanged. Runs record `outputFormat`, patch/full byte
+sizes, the public effort level, every turn's actual model, and any deterministic
+Opus-escalation reason.
 
 ## A beat grid that stops before the song does
 

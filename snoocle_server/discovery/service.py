@@ -22,7 +22,6 @@ from .chordsheet import parse_chord_sheet
 from .fetch import extract_sheet_text, fetch_page
 from .models import CandidateSource, SectionStart
 from .search import SearchError, SearchHit, web_search
-from .sources.ultimate_guitar import discover_ultimate_guitar
 from ..audio.acquire import parse_dash_title, parse_quoted_track
 from ..config import settings
 
@@ -32,6 +31,7 @@ SearchFn = Callable[[str, int], list[SearchHit]]
 FetchFn = Callable[[str], str]
 
 _QUOTE_RE = re.compile(r'["“”„‟]+')
+_ORIGINAL_FETCH_PAGE = fetch_page
 
 
 def _phrase(term: str) -> str:
@@ -63,6 +63,12 @@ def candidate_from_text(text: str, source_id: str, url: str | None = None, title
             f"source declared capo {sheet.declared_capo}; chords transposed to "
             f"sounding pitch at ingestion (+{sheet.declared_capo} semitones)"
         )
+    confidence = _confidence(sheet)
+    full_song = (
+        len(sheet.lines) >= 8
+        and sheet.placement_count >= 8
+        and (len(sheet.sections_hint) >= 2 or sheet.lyric_line_count >= 12)
+    )
     return CandidateSource(
         sourceId=source_id,
         url=url,
@@ -70,7 +76,9 @@ def candidate_from_text(text: str, source_id: str, url: str | None = None, title
         retrievedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         declaredCapo=sheet.declared_capo,
         declaredKey=sheet.declared_key,
-        confidence=_confidence(sheet),
+        confidence=confidence,
+        parseConfidence=confidence,
+        coverage="full-song" if full_song else "partial",
         sectionsHint=sheet.sections_hint,
         sectionStarts=[
             SectionStart(name=n, startLineIndex=i)
@@ -88,21 +96,51 @@ def discover_sources(
     max_candidates: int | None = None,
     search_fn: SearchFn | None = None,
     fetch_fn: FetchFn | None = None,
+    *,
+    with_report: bool = False,
+    song_id: str | None = None,
+    recording_variant: str | None = None,
+    site_preferences: dict[str, list[str]] | None = None,
 ) -> list[CandidateSource]:
-    """General web search -> fetch -> parse -> ranked candidate sources,
-    plus Ultimate Guitar (a separate, site-specific channel — see
-    discovery/sources/ultimate_guitar.py — additive, not a fallback for the
-    generic web search; on by default, SNOOCLE_SOURCE_UG=0 disables it).
+    """Compatibility wrapper returning deterministic prefetch candidates."""
+    result = discover_sources_with_report(
+        title, artist, max_candidates=max_candidates,
+        search_fn=search_fn, fetch_fn=fetch_fn,
+        song_id=song_id, recording_variant=recording_variant,
+        site_preferences=site_preferences,
+    )
+    return result if with_report else result.candidates
 
-    Note the two channels fail independently and on purpose: UG is merged in
-    whether the generic search succeeded, returned nothing, or raised, and the
-    search error is only re-raised when the merge leaves nothing at all. Since
-    2026-07 that is not a corner case — from a datacenter IP the keyless
-    general backend is throttled to roughly a coin flip, so on any given run UG
-    is quite often the only channel that returns anything."""
-    max_candidates = max_candidates or settings.search_max_candidates
+
+def discover_sources_with_report(
+    title: str,
+    artist: str,
+    max_candidates: int | None = None,
+    search_fn: SearchFn | None = None,
+    fetch_fn: FetchFn | None = None,
+    *,
+    song_id: str | None = None,
+    recording_variant: str | None = None,
+    site_preferences: dict[str, list[str]] | None = None,
+):
+    """Ranked multi-format gather plus its trace-ready decision report."""
+    from ..schema.song import slugify_song_id
+    from .prefetch import PrefetchResult, gather_chord_sheets, infer_recording_variant
+
+    max_candidates = max_candidates or settings.source_prefetch_max
     search_fn = search_fn or (lambda q, n: web_search(q, n))
-    fetch_fn = fetch_fn or fetch_page
+    if fetch_fn is None:
+        # Production needs the multi-format resource fetcher (content type +
+        # bytes for PDF/DOC/image). Keep the long-standing ``service.fetch_page``
+        # monkeypatch seam for offline callers and tests that replaced it.
+        if fetch_page is _ORIGINAL_FETCH_PAGE:
+            from .resource import fetch_resource
+
+            fetch_fn = fetch_resource
+        else:
+            fetch_fn = fetch_page
+    song_id = song_id or slugify_song_id(artist, title)
+    recording_variant = recording_variant or infer_recording_variant(title)
 
     # Video-derived identities ('Amy Winehouse - Back To Black' with the channel
     # name as the artist, or 'Artist "Track" at some show') rarely match any
@@ -111,12 +149,16 @@ def discover_sources(
     # retry with the cleaner identity embedded in the title itself.
     primary_error: SearchError | None = None
     try:
-        candidates = _search_and_parse(title, artist, max_candidates, search_fn, fetch_fn)
+        gathered = gather_chord_sheets(
+            song_id, artist, title, recording_variant,
+            max_sheets=max_candidates, search_fn=search_fn, fetch_fn=fetch_fn,
+            site_preferences=site_preferences,
+        )
     except SearchError as e:
         primary_error = e
-        candidates = []
+        gathered = PrefetchResult(candidates=[], report={"error": str(e)})
 
-    if not candidates:
+    if not gathered.candidates:
         extracted = _embedded_identity(title, artist)
         if extracted:
             ex_artist, ex_track = extracted
@@ -125,25 +167,26 @@ def discover_sources(
                 artist, title, ex_artist, ex_track,
             )
             try:
-                candidates = _search_and_parse(
-                    ex_track, ex_artist, max_candidates, search_fn, fetch_fn
+                fallback = gather_chord_sheets(
+                    slugify_song_id(ex_artist, ex_track), ex_artist, ex_track,
+                    infer_recording_variant(ex_track), max_sheets=max_candidates,
+                    search_fn=search_fn, fetch_fn=fetch_fn,
+                    site_preferences=site_preferences,
+                )
+                gathered = PrefetchResult(
+                    candidates=fallback.candidates,
+                    report={
+                        **fallback.report,
+                        "fallbackFrom": {"artist": artist, "title": title},
+                        "attempts": [gathered.report, fallback.report],
+                    },
                 )
             except SearchError:
                 pass  # fall through to the primary outcome below
 
-    # Ultimate Guitar is best-effort and never raises (see its own module
-    # docstring) — merge whatever it finds in regardless of whether the
-    # generic web search above succeeded or failed.
-    ug_candidates = discover_ultimate_guitar(
-        title, artist, max_candidates=settings.source_ug_max_candidates
-    )
-    candidates = candidates + ug_candidates
-
-    if not candidates and primary_error is not None:
+    if not gathered.candidates and primary_error is not None:
         raise primary_error
-
-    candidates.sort(key=lambda c: c.confidence, reverse=True)
-    return candidates
+    return gathered
 
 
 def _embedded_identity(title: str, artist: str) -> tuple[str, str] | None:

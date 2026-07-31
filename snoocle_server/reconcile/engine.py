@@ -52,11 +52,19 @@ from .. import __version__
 from ..audio.utils import probe, trim
 from ..config import settings
 from ..discovery.models import CandidateSource
+from ..identity import require_resolved_song_id
 from ..mir.base import MirAnalysis
 from ..schema import Song, song_json_schema
 from ..schema.song import ProvenanceEntry, slugify_song_id
 from ..scope import AnalysisScope
 from .agent_config import AgentConfig, config_version
+from .delta import (
+    AppliedDelta,
+    ReconcileDeltaError,
+    apply_reconcile_delta,
+    reconcile_delta_json_schema,
+    strip_postpass_schema,
+)
 from .depth import DepthProfile, resolve_depth
 from .lyric_refs import (
     LyricOverride,
@@ -70,6 +78,7 @@ from .patch_ops import AppliedOp, PatchError, apply_patch, parse_ops_response
 from .prompt import (
     build_patch_system_prompt,
     build_patch_user_prompt,
+    build_delta_repair_prompt,
     build_repair_prompt,
     build_system_prompt,
     build_user_prompt,
@@ -137,6 +146,8 @@ class ReconcileResult:
     # that DECLARED the authority can put the recording-level fields back if the
     # pass it named never completed. See :class:`TimingStrip`.
     timing_strip: TimingStrip | None = None
+    output_format: str = "full"
+    patch_size_vs_full: dict | None = None
 
 
 def extract_json(text: str) -> str:
@@ -694,6 +705,7 @@ def _attempt_patch(
     prior_song_obj: Song,
     guidance: str,
     trace: TraceRecorder | None,
+    run_cap: float,
 ) -> tuple[Song, list[AppliedOp], str, dict] | None:
     """One model call, patch-shaped. Returns ``(song, applied_ops,
     resolved_model, usage)`` on success.
@@ -713,12 +725,32 @@ def _attempt_patch(
     system_prompt = build_patch_system_prompt()
     user_prompt = build_patch_user_prompt(title, artist, song_id, prior_song, guidance)
     started = clock()
+    from ..usage import BudgetExceededError, persisted_usage
+    if trace is not None and trace.trace.cost_usd >= run_cap:
+        raise BudgetExceededError(
+            "run", trace.trace.cost_usd, run_cap, refused="patch model call"
+        )
     response = provider.complete(system_prompt, [{"role": "user", "text": user_prompt}], model=model)
     usage: dict = {}
     for k, v in (response.usage or {}).items():
         if isinstance(v, (int, float)):
             usage[k] = usage.get(k, 0) + v
     resolved_model = response.model
+    if trace is not None:
+        step_cost = trace.record_model_usage(resolved_model, response.usage or {})
+        trace.step(
+            "model", "patch-attempt", "patch model response received",
+            detail={
+                "usage": persisted_usage(response.usage or {}),
+                "costUSD": step_cost,
+            },
+            duration_seconds=clock() - started,
+        )
+        if trace.trace.cost_usd > run_cap:
+            raise BudgetExceededError(
+                "run", trace.trace.cost_usd, run_cap,
+                refused="continuation after patch model call",
+            )
 
     try:
         document = json.loads(extract_json(response.text))
@@ -752,6 +784,22 @@ def _attempt_patch(
         raise PatchApplicationError(str(e)) from e
 
     if trace is not None:
+        patch_bytes = len(
+            json.dumps(
+                document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+        )
+        full_bytes = len(
+            json.dumps(
+                patched_song.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        )
+        trace.set_output_format(
+            "patch", patch_bytes=patch_bytes, full_bytes=full_bytes
+        )
         trace.step(
             "patch", "patch-applied", f"{len(applied)} op(s) applied",
             detail={"ops": [a.description for a in applied]},
@@ -803,6 +851,7 @@ def reconcile(
     puts the fields back from ``result.timing_strip``.
     """
     song_id = song_id or slugify_song_id(artist, title)
+    require_resolved_song_id(song_id)
     provider = get_provider(provider_name)
     depth = depth or resolve_depth(None)
 
@@ -852,6 +901,11 @@ def reconcile(
     )
 
     if uses_patch_ops:
+        run_cap = (
+            agent_config.run_cost_cap_usd
+            if agent_config.run_cost_cap_usd is not None
+            else settings.run_cost_cap_usd
+        )
         if trace is not None:
             trace.step(
                 "inputs", "read-inputs",
@@ -860,7 +914,7 @@ def reconcile(
             )
         attempt = _attempt_patch(
             provider, model, title, artist, song_id, prior_song, prior_song_obj,
-            guidance or "", trace,
+            guidance or "", trace, run_cap,
         )
         if attempt is not None:
             patched_song, applied_ops, resolved_model, usage = attempt
@@ -900,6 +954,7 @@ def reconcile(
                 usage=usage,
                 trace=trace.trace if trace is not None else None,
                 patch_ops_applied=len(applied_ops),
+                output_format="patch",
             )
         # else: the model explicitly asked for a full reconcile. Falls
         # through to EXACTLY today's notes-only path below (full-Song
@@ -914,7 +969,16 @@ def reconcile(
     uses_lyric_refs = bool(getattr(provider, "emits_lyric_refs", False))
     ref_index = build_ref_index(candidates, prior_song) if uses_lyric_refs else {}
     base_schema = song_json_schema()
-    schema_for_model = agent_song_json_schema(base_schema) if uses_lyric_refs else base_schema
+    uses_reconcile_delta = bool(prior_song_obj is not None and uses_lyric_refs)
+    output_format = "patch" if uses_reconcile_delta else "full"
+    if uses_reconcile_delta:
+        schema_for_model = reconcile_delta_json_schema()
+    else:
+        schema_for_model = strip_postpass_schema(base_schema, mir_present=mir is not None)
+        if uses_lyric_refs:
+            schema_for_model = agent_song_json_schema(schema_for_model)
+    if trace is not None:
+        trace.set_output_format(output_format)
 
     if trace is not None:
         # The FULL MIR snapshot rides on the run itself (un-truncated; the GUI
@@ -978,8 +1042,13 @@ def reconcile(
             "scope": scope,
             "agent_config": agent_config if not agent_config.is_default() else None,
             "evidence_manifest": evidence_manifest,
+            "recording_variant": (
+                ((evidence_manifest or {}).get("request") or {}).get("recordingVariant")
+                or "studio"
+            ),
             "quality_feedback": quality_feedback,
             "structure_feedback": structure_feedback,
+            "output_format": output_format,
         }
     if hasattr(provider, "trace"):
         provider.trace = trace
@@ -996,27 +1065,66 @@ def reconcile(
         ref_index=ref_index if uses_lyric_refs else None,
         quality_feedback=quality_feedback,
         structure_feedback=structure_feedback,
+        output_format=output_format,
     )
-    system_prompt = build_system_prompt(lyric_refs=uses_lyric_refs)
+    system_prompt = build_system_prompt(
+        lyric_refs=uses_lyric_refs, output_format=output_format
+    )
     turns: list[dict] = [{"role": "user", "text": user_prompt}]
 
     usage: dict = {}
     resolved_model = model or settings.llm_model or provider.default_model
     last_errors = ""
-    for attempt in range(1, settings.llm_repair_attempts + 2):
+    max_attempts = 2 if uses_reconcile_delta else settings.llm_repair_attempts + 1
+    for attempt in range(1, max_attempts + 1):
+        from ..usage import BudgetExceededError
+        run_cap = (
+            agent_config.run_cost_cap_usd
+            if agent_config.run_cost_cap_usd is not None
+            else settings.run_cost_cap_usd
+        )
+        if trace is not None and trace.trace.cost_usd >= run_cap:
+            raise BudgetExceededError(
+                "run", trace.trace.cost_usd, run_cap, refused=f"model attempt {attempt}"
+            )
         started = clock()
         response = provider.complete(
             system_prompt, turns, model=model, audio=audio if attempt == 1 else None
         )
+        if trace is not None and not getattr(provider, "records_usage_in_trace", False):
+            step_cost = trace.record_model_usage(response.model, response.usage or {})
+            from ..usage import persisted_usage
+            trace.step(
+                "model", f"attempt-{attempt}", "model response received",
+                detail={
+                    "attempt": attempt,
+                    "usage": persisted_usage(response.usage or {}),
+                    "costUSD": step_cost,
+                },
+                duration_seconds=clock() - started,
+            )
+            if trace.trace.cost_usd > run_cap:
+                raise BudgetExceededError(
+                    "run", trace.trace.cost_usd, run_cap,
+                    refused=f"continuation after model attempt {attempt}",
+                )
         for k, v in (response.usage or {}).items():
             if isinstance(v, (int, float)):
                 usage[k] = usage.get(k, 0) + v
         resolved_model = response.model
         overrides: tuple[LyricOverride, ...] = ()
         refs_resolved = 0
+        applied_delta: AppliedDelta | None = None
         try:
             document = json.loads(extract_json(response.text))
-            if uses_lyric_refs:
+            if uses_reconcile_delta:
+                applied_delta = apply_reconcile_delta(
+                    prior_song_obj, document, ref_index
+                )
+                song = applied_delta.song
+                overrides = applied_delta.lyric_overrides
+                refs_resolved = applied_delta.lyric_refs_resolved
+            elif uses_lyric_refs:
                 # Splice BEFORE schema validation: the Song schema knows
                 # nothing about refs, and its charIndex rule only means
                 # something once the real text is in place.
@@ -1024,7 +1132,9 @@ def reconcile(
                 document = spliced.document
                 overrides = spliced.overrides
                 refs_resolved = spliced.refs_resolved
-            song = Song.model_validate(document)
+                song = Song.model_validate(document)
+            else:
+                song = Song.model_validate(document)
         except UnresolvableLyricRefError as e:
             # NOT repaired. A lyric with no valid provenance must not reach
             # the store, and a retry is an invitation to supply one from
@@ -1037,7 +1147,13 @@ def reconcile(
                     duration_seconds=clock() - started,
                 )
             raise LyricProvenanceError(str(e)) from e
-        except (ValidationError, ValueError, json.JSONDecodeError, LyricSpliceError) as e:
+        except (
+            ValidationError,
+            ValueError,
+            json.JSONDecodeError,
+            LyricSpliceError,
+            ReconcileDeltaError,
+        ) as e:
             last_errors = str(e)[:4000]
             log.info("reconcile attempt %d failed validation: %s", attempt, last_errors[:300])
             if trace is not None:
@@ -1048,9 +1164,14 @@ def reconcile(
                     duration_seconds=clock() - started,
                 )
             turns.append({"role": "assistant", "text": response.text})
-            turns.append(
-                {"role": "user", "text": build_repair_prompt(last_errors, uses_lyric_refs)}
-            )
+            turns.append({
+                "role": "user",
+                "text": (
+                    build_delta_repair_prompt(last_errors)
+                    if uses_reconcile_delta
+                    else build_repair_prompt(last_errors, uses_lyric_refs)
+                ),
+            })
             continue
         song, timing_strip = _finalize(
             song,
@@ -1080,6 +1201,22 @@ def reconcile(
             trace=trace,
         )
         if trace is not None:
+            if applied_delta is not None:
+                trace.set_output_format(
+                    "patch",
+                    patch_bytes=applied_delta.patch_bytes,
+                    full_bytes=applied_delta.full_bytes,
+                )
+            else:
+                full_bytes = len(
+                    json.dumps(
+                        song.model_dump(mode="json"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode()
+                )
+                trace.set_output_format("full", full_bytes=full_bytes)
             trace.step(
                 "final", "reconciled",
                 f"produced Song: {len(song.lines)} lines, "
@@ -1095,6 +1232,15 @@ def reconcile(
                         {"lineIndex": o.line_index, "reason": o.reason} for o in overrides
                     ],
                     "usage": usage,
+                    "outputFormat": output_format,
+                    "patchSizeVsFull": (
+                        {
+                            "patchBytes": applied_delta.patch_bytes,
+                            "fullBytes": applied_delta.full_bytes,
+                            "ratio": round(applied_delta.ratio, 4),
+                        }
+                        if applied_delta is not None else None
+                    ),
                 },
                 duration_seconds=clock() - started,
             )
@@ -1107,9 +1253,18 @@ def reconcile(
             usage=usage,
             trace=trace.trace if trace is not None else None,
             timing_strip=timing_strip,
+            output_format=output_format,
+            patch_size_vs_full=(
+                {
+                    "patchBytes": applied_delta.patch_bytes,
+                    "fullBytes": applied_delta.full_bytes,
+                    "ratio": round(applied_delta.ratio, 4),
+                }
+                if applied_delta is not None else None
+            ),
         )
 
     raise ReconcileError(
         f"reconciliation failed schema validation after "
-        f"{settings.llm_repair_attempts + 1} attempts; last errors: {last_errors[:1000]}"
+        f"{max_attempts} attempts; last errors: {last_errors[:1000]}"
     )

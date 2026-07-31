@@ -41,6 +41,21 @@ class VersionConflictError(StoreError):
     """The record changed since the caller last read it (optimistic-lock miss)."""
 
 
+class IdentityCollisionError(StoreError):
+    """Two distinct recordings attempted to share one permanent song id."""
+
+    code = "identity_collision"
+
+    def __init__(self, song_id: str, existing_audio_hash: str, incoming_audio_hash: str):
+        self.song_id = song_id
+        self.existing_audio_hash = existing_audio_hash
+        self.incoming_audio_hash = incoming_audio_hash
+        super().__init__(
+            f"identity collision for {song_id!r}: existing audio content hash "
+            f"{existing_audio_hash} differs from incoming {incoming_audio_hash}"
+        )
+
+
 class CorruptSongError(StoreError):
     """A stored song document exists but fails validation against the
     current Song schema (e.g. a pre-schema import that used a chord
@@ -229,6 +244,18 @@ def validate_stored_song(song_id: str, version: str | None, song_dict: dict) -> 
         return Song.model_validate(song_dict)
     except ValidationError as e:
         raise CorruptSongError(song_id, version, e) from e
+
+
+def guard_audio_identity_collision(existing_song: dict, incoming_song: Song) -> None:
+    """Refuse appending a different recording to an existing id's history.
+
+    Legacy rows may lack ``audio.contentHash``; they remain readable and can be
+    migrated, but once both sides name their bytes a mismatch is unequivocal.
+    """
+    old_hash = ((existing_song.get("audio") or {}).get("contentHash") or "").strip()
+    new_hash = (incoming_song.audio.contentHash or "").strip()
+    if old_hash and new_hash and old_hash != new_hash:
+        raise IdentityCollisionError(incoming_song.id, old_hash, new_hash)
 
 
 def check_provenance_append_only(old_song_dict: dict, new_song: Song) -> None:

@@ -7,6 +7,7 @@ stateless and deployable anywhere; a local .env is honored for development.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Dict
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -71,6 +72,10 @@ class Settings(BaseSettings):
     # + local tools (chord-sheet fetch/parse, windowed MIR). Uses the same
     # SNOOCLE_ANTHROPIC_API_KEY as the plain "anthropic" provider.
     anthropic_agent_model: str = "claude-opus-4-8"
+    # Effort-tier defaults.  `anthropic_agent_model` remains the high/legacy
+    # default and an explicit request/config model still overrides routing.
+    anthropic_agent_low_model: str = "claude-haiku-4-5"
+    anthropic_agent_standard_model: str = "claude-sonnet-5"
     anthropic_agent_max_turns: int = 12  # hard cap on agent loop iterations
     # Reasoning effort for the agent loop. "medium" keeps tool use consolidated
     # and turns fast — reconciliation is structured evidence-fusion, not
@@ -78,6 +83,30 @@ class Settings(BaseSettings):
     # (Wall-clock is dominated by effort x turns; SNOOCLE_LLM_MODEL=
     # claude-sonnet-5 is the other big speed lever.)
     anthropic_agent_effort: str = "medium"
+
+    # --- trustworthy usage accounting + hard spend ceilings ---
+    # Rates are USD per million tokens and are data, not pricing logic. The
+    # whole table is env-overridable as JSON via SNOOCLE_LLM_PRICE_TABLE.
+    llm_price_table_version: str = "anthropic-2026-07-31"
+    llm_price_table: Dict[str, Dict[str, float]] = Field(
+        default_factory=lambda: {
+            "claude-opus-4-8": {
+                "input": 5.0, "output": 25.0, "cacheWrite": 6.25, "cacheRead": 0.5,
+            },
+            "claude-sonnet-5*": {
+                "input": 2.0, "output": 10.0, "cacheWrite": 2.5, "cacheRead": 0.2,
+            },
+            "claude-sonnet-4*": {
+                "input": 3.0, "output": 15.0, "cacheWrite": 3.75, "cacheRead": 0.3,
+            },
+            "claude-haiku-4-5*": {
+                "input": 1.0, "output": 5.0, "cacheWrite": 1.25, "cacheRead": 0.1,
+            },
+        }
+    )
+    run_cost_cap_usd: float = 2.0
+    batch_cost_cap_usd: float = 10.0
+    daily_cost_cap_usd: float = 25.0
 
     # --- song identity resolution (title/artist from a media URL) ---
     # When only a YouTube URL is given, title+artist come from the video's own
@@ -107,6 +136,11 @@ class Settings(BaseSettings):
     discovery_cache_enabled: bool = True
     discovery_cache_collection: str = "discovery_cache"
     discovery_cache_ttl_days: float = 30.0
+    # Parsed sheet cache: URL pointer + URL/content-hash entry. Kept separate
+    # from query discovery so the same page found by a different query is free.
+    sources_cache_collection: str = "sources"
+    sources_cache_ttl_days: float = 30.0
+    source_prefetch_max: int = 3
 
     # --- agent-delegated reconciliation (provider "agent") ---
     # Snoocle holds no LLM keys in this mode: reconciliation is delegated to an

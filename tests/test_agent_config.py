@@ -41,7 +41,10 @@ def test_config_validation_rejects_bad_effort_and_tools():
     with pytest.raises(ValueError):
         AgentConfig(disabled_tools=["not_a_tool"])
     # valid ones pass
-    AgentConfig(effort="high", disabled_tools=["web_fetch"], max_turns=8)
+    AgentConfig(effort="high", disabled_tools=["search_and_fetch_sheet"], max_turns=8)
+    # Stored pre-restriction configs remain readable, but obsolete raw tools
+    # are discarded rather than re-exposed to the model.
+    assert AgentConfig(disabled_tools=["web_fetch"]).disabled_tools == []
 
 
 def test_is_default_and_version_fingerprint():
@@ -81,9 +84,11 @@ def test_extra_appended_and_sections_swapped():
 
 
 def test_build_tools_drops_disabled():
-    names = {t["name"] for t in _build_tools(2, 3, frozenset({"web_fetch", "analyze_audio_window"}))}
-    assert "web_fetch" not in names and "analyze_audio_window" not in names
-    assert "web_search" in names and "fetch_chord_sheet" in names
+    names = {t["name"] for t in _build_tools(
+        2, 1, frozenset({"analyze_audio_window"})
+    )}
+    assert names == {"search_and_fetch_sheet"}
+    assert {"web_search", "web_fetch", "fetch_chord_sheet"}.isdisjoint(names)
 
 
 # --- precedence (config beats depth beats settings) -------------------------
@@ -114,7 +119,7 @@ def test_config_overrides_reach_the_request(monkeypatch):
     store = InMemoryAgentConfigStore()
     store.set(AgentConfig(effort="high", model="claude-opus-4-8",
                           instructions_extra="XX-RULE-XX",
-                          disabled_tools=["web_fetch"]).model_dump())
+                          disabled_tools=["search_and_fetch_sheet"]).model_dump())
     monkeypatch.setattr("snoocle_server.store.agent_config.get_agent_config_store", lambda: store)
 
     recorder = start_run("the-beatles--let-it-be", "anthropic-agent", "standard")
@@ -125,7 +130,7 @@ def test_config_overrides_reach_the_request(monkeypatch):
     assert kw["output_config"] == {"effort": "high"}      # cfg effort
     assert kw["model"] == "claude-opus-4-8"               # cfg model
     assert "XX-RULE-XX" in kw["system"][0]["text"]        # cfg extra instructions
-    assert "web_fetch" not in {t["name"] for t in kw["tools"]}  # cfg disabled tool
+    assert "search_and_fetch_sheet" not in {t["name"] for t in kw["tools"]}
     # and the run is stamped with the config fingerprint
     assert recorder.trace.config_version is not None
 
@@ -195,7 +200,11 @@ def test_rest_instructions_append_rejects_empty_and_keeps_other_fields(client, m
     h = {"Authorization": "Bearer tok"}
     client.put("/v1/config/agent", headers=h,
                json={"effort": "high", "model": "claude-opus-4-8", "max_turns": 7,
-                     "disabled_tools": ["web_fetch"]})
+                     "disabled_tools": ["search_and_fetch_sheet"],
+                     "source_site_preferences": {
+                         "global": ["ultimate-guitar.com", "chordify.net"],
+                         "hebrew": ["tab4u.com"],
+                     }})
 
     for body in ({"add": ""}, {"add": "   "}, {}):
         assert client.post("/v1/config/agent/instructions", headers=h, json=body).status_code == 400
@@ -204,7 +213,9 @@ def test_rest_instructions_append_rejects_empty_and_keeps_other_fields(client, m
                       json={"add": "capo 0 always"}).json()["config"]
     assert cfg["instructions_extra"] == "capo 0 always"
     assert cfg["effort"] == "high" and cfg["model"] == "claude-opus-4-8"
-    assert cfg["max_turns"] == 7 and cfg["disabled_tools"] == ["web_fetch"]
+    assert cfg["max_turns"] == 7
+    assert cfg["disabled_tools"] == ["search_and_fetch_sheet"]
+    assert cfg["source_site_preferences"]["hebrew"] == ["tab4u.com"]
     # and it is what a subsequent GET reports (it was really stored)
     got = client.get("/v1/config/agent", headers=h).json()["config"]
     assert got["instructions_extra"] == "capo 0 always" and got["effort"] == "high"
@@ -221,9 +232,16 @@ def test_mcp_agent_config_tools_roundtrip(monkeypatch):
     monkeypatch.setattr(settings, "api_token", "tok")
 
     assert mcp_server.get_agent_config()["isDefault"] is True
-    out = mcp_server.set_agent_config(json.dumps({"effort": "low", "max_turns": 5}))
+    out = mcp_server.set_agent_config(json.dumps({
+        "effort": "low",
+        "max_turns": 5,
+        "source_site_preferences": {"global": ["songsterr.com"]},
+    }))
     assert out["status"] == "stored"
     assert mcp_server.get_agent_config()["config"]["effort"] == "low"
+    assert mcp_server.get_agent_config()["config"]["source_site_preferences"] == {
+        "global": ["songsterr.com"]
+    }
     mcp_server.reset_agent_config()
     assert mcp_server.get_agent_config()["isDefault"] is True
 

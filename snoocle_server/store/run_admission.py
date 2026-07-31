@@ -50,6 +50,11 @@ def evidence_hash(manifest: dict | None) -> str:
     lrc = manifest.get("lrcAlign") or {}
     request = manifest.get("request") or {}
     source_ids = sources.get("ids") or sources.get("sourceIds") or []
+    source_hashes = [
+        str(sheet.get("contentHash"))
+        for sheet in (sources.get("sheets") or [])
+        if isinstance(sheet, dict) and sheet.get("contentHash")
+    ]
     projection = {
         "mir": {
             "analyzedAt": mir.get("analyzedAt"),
@@ -58,6 +63,7 @@ def evidence_hash(manifest: dict | None) -> str:
         "sources": {
             "ids": sorted(str(value) for value in source_ids),
             "gatheredAt": sources.get("gatheredAt"),
+            "contentHashes": sorted(source_hashes),
         },
         "lrcAlign": {"fingerprint": lrc.get("fingerprint")},
         "scope": request.get("scope", manifest.get("scope")),

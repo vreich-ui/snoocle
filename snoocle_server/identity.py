@@ -37,7 +37,8 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
+from urllib.parse import unquote, urlparse
 
 from .config import settings
 
@@ -50,6 +51,43 @@ class IdentityError(ValueError):
     Deliberately fatal: a song id is permanent, so an ambiguous title is a
     reason to ask the caller for title+artist, never to guess.
     """
+
+
+class IdentityUnresolvedError(IdentityError):
+    """A caller attempted to mint or admit a non-identity.
+
+    This is deliberately structured because REST and MCP callers need to know
+    whether to ask for an artist, a title, or both.  It is also used at every
+    permanent-id boundary, so no path can recreate ``unknown--unknown``.
+    """
+
+    code = "identity_unresolved"
+
+    def __init__(
+        self,
+        *,
+        artist: str | None,
+        title: str | None,
+        evidence_tried: Iterable[str] = (),
+    ) -> None:
+        self.artist = (artist or "").strip()
+        self.title = (title or "").strip()
+        self.missing = missing_identity_fields(self.artist, self.title)
+        self.evidence_tried = list(dict.fromkeys(str(v) for v in evidence_tried if v))
+        missing = ", ".join(self.missing) or "identity"
+        evidence = ", ".join(self.evidence_tried) or "caller-supplied identity"
+        super().__init__(
+            f"identity unresolved: missing {missing}; evidence tried: {evidence}. "
+            "Provide both artist and title before creating or reconciling a song."
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "errorCode": self.code,
+            "missing": self.missing,
+            "evidenceTried": self.evidence_tried,
+            "needsIdentity": True,
+        }
 
 
 @dataclass(frozen=True)
@@ -67,6 +105,60 @@ class SongIdentity:
         if self.is_cover:
             s += f" cover-of={self.original_artist!r}"
         return s
+
+
+_UNRESOLVED_PARTS = {"", "unknown"}
+
+
+def _identity_part_is_unresolved(value: str | None) -> bool:
+    """Whether an identity component is absent or the old sentinel value."""
+    return (value or "").strip().casefold() in _UNRESOLVED_PARTS
+
+
+def missing_identity_fields(artist: str | None, title: str | None) -> list[str]:
+    missing: list[str] = []
+    if _identity_part_is_unresolved(artist):
+        missing.append("artist")
+    if _identity_part_is_unresolved(title):
+        missing.append("title")
+    return missing
+
+
+def require_resolved_identity(
+    artist: str | None,
+    title: str | None,
+    *,
+    evidence_tried: Iterable[str] = (),
+) -> tuple[str, str]:
+    """Return clean identity text or raise the canonical unresolved error."""
+    clean_artist = (artist or "").strip()
+    clean_title = (title or "").strip()
+    if missing_identity_fields(clean_artist, clean_title):
+        raise IdentityUnresolvedError(
+            artist=clean_artist,
+            title=clean_title,
+            evidence_tried=evidence_tried,
+        )
+    return clean_artist, clean_title
+
+
+def song_id_has_unknown_segment(song_id: str | None) -> bool:
+    """True for legacy ids such as ``unknown--unknown`` or ``splean--unknown``."""
+    parts = (song_id or "").casefold().split("--")
+    return len(parts) != 2 or any(part in _UNRESOLVED_PARTS for part in parts)
+
+
+def require_resolved_song_id(song_id: str | None) -> str:
+    """Reject an unresolved/legacy id before an irreversible operation."""
+    value = (song_id or "").strip()
+    if song_id_has_unknown_segment(value):
+        artist, title = (value.split("--", 1) + [""])[:2] if "--" in value else ("", "")
+        raise IdentityUnresolvedError(
+            artist=artist,
+            title=title,
+            evidence_tried=["songId validation"],
+        )
+    return value
 
 
 # --- deterministic layer ----------------------------------------------------
@@ -198,6 +290,149 @@ def split_artist_title(text: str) -> Optional[tuple[str, str, str]]:
             return artist, title, "pipe"
 
     return None
+
+
+def _usable_identity_part(value: str | None) -> str:
+    value = (value or "").strip()
+    return "" if _identity_part_is_unresolved(value) else value
+
+
+def _complete_identity(
+    current_artist: str | None,
+    current_title: str | None,
+    candidate_artist: str | None,
+    candidate_title: str | None,
+) -> tuple[str, str] | None:
+    """Fill only missing halves; supplied identity is never overwritten."""
+    artist = _usable_identity_part(current_artist) or _usable_identity_part(candidate_artist)
+    title = _usable_identity_part(current_title) or _usable_identity_part(candidate_title)
+    if not missing_identity_fields(artist, title):
+        return artist, title
+    return None
+
+
+def _media_tag_identity(meta) -> tuple[str, str] | None:
+    track = _usable_identity_part(getattr(meta, "track", None))
+    artist = _usable_identity_part(getattr(meta, "track_artist", None))
+    if track and artist:
+        return artist, track
+    return None
+
+
+def _media_title_identity(meta) -> tuple[str, str] | None:
+    raw = _usable_identity_part(getattr(meta, "video_title", None))
+    if not raw:
+        return None
+    parsed = split_artist_title(strip_title_noise(raw))
+    if parsed is None:
+        return None
+    artist, title, _ = parsed
+    return _usable_identity_part(artist), _usable_identity_part(title)
+
+
+def _lrc_identity(match) -> tuple[str, str] | None:
+    if match is None:
+        return None
+    if isinstance(match, dict):
+        title = match.get("trackName") or match.get("track_name") or match.get("title")
+        artist = match.get("artistName") or match.get("artist_name") or match.get("artist")
+    else:
+        title = getattr(match, "track_name", None) or getattr(match, "trackName", None)
+        artist = getattr(match, "artist_name", None) or getattr(match, "artistName", None)
+    title, artist = _usable_identity_part(title), _usable_identity_part(artist)
+    return (artist, title) if artist and title else None
+
+
+def _source_slug_identity(candidate) -> tuple[str, str] | None:
+    """Extract the two durable fields from a pre-gathered source.
+
+    amdm.ru's URL shape is particularly valuable here: its last two meaningful
+    path segments are artist and song title.  A source page title containing a
+    conventional ``Artist - Title`` split is the portable fallback.
+    """
+    page_title = _usable_identity_part(getattr(candidate, "title", None))
+    if page_title:
+        parsed = split_artist_title(strip_title_noise(page_title))
+        if parsed is not None:
+            artist, title, _ = parsed
+            artist, title = _usable_identity_part(artist), _usable_identity_part(title)
+            if artist and title:
+                return artist, title
+
+    raw_url = _usable_identity_part(getattr(candidate, "url", None))
+    if not raw_url:
+        return None
+    parsed_url = urlparse(raw_url)
+    host = parsed_url.netloc.casefold().removeprefix("www.")
+    parts = [unquote(part).strip() for part in parsed_url.path.split("/") if part.strip()]
+    # The site that caused the incident has a stable, unambiguous convention:
+    # /akkordi/<artist-slug>/<song-slug>/. Do not apply this heuristic to an
+    # arbitrary URL — the last two path components are not generally identity.
+    if host.endswith("amdm.ru") and len(parts) >= 3 and parts[-3].casefold() in {
+        "akkordi", "akkordy", "texts", "texty",
+    }:
+        artist, title = parts[-2].replace("-", " "), parts[-1].replace("-", " ")
+        artist, title = _usable_identity_part(artist), _usable_identity_part(title)
+        if artist and title:
+            return artist, title
+    return None
+
+
+def resolve_identity_from_evidence(
+    *,
+    artist: str | None,
+    title: str | None,
+    media_metadata=None,
+    lrc_match=None,
+    candidates: Iterable[object] = (),
+) -> SongIdentity:
+    """Resolve identity using only already-available, deterministic evidence.
+
+    The order is intentional and mirrors the incident fix: media tags first,
+    then upload-title parsing, an existing lyrics match, and finally page URL/
+    title evidence already gathered for reconciliation. No web search or model
+    call is hidden in this helper.
+    """
+    current_artist, current_title = _usable_identity_part(artist), _usable_identity_part(title)
+    tried: list[str] = []
+    if not missing_identity_fields(current_artist, current_title):
+        return SongIdentity(current_title, current_artist, 1.0, "caller")
+
+    if media_metadata is not None:
+        tried.append("media metadata tags")
+        tags = _media_tag_identity(media_metadata)
+        if tags:
+            filled = _complete_identity(current_artist, current_title, *tags)
+            if filled:
+                return SongIdentity(filled[1], filled[0], _CONF_STRUCTURED, "media-tags")
+        tried.append("media upload title")
+        parsed = _media_title_identity(media_metadata)
+        if parsed:
+            filled = _complete_identity(current_artist, current_title, *parsed)
+            if filled:
+                return SongIdentity(filled[1], filled[0], _CONF_SEPARATOR, "media-title")
+
+    tried.append("LRC/lyrics match")
+    lrc = _lrc_identity(lrc_match)
+    if lrc:
+        filled = _complete_identity(current_artist, current_title, *lrc)
+        if filled:
+            return SongIdentity(filled[1], filled[0], 0.9, "lrc-match")
+
+    candidates = list(candidates or [])
+    tried.append("gathered source URL/page title")
+    for candidate in candidates:
+        source_identity = _source_slug_identity(candidate)
+        if source_identity:
+            filled = _complete_identity(current_artist, current_title, *source_identity)
+            if filled:
+                return SongIdentity(filled[1], filled[0], 0.85, "source-slug")
+
+    raise IdentityUnresolvedError(
+        artist=current_artist,
+        title=current_title,
+        evidence_tried=tried,
+    )
 
 
 def _strip_topic(channel: str) -> str:

@@ -48,6 +48,8 @@ EXPECTED_TOOLS = {
     "calculate_recording_offset",
     "apply_deterministic_song_patch",
     "build_song_evidence_manifest",
+    "align_song_deterministically",
+    "process_song_deterministically",
     "discover_song",
     "acquire_audio",
     "analyze_audio",
@@ -162,6 +164,28 @@ async def test_mcp_tools_over_stdio(tone_wav_b64, tmp_path):
             assert parsed_payload["modelCostUSD"] == 0
             assert parsed_payload["cacheStatus"] == "not_applicable"
 
+            baseline = await session.call_tool(
+                "build_song_baseline",
+                {
+                    "candidate_json": json.dumps(parsed_payload["result"]["candidate"]),
+                    "song_id": "artist--title",
+                    "title": "Title",
+                    "artist": "Artist",
+                },
+            )
+            baseline_payload = json.loads(baseline.content[0].text)
+            aligned = await session.call_tool(
+                "align_song_deterministically",
+                {
+                    "song_json": json.dumps(baseline_payload["result"]["song"]),
+                    "mir_json": json.dumps({"duration_seconds": 4}),
+                },
+            )
+            aligned_payload = json.loads(aligned.content[0].text)
+            assert aligned_payload["ok"] is True
+            assert aligned_payload["result"]["song"]["id"] == "artist--title"
+            assert aligned_payload["modelCalls"] == 0
+
             extended = await session.call_tool(
                 "extend_mir_beat_grid",
                 {
@@ -179,6 +203,21 @@ async def test_mcp_tools_over_stdio(tone_wav_b64, tmp_path):
                 "cache": "none",
                 "persistence": "none",
             }
+
+            processed = await session.call_tool(
+                "process_song_deterministically",
+                {
+                    "title": "Title",
+                    "artist": "Artist",
+                    "mir_json": json.dumps({"duration_seconds": 1}),
+                    "candidates_json": "[]",
+                },
+            )
+            processed_payload = json.loads(processed.content[0].text)
+            assert processed_payload["ok"] is True
+            assert processed_payload["result"]["status"] == "needs_review"
+            assert processed_payload["result"]["reason"] == "no_candidate_sources"
+            assert processed_payload["modelCalls"] == 0
 
 
 def _free_port() -> int:

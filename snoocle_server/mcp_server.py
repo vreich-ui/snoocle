@@ -23,10 +23,12 @@ docs/DEPLOY_CLOUD_RUN.md). SSE is also available for older clients.
 from __future__ import annotations
 
 import base64
+import asyncio
 import dataclasses
 import json
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -45,6 +47,10 @@ from .deterministic import (
     build_song_from_candidate as _build_song_from_candidate,
     rank_candidates_deterministically as _rank_candidates_deterministically,
     select_candidate_deterministically as _select_candidate_deterministically,
+    align_song_deterministically_service as _align_song_deterministically,
+)
+from .deterministic_process import (
+    process_song_deterministically_service as _process_song_deterministically,
 )
 from .discovery import CandidateSource, discover_sources
 from .discovery.service import candidate_from_text as _candidate_from_text
@@ -60,6 +66,7 @@ from .mir import MirAnalysis, analyze_audio as _analyze_audio
 from .mir.base import Beat
 from .mir.beats import extend_beat_grid as _extend_beat_grid
 from .mir.pipeline import analyze_window as _analyze_window
+from .mir.cache import analyze_cached as _analyze_cached
 from .pipeline import PipelineStepError, get_store, run_pipeline_async
 from .reconcile import provider_capabilities
 from .reconcile.admission import reconcile_admitted
@@ -71,6 +78,7 @@ from .quality.theory import theory_validity as _theory_validity
 from .schema import Song, song_json_schema
 from .scope import AnalysisScope
 from .store import IdentityCollisionError, backend_label as _store_backend_label
+from .store.base import StoreError, VersionConflictError
 from .store.identity_rename import rename_song_identity
 from .store.runs import get_run_store
 from .timing.carry_forward import carry_forward_timing as _carry_forward_timing
@@ -1146,6 +1154,521 @@ def build_song_evidence_manifest(
             "sourceCount": result["manifest"].get("sources", {}).get("count", 0),
             "lrcStatus": result["manifest"].get("lrcAlign", {}).get("status"),
         },
+    )
+
+
+# --- deterministic orchestration tools -------------------------------------
+
+
+def _optional_candidates_payload(value: str | None) -> list[CandidateSource] | None:
+    return _candidate_list_payload(value) if value is not None else None
+
+
+def _optional_lrc_payload(value: str | None) -> list[LrcLine] | None:
+    return _lrc_payload(value) if value is not None else None
+
+
+def _persistence_expected_version(persist: bool, expected_version: str | None) -> str | None:
+    if persist and expected_version is None:
+        raise _MCPDeterministicInputError(
+            "missing_expected_version",
+            "expected_version is required when persist=true; use an empty string for create-only",
+        )
+    if not persist and expected_version is not None:
+        raise _MCPDeterministicInputError(
+            "unexpected_expected_version",
+            "expected_version is only valid when persist=true",
+        )
+    return expected_version or None
+
+
+def _save_deterministic_song(song: Song, expected_version: str | None, message: str) -> dict:
+    try:
+        saved = get_store().save(
+            song,
+            message,
+            expected_version=expected_version,
+            enforce_expected=True,
+        )
+    except VersionConflictError as error:
+        raise _MCPDeterministicInputError(
+            "version_conflict",
+            str(error),
+            expectedVersion=expected_version,
+            currentVersion=get_store().current_version(song.id),
+        ) from error
+    except StoreError as error:
+        raise _MCPDeterministicInputError("store_rejected", str(error)) from error
+    return dataclasses.asdict(saved)
+
+
+def _save_deterministic_trace(
+    *,
+    run_type: str,
+    song_id: str,
+    status: str,
+    reason: str | None,
+    stages: list[dict],
+    totals: dict,
+    cache: dict,
+    report: dict | None = None,
+    quality: dict | None = None,
+    persistence: dict | None = None,
+) -> str:
+    run_id = str(uuid.uuid4())
+    timestamp = _now_iso()
+    trace = {
+        "runId": run_id,
+        "runType": run_type,
+        "songId": song_id,
+        "status": status,
+        "reason": reason,
+        "startedAt": timestamp,
+        "finishedAt": timestamp,
+        "steps": stages,
+        "totals": totals,
+        "cache": cache,
+        "alignmentReport": report,
+        "quality": quality,
+        "persistence": persistence or {"requested": False, "stored": False},
+        "modelCalls": 0,
+        "modelCostUSD": 0,
+        "usageReliable": True,
+    }
+    get_run_store().save_run(trace)
+    return run_id
+
+
+def _overall_cache_status(cache: dict[str, str]) -> str:
+    statuses = set(cache.values())
+    if statuses & {"miss", "refresh", "disabled"}:
+        return "miss"
+    if "hit" in statuses:
+        return "hit"
+    return "not_applicable"
+
+
+def _alignment_status(result) -> tuple[str, str | None]:
+    verdict = result.quality.grade.verdict
+    if verdict == "fail":
+        return "needs_review", "quality_gate_failed"
+    if verdict == "unknown":
+        return "needs_review", "quality_evidence_insufficient"
+    if result.review_queue:
+        return "needs_review", "low_confidence_placements"
+    return "completed", None
+
+
+def _resolve_alignment_song(
+    song_json: str | None, song_id: str | None, song_version: str | None
+) -> tuple[Song, str | None, str]:
+    if (song_json is None) == (song_id is None):
+        raise _MCPDeterministicInputError(
+            "invalid_song_source", "provide exactly one of song_json or song_id"
+        )
+    if song_json is not None:
+        if song_version is not None:
+            raise _MCPDeterministicInputError(
+                "unexpected_song_version", "song_version requires song_id"
+            )
+        song = _song_payload(song_json)
+        return song, None, "caller"
+    try:
+        song = get_store().get(song_id, song_version)
+    except StoreError as error:
+        raise _MCPDeterministicInputError("song_not_found", str(error)) from error
+    loaded_version = song_version or get_store().current_version(song.id)
+    return song, loaded_version, "store"
+
+
+def _resolve_alignment_mir(
+    *,
+    mir_json: str | None,
+    cached_mir_json: str | None,
+    audio_path: str | None,
+    recording_id: str | None,
+    mir_accuracy: str,
+    refresh_mir_cache: bool,
+) -> tuple[MirAnalysis | None, dict[str, str], str | None]:
+    sources = sum(
+        value is not None for value in (mir_json, cached_mir_json, audio_path, recording_id)
+    )
+    if sources > 1:
+        raise _MCPDeterministicInputError(
+            "invalid_mir_source",
+            "provide at most one of mir_json, cached_mir_json, audio_path, or recording_id",
+        )
+    cache = {"audio": "not_applicable", "mir": "not_applicable"}
+    if mir_json is not None:
+        return _mir_payload(mir_json), cache, None
+    if cached_mir_json is not None:
+        cache["mir"] = "hit"
+        return _mir_payload(cached_mir_json), cache, None
+    path: str | None = None
+    resolved_recording_id = recording_id
+    if audio_path is not None:
+        path = str(_existing_path(audio_path, label="audio_path"))
+    elif recording_id is not None:
+        acquired = _acquire(video_url_or_id=recording_id)
+        path = acquired.path
+        resolved_recording_id = acquired.video_id
+        cache["audio"] = "hit" if acquired.from_cache else "miss"
+    if path is None:
+        return None, cache, resolved_recording_id
+    mir, info = _analyze_cached(
+        path,
+        accuracy=mir_accuracy,
+        compute=lambda: _analyze_audio(path, accuracy=mir_accuracy),
+        refresh=refresh_mir_cache,
+    )
+    cache["mir"] = info.status
+    return mir, cache, resolved_recording_id
+
+
+def _align_song_worker(
+    *,
+    song_json: str | None,
+    song_id: str | None,
+    song_version: str | None,
+    mir_json: str | None,
+    cached_mir_json: str | None,
+    audio_path: str | None,
+    recording_id: str | None,
+    candidates_json: str,
+    lrc_json: str | None,
+    use_lrc: bool,
+    mir_accuracy: str,
+    refresh_mir_cache: bool,
+    persist: bool,
+    expected_version: str | None,
+) -> dict:
+    def call() -> dict:
+        expected = _persistence_expected_version(persist, expected_version)
+        song, loaded_version, song_source = _resolve_alignment_song(
+            song_json, song_id, song_version
+        )
+        mir, cache, resolved_recording_id = _resolve_alignment_mir(
+            mir_json=mir_json,
+            cached_mir_json=cached_mir_json,
+            audio_path=audio_path,
+            recording_id=recording_id,
+            mir_accuracy=mir_accuracy,
+            refresh_mir_cache=refresh_mir_cache,
+        )
+        candidates = _candidate_list_payload(candidates_json)
+        lrc_lines = _optional_lrc_payload(lrc_json)
+        result = _align_song_deterministically(
+            song,
+            mir,
+            candidates=candidates,
+            lrc_lines=lrc_lines,
+            use_lrc=use_lrc,
+            document_version=loaded_version,
+        )
+        payload = result.to_dict()
+        status, reason = _alignment_status(result)
+        persisted = {"requested": persist, "stored": False}
+        if persist:
+            try:
+                saved = _save_deterministic_song(
+                    result.song, expected, "Deterministic alignment"
+                )
+            except _MCPDeterministicInputError as error:
+                failed_persistence = {
+                    "requested": True,
+                    "stored": False,
+                    "errorCode": error.code,
+                }
+                _save_deterministic_trace(
+                    run_type="deterministic-align",
+                    song_id=result.song.id,
+                    status="failed",
+                    reason=error.code,
+                    stages=payload["stages"],
+                    totals=payload["totals"],
+                    cache=cache,
+                    report=payload["alignmentReport"],
+                    quality=payload["quality"],
+                    persistence=failed_persistence,
+                )
+                raise
+            persisted = {"requested": True, "stored": True, **saved}
+        payload.update(
+            {
+                "status": status,
+                "reason": reason,
+                "cache": cache,
+                "songSource": song_source,
+                "recordingId": resolved_recording_id,
+                "persistence": persisted,
+            }
+        )
+        run_id = _save_deterministic_trace(
+            run_type="deterministic-align",
+            song_id=result.song.id,
+            status=status,
+            reason=reason,
+            stages=payload["stages"],
+            totals=payload["totals"],
+            cache=cache,
+            report=payload["alignmentReport"],
+            quality=payload["quality"],
+            persistence=persisted,
+        )
+        payload["runId"] = run_id
+        return payload
+
+    network = []
+    if recording_id is not None:
+        network.append("audio_acquisition")
+    if use_lrc and lrc_json is None:
+        network.append("lrclib")
+    response = _deterministic_mcp_response(
+        "align_song_deterministically",
+        {
+            "songSource": "json" if song_json is not None else "store",
+            "mirSource": (
+                "json" if mir_json is not None else
+                "cache" if cached_mir_json is not None else
+                "audio" if audio_path is not None else
+                "recording" if recording_id is not None else "none"
+            ),
+            "persist": persist,
+        },
+        call,
+        lambda result: {
+            "status": result["status"],
+            "songId": result["song"]["id"],
+            "qualityVerdict": result["quality"]["grade"]["verdict"],
+            "reviewItems": len(result["reviewQueue"]),
+            "stored": result["persistence"]["stored"],
+        },
+        network_access=",".join(network) or "none",
+        cache_access="mir,audio" if audio_path is not None or recording_id is not None else "none",
+        persistence="run_trace_and_optional_song",
+    )
+    if response["ok"]:
+        response["cacheStatus"] = _overall_cache_status(response["result"]["cache"])
+    return response
+
+
+@mcp.tool()
+async def align_song_deterministically(
+    song_json: str = "",
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+    mir_json: str = "",
+    cached_mir_json: str = "",
+    audio_path: Optional[str] = None,
+    recording_id: Optional[str] = None,
+    candidates_json: str = "[]",
+    lrc_json: str = "",
+    use_lrc: bool = False,
+    mir_accuracy: Literal["standard", "thorough"] = "standard",
+    refresh_mir_cache: bool = False,
+    persist: bool = False,
+    expected_version: Optional[str] = None,
+) -> dict:
+    """Run snap→LRC→sections→collapse→confidence→quality without a model.
+
+    Song persistence is opt-in and requires explicit optimistic locking. A
+    bounded run trace is always persisted. Blocking acquisition/MIR work runs
+    in a worker thread rather than on the MCP async event loop.
+    """
+    return await asyncio.to_thread(
+        _align_song_worker,
+        song_json=song_json or None,
+        song_id=song_id,
+        song_version=song_version,
+        mir_json=mir_json or None,
+        cached_mir_json=cached_mir_json or None,
+        audio_path=audio_path,
+        recording_id=recording_id,
+        candidates_json=candidates_json,
+        lrc_json=lrc_json or None,
+        use_lrc=use_lrc,
+        mir_accuracy=mir_accuracy,
+        refresh_mir_cache=refresh_mir_cache,
+        persist=persist,
+        expected_version=expected_version,
+    )
+
+
+def _process_song_worker(
+    *,
+    title: str,
+    artist: str,
+    audio_path: str | None,
+    recording_id: str | None,
+    mir_json: str | None,
+    candidates_json: str | None,
+    lrc_json: str | None,
+    use_lrc: bool,
+    selection_strategy: str,
+    max_candidates: int,
+    mir_accuracy: str,
+    refresh_mir_cache: bool,
+    refresh_discovery_cache: bool,
+    persist: bool,
+    expected_version: str | None,
+) -> dict:
+    def call() -> dict:
+        expected = _persistence_expected_version(persist, expected_version)
+        if len(title) > 500 or len(artist) > 500:
+            raise _MCPDeterministicInputError(
+                "input_too_long", "title and artist are limited to 500 characters"
+            )
+        if not 1 <= max_candidates <= MAX_CANDIDATES:
+            raise _MCPDeterministicInputError(
+                "invalid_candidate_limit",
+                f"max_candidates must be between 1 and {MAX_CANDIDATES}",
+            )
+        if selection_strategy not in {"best", "strict"}:
+            raise _MCPDeterministicInputError(
+                "invalid_selection_strategy", "selection_strategy must be best or strict"
+            )
+        candidates = _optional_candidates_payload(candidates_json)
+        lrc_lines = _optional_lrc_payload(lrc_json)
+        mir = _mir_payload(mir_json)
+        resolved_audio_path = (
+            str(_existing_path(audio_path, label="audio_path"))
+            if audio_path is not None
+            else None
+        )
+        result = _process_song_deterministically(
+            title=title,
+            artist=artist,
+            audio_path=resolved_audio_path,
+            recording_id=recording_id,
+            mir=mir,
+            candidates=candidates,
+            lrc_lines=lrc_lines,
+            use_lrc=use_lrc,
+            selection_strategy=selection_strategy,
+            max_candidates=max_candidates,
+            mir_accuracy=mir_accuracy,
+            refresh_mir_cache=refresh_mir_cache,
+            refresh_discovery_cache=refresh_discovery_cache,
+        )
+        payload = result.to_dict()
+        persisted = {"requested": persist, "stored": False}
+        if persist and result.alignment is not None:
+            try:
+                saved = _save_deterministic_song(
+                    result.alignment.song, expected, "Deterministic processing"
+                )
+            except _MCPDeterministicInputError as error:
+                failed_persistence = {
+                    "requested": True,
+                    "stored": False,
+                    "errorCode": error.code,
+                }
+                _save_deterministic_trace(
+                    run_type="deterministic-process",
+                    song_id=result.song_id,
+                    status="failed",
+                    reason=error.code,
+                    stages=payload["stages"],
+                    totals=payload["totals"],
+                    cache=payload["cache"],
+                    report=payload.get("alignmentReport"),
+                    quality=payload.get("quality"),
+                    persistence=failed_persistence,
+                )
+                raise
+            persisted = {"requested": True, "stored": True, **saved}
+        elif persist:
+            persisted["reason"] = "song_not_produced"
+        payload["persistence"] = persisted
+        run_id = _save_deterministic_trace(
+            run_type="deterministic-process",
+            song_id=result.song_id,
+            status=result.status,
+            reason=result.reason,
+            stages=payload["stages"],
+            totals=payload["totals"],
+            cache=payload["cache"],
+            report=payload.get("alignmentReport"),
+            quality=payload.get("quality"),
+            persistence=persisted,
+        )
+        payload["runId"] = run_id
+        return payload
+
+    network = []
+    if audio_path is None and mir_json is None:
+        network.append("audio_acquisition")
+    if candidates_json is None:
+        network.append("discovery")
+    if use_lrc and lrc_json is None:
+        network.append("lrclib")
+    response = _deterministic_mcp_response(
+        "process_song_deterministically",
+        {
+            "title": title,
+            "artist": artist,
+            "callerAudio": audio_path is not None,
+            "callerMir": mir_json is not None,
+            "callerCandidates": candidates_json is not None,
+            "persist": persist,
+        },
+        call,
+        lambda result: {
+            "status": result["status"],
+            "songId": result["songId"],
+            "reason": result["reason"],
+            "stored": result["persistence"]["stored"],
+        },
+        network_access=",".join(network) or "none",
+        cache_access="audio,mir,discovery",
+        persistence="run_trace_and_optional_song",
+    )
+    if response["ok"]:
+        response["cacheStatus"] = _overall_cache_status(response["result"]["cache"])
+    return response
+
+
+@mcp.tool()
+async def process_song_deterministically(
+    title: str,
+    artist: str,
+    audio_path: Optional[str] = None,
+    recording_id: Optional[str] = None,
+    mir_json: str = "",
+    candidates_json: str = "",
+    lrc_json: str = "",
+    use_lrc: bool = False,
+    selection_strategy: Literal["best", "strict"] = "strict",
+    max_candidates: int = 8,
+    mir_accuracy: Literal["standard", "thorough"] = "standard",
+    refresh_mir_cache: bool = False,
+    refresh_discovery_cache: bool = False,
+    persist: bool = False,
+    expected_version: Optional[str] = None,
+) -> dict:
+    """Build and align a Song through the complete deterministic pipeline.
+
+    The tool never calls reconciliation or a model provider. Song persistence
+    is opt-in with an explicit expected version; run traces are always saved.
+    All blocking acquisition, discovery, and MIR work runs in a worker thread.
+    """
+    return await asyncio.to_thread(
+        _process_song_worker,
+        title=title,
+        artist=artist,
+        audio_path=audio_path,
+        recording_id=recording_id,
+        mir_json=mir_json or None,
+        candidates_json=candidates_json or None,
+        lrc_json=lrc_json or None,
+        use_lrc=use_lrc,
+        selection_strategy=selection_strategy,
+        max_candidates=max_candidates,
+        mir_accuracy=mir_accuracy,
+        refresh_mir_cache=refresh_mir_cache,
+        refresh_discovery_cache=refresh_discovery_cache,
+        persist=persist,
+        expected_version=expected_version,
     )
 
 

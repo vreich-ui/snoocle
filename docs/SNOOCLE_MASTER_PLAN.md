@@ -34,7 +34,7 @@ This plan is written to be executed **task by task by a less capable model**. Ev
 - **Key gap:** MIR produces a full chord timeline with timestamps, but the reconciled Song only keeps **line-level** times in `syncMap`. Chord-level timing is discarded.
 - **Agent hooks that already exist:** `agent` provider = Snoocle acts as MCP *client* calling one tool (`SNOOCLE_AGENT_MCP_TOOL`, default `reconcile_song`) at `SNOOCLE_AGENT_MCP_URL`; re-runs send `prior_song` + human `guidance`; gold versions + scorecard (`/v1/eval/scorecard`); agent workbench (instructions/tools/budgets) in the web UI; full run traces.
 - **Web UI** (`ui/`): dependency-free vanilla JS admin — song list, Edit (bracket-text editing, sections), Agent (run trace + MIR timeline viz), Versions (diff, gold), Play (static sheet + plain YouTube embed; `autoScrollTo()` is a stub), Scorecard, Workbench.
-- **MCP:** 38 step-scoped tools embedded at `/mcp`, including 22 model-free
+- **MCP:** 40 step-scoped tools embedded at `/mcp`, including 24 model-free
   source/candidate/baseline and MIR/timing/quality/evidence operations.
 
 ### iOS app (SwiftUI, iPad-first, works on iPhone)

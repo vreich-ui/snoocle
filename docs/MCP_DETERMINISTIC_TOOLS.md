@@ -1,9 +1,10 @@
 # Deterministic MCP tools
 
-Twenty-two MCP tools expose Snoocle's model-free deterministic core: six
+Twenty-four MCP tools expose Snoocle's model-free deterministic core: six
 source-to-baseline operations and sixteen MIR, timing, quality, patch, and
-evidence leaves. All are persistence-free and cache-free. Only `lookup_lrc`
-uses the network, and it is identified as such in every response.
+evidence leaves, plus two orchestrators. The leaf tools are persistence-free
+and cache-free. Only `lookup_lrc` uses the network at the leaf layer, and it is
+identified as such in every response.
 
 Every response has the same envelope:
 
@@ -62,6 +63,27 @@ never acquire recordings implicitly. No leaf accepts a persistence flag,
 because none writes state. Consequently expected-version locking is not
 applicable at this layer. Persistence and optimistic locking belong to the
 explicit orchestrator/store boundary.
+
+## Deterministic orchestrators
+
+| MCP tool | Composition | Inputs and persistence |
+|---|---|---|
+| `align_song_deterministically` | snap → optional LRC → section timing → collapse guard → confidence/review queue → quality/fault attribution | Caller Song JSON or stored song/version; caller/cached MIR JSON, local audio, or recording ID; optional candidates/LRC. Song writes require `persist=true` and explicit `expected_version` (`""` means create-only). |
+| `process_song_deterministically` | identity → acquire/cache → MIR/cache → discovery/cache → ranking/selection → baseline → full deterministic alignment → optional store | Title/artist plus caller audio/recording/MIR/candidates/LRC. Song writes use the same explicit optimistic-lock contract. |
+
+Both tools return `status=needs_review` with a stable `reason` when evidence
+cannot safely produce a complete answer. Their results include ordered stage
+observations, cache status by subsystem, total elapsed/model usage, compact
+candidate or placement conflicts, matched/unmatched chord totals, line and
+section timing coverage, interpolation share, collapse interventions, review
+queue, quality verdict, and fault attribution. Blocking acquisition,
+discovery, and MIR work runs outside the async MCP event loop.
+
+Every orchestration call persists a bounded run trace containing those stage
+observations. This operational trace is separate from opt-in Song persistence;
+the response advertises `persistence=run_trace_and_optional_song`. Neither
+orchestrator imports or invokes reconciliation or any model provider, and all
+stage and aggregate usage fields remain zero.
 
 `*_json` inputs are JSON strings. A candidate input is one `CandidateSource`
 object; a ranking or selection input is an array of those objects; MIR is one

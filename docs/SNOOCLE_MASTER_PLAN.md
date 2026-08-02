@@ -34,7 +34,8 @@ This plan is written to be executed **task by task by a less capable model**. Ev
 - **Key gap:** MIR produces a full chord timeline with timestamps, but the reconciled Song only keeps **line-level** times in `syncMap`. Chord-level timing is discarded.
 - **Agent hooks that already exist:** `agent` provider = Snoocle acts as MCP *client* calling one tool (`SNOOCLE_AGENT_MCP_TOOL`, default `reconcile_song`) at `SNOOCLE_AGENT_MCP_URL`; re-runs send `prior_song` + human `guidance`; gold versions + scorecard (`/v1/eval/scorecard`); agent workbench (instructions/tools/budgets) in the web UI; full run traces.
 - **Web UI** (`ui/`): dependency-free vanilla JS admin — song list, Edit (bracket-text editing, sections), Agent (run trace + MIR timeline viz), Versions (diff, gold), Play (static sheet + plain YouTube embed; `autoScrollTo()` is a stub), Scorecard, Workbench.
-- **MCP:** 16 step-scoped tools embedded at `/mcp`.
+- **MCP:** 22 step-scoped tools embedded at `/mcp`, including six model-free
+  source/candidate/baseline operations.
 
 ### iOS app (SwiftUI, iPad-first, works on iPhone)
 - Library, Add song (server pipeline trigger), song detail w/ chords-over-lyrics sheet (`WrappedChordLineView`), practice scroll engine: `SyncTimeline` (line start times) + `TimedScrollModel` (hold-at-top through intro ✔, glide between close lines, hold across instrumental gaps, medianGap-derived policy) + `PracticeScrollView` (UIScrollView + CADisplayLink easing) + `PracticeClock` (clock playhead w/ rate 0.6–1.4 when no video). YouTube player via embedded web player (`YouTubePlayerController`), cookies harvesting, background upload/analysis jobs, versions/diff/run-trace views, extensive self-tests.

@@ -31,6 +31,23 @@ EXPECTED_TOOLS = {
     "select_candidate_deterministically",
     "build_song_baseline",
     "validate_song_json",
+    # deterministic MIR/timing/quality/evidence leaves
+    "analyze_full_track_mir",
+    "analyze_mir_window",
+    "extend_mir_beat_grid",
+    "snap_song_to_mir",
+    "carry_forward_song_timing",
+    "lookup_lrc",
+    "match_lrc_to_song",
+    "apply_lrc_to_song",
+    "retime_song_sections",
+    "guard_song_timing_collapse",
+    "score_song_confidence",
+    "evaluate_song_quality",
+    "validate_song_theory",
+    "calculate_recording_offset",
+    "apply_deterministic_song_patch",
+    "build_song_evidence_manifest",
     "discover_song",
     "acquire_audio",
     "analyze_audio",
@@ -144,6 +161,24 @@ async def test_mcp_tools_over_stdio(tone_wav_b64, tmp_path):
             assert parsed_payload["modelCalls"] == 0
             assert parsed_payload["modelCostUSD"] == 0
             assert parsed_payload["cacheStatus"] == "not_applicable"
+
+            extended = await session.call_tool(
+                "extend_mir_beat_grid",
+                {
+                    "beats_json": json.dumps(
+                        [{"time": float(index), "position": index % 4 + 1} for index in range(16)]
+                    ),
+                    "duration_seconds": 20,
+                },
+            )
+            extended_payload = json.loads(extended.content[0].text)
+            assert extended_payload["ok"] is True
+            assert extended_payload["modelCalls"] == 0
+            assert extended_payload["access"] == {
+                "network": "none",
+                "cache": "none",
+                "persistence": "none",
+            }
 
 
 def _free_port() -> int:

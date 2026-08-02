@@ -53,7 +53,14 @@ def _confidence(sheet) -> float:
     return round(min(score, 0.95), 3)
 
 
-def candidate_from_text(text: str, source_id: str, url: str | None = None, title: str | None = None) -> CandidateSource | None:
+def candidate_from_text(
+    text: str,
+    source_id: str,
+    url: str | None = None,
+    title: str | None = None,
+    *,
+    retrieved_at: str | None = None,
+) -> CandidateSource | None:
     sheet = parse_chord_sheet(text)
     if not sheet.is_plausible:
         return None
@@ -73,7 +80,9 @@ def candidate_from_text(text: str, source_id: str, url: str | None = None, title
         sourceId=source_id,
         url=url,
         title=title,
-        retrievedAt=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        retrievedAt=(
+            retrieved_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+        ),
         declaredCapo=sheet.declared_capo,
         declaredKey=sheet.declared_key,
         confidence=confidence,

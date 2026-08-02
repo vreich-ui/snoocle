@@ -118,7 +118,7 @@ snoocle_server/
 │                    ALSO embeds the MCP transport at /mcp (single-service
 │                    topology) — imports the FastMCP instance, runs its
 │                    session manager in the app lifespan, registers the route
-└── mcp_server.py    MCP surface (16 step-scoped tools; base64 fallback for
+└── mcp_server.py    MCP surface (22 step-scoped tools; base64 fallback for
                      binary; save-if-version-unchanged exposed). Defaults to
                      stdio (local subprocess use); SNOOCLE_MCP_TRANSPORT=
                      streamable-http serves it as a standalone HTTP process.

@@ -24,6 +24,13 @@ from mcp.client.streamable_http import streamablehttp_client
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
 EXPECTED_TOOLS = {
+    # deterministic source/candidate/baseline boundary
+    "parse_candidate_text",
+    "score_candidate_against_mir",
+    "rank_candidates_deterministically",
+    "select_candidate_deterministically",
+    "build_song_baseline",
+    "validate_song_json",
     "discover_song",
     "acquire_audio",
     "analyze_audio",
@@ -124,6 +131,19 @@ async def test_mcp_tools_over_stdio(tone_wav_b64, tmp_path):
 
             schema = await session.call_tool("get_song_schema", {})
             assert "chordPlacements" in schema.content[0].text
+
+            parsed = await session.call_tool(
+                "parse_candidate_text",
+                {
+                    "source_id": "caller-sheet",
+                    "text": "[Verse]\n[C]one\n[G]two\n[Am]three\n[F]four",
+                },
+            )
+            parsed_payload = json.loads(parsed.content[0].text)
+            assert parsed_payload["ok"] is True
+            assert parsed_payload["modelCalls"] == 0
+            assert parsed_payload["modelCostUSD"] == 0
+            assert parsed_payload["cacheStatus"] == "not_applicable"
 
 
 def _free_port() -> int:

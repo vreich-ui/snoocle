@@ -26,16 +26,28 @@ import base64
 import dataclasses
 import json
 import tempfile
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import ValidationError
 
 from . import __version__
 from .audio import utils as audio_utils
 from .audio.acquire import acquire as _acquire
 from .config import settings
+from .deterministic import (
+    MAX_CANDIDATES,
+    MAX_JSON_BYTES,
+    MAX_LINES,
+    DeterministicPipelineError,
+    build_song_from_candidate as _build_song_from_candidate,
+    rank_candidates_deterministically as _rank_candidates_deterministically,
+    select_candidate_deterministically as _select_candidate_deterministically,
+)
 from .discovery import CandidateSource, discover_sources
+from .discovery.service import candidate_from_text as _candidate_from_text
 from .identity import (
     IdentityUnresolvedError,
     require_resolved_song_id,
@@ -46,6 +58,7 @@ from .mir import MirAnalysis, analyze_audio as _analyze_audio
 from .pipeline import PipelineStepError, get_store, run_pipeline_async
 from .reconcile import provider_capabilities
 from .reconcile.admission import reconcile_admitted
+from .reconcile.match import score_candidate as _score_candidate
 from .schema import Song, song_json_schema
 from .scope import AnalysisScope
 from .store import IdentityCollisionError, backend_label as _store_backend_label
@@ -66,6 +79,203 @@ def _identity_collision_error(error: IdentityCollisionError) -> dict:
     return {"detail": str(error), "errorCode": error.code}
 
 
+class _MCPDeterministicInputError(ValueError):
+    def __init__(self, code: str, message: str, **details: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+
+def _bounded_payload(value: str, *, label: str) -> None:
+    size = len(value.encode("utf-8"))
+    if size > MAX_JSON_BYTES:
+        raise _MCPDeterministicInputError(
+            "payload_too_large",
+            f"{label} payload is {size} bytes; limit is {MAX_JSON_BYTES}",
+            actualBytes=size,
+            maxBytes=MAX_JSON_BYTES,
+        )
+
+
+def _bounded_text_lines(value: str, *, label: str) -> int:
+    _bounded_payload(value, label=label)
+    line_count = len(value.splitlines())
+    if line_count > MAX_LINES:
+        raise _MCPDeterministicInputError(
+            "too_many_lines",
+            f"{label} has {line_count} lines; limit is {MAX_LINES}",
+            actualLines=line_count,
+            maxLines=MAX_LINES,
+        )
+    return line_count
+
+
+def _required_text(value: str, *, label: str, max_chars: int = 500) -> str:
+    if not value.strip():
+        raise _MCPDeterministicInputError(
+            "missing_required_input", f"{label} must not be empty", field=label
+        )
+    if len(value) > max_chars:
+        raise _MCPDeterministicInputError(
+            "input_too_long",
+            f"{label} has {len(value)} characters; limit is {max_chars}",
+            field=label,
+            actualCharacters=len(value),
+            maxCharacters=max_chars,
+        )
+    return value
+
+
+def _json_payload(value: str, *, label: str, expected: type) -> object:
+    _bounded_payload(value, label=label)
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise _MCPDeterministicInputError(
+            "invalid_json",
+            f"{label} is not valid JSON",
+            line=error.lineno,
+            column=error.colno,
+        ) from error
+    if not isinstance(parsed, expected):
+        expected_name = "object" if expected is dict else "array"
+        raise _MCPDeterministicInputError(
+            "invalid_json_shape",
+            f"{label} must be a JSON {expected_name}",
+            expected=expected_name,
+        )
+    return parsed
+
+
+def _candidate_payload(value: str) -> CandidateSource:
+    parsed = _json_payload(value, label="candidate_json", expected=dict)
+    candidate = CandidateSource.model_validate(parsed)
+    if len(candidate.lines) > MAX_LINES:
+        raise _MCPDeterministicInputError(
+            "too_many_lines",
+            f"candidate has {len(candidate.lines)} lines; limit is {MAX_LINES}",
+            actualLines=len(candidate.lines),
+            maxLines=MAX_LINES,
+        )
+    return candidate
+
+
+def _candidate_list_payload(value: str) -> list[CandidateSource]:
+    parsed = _json_payload(value, label="candidates_json", expected=list)
+    if len(parsed) > MAX_CANDIDATES:
+        raise _MCPDeterministicInputError(
+            "too_many_candidates",
+            f"candidate count {len(parsed)} exceeds the limit of {MAX_CANDIDATES}",
+            actualCandidates=len(parsed),
+            maxCandidates=MAX_CANDIDATES,
+        )
+    candidates = [CandidateSource.model_validate(item) for item in parsed]
+    for candidate in candidates:
+        if len(candidate.lines) > MAX_LINES:
+            raise _MCPDeterministicInputError(
+                "too_many_lines",
+                f"candidate {candidate.sourceId!r} has {len(candidate.lines)} lines; "
+                f"limit is {MAX_LINES}",
+                sourceId=candidate.sourceId,
+                actualLines=len(candidate.lines),
+                maxLines=MAX_LINES,
+            )
+    return candidates
+
+
+def _mir_payload(value: str | None) -> MirAnalysis | None:
+    if value is None:
+        return None
+    parsed = _json_payload(value, label="mir_json", expected=dict)
+    return MirAnalysis.model_validate(parsed)
+
+
+def _validation_details(error: ValidationError) -> list[dict]:
+    return json.loads(error.json(include_input=False, include_url=False))
+
+
+def _deterministic_mcp_response(
+    operation: str,
+    input_summary: dict,
+    call: Callable[[], dict],
+    summarize: Callable[[dict], dict],
+) -> dict:
+    start = time.perf_counter()
+    try:
+        result = call()
+    except _MCPDeterministicInputError as error:
+        elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
+        return {
+            "ok": False,
+            "error": {"code": error.code, "message": str(error), "details": error.details},
+            "elapsedMs": elapsed_ms,
+            "cacheStatus": "not_applicable",
+            "modelCalls": 0,
+            "modelCostUSD": 0,
+            "inputSummary": input_summary,
+            "outputSummary": {"status": "error", "operation": operation},
+            "warnings": [],
+        }
+    except ValidationError as error:
+        elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
+        return {
+            "ok": False,
+            "error": {
+                "code": "schema_validation_failed",
+                "message": "input does not conform to the required schema",
+                "details": {"issues": _validation_details(error)},
+            },
+            "elapsedMs": elapsed_ms,
+            "cacheStatus": "not_applicable",
+            "modelCalls": 0,
+            "modelCostUSD": 0,
+            "inputSummary": input_summary,
+            "outputSummary": {"status": "error", "operation": operation},
+            "warnings": [],
+        }
+    except DeterministicPipelineError as error:
+        elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
+        return {
+            "ok": False,
+            "error": {"code": "deterministic_input_error", "message": str(error)},
+            "elapsedMs": elapsed_ms,
+            "cacheStatus": "not_applicable",
+            "modelCalls": 0,
+            "modelCostUSD": 0,
+            "inputSummary": input_summary,
+            "outputSummary": {"status": "error", "operation": operation},
+            "warnings": [],
+        }
+    except Exception:  # noqa: BLE001 - MCP callers receive a stable error, never a traceback
+        elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
+        return {
+            "ok": False,
+            "error": {
+                "code": "deterministic_operation_failed",
+                "message": f"{operation} could not be completed",
+            },
+            "elapsedMs": elapsed_ms,
+            "cacheStatus": "not_applicable",
+            "modelCalls": 0,
+            "modelCostUSD": 0,
+            "inputSummary": input_summary,
+            "outputSummary": {"status": "error", "operation": operation},
+            "warnings": [],
+        }
+    elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
+    return {
+        "ok": True,
+        "result": result,
+        "elapsedMs": elapsed_ms,
+        "cacheStatus": "not_applicable",
+        "modelCalls": 0,
+        "modelCostUSD": 0,
+        "inputSummary": input_summary,
+        "outputSummary": summarize(result),
+        "warnings": [],
+    }
+
+
 mcp = FastMCP(
     "snoocle",
     instructions=(
@@ -73,6 +283,8 @@ mcp = FastMCP(
         "discover_song -> acquire_audio -> analyze_audio -> reconcile_song, or "
         "analyze_and_store_song for the full flow with Firestore-backed, "
         "content-versioned persistence. "
+        "Model-free source tools parse, score, rank, select, build an untimed "
+        "baseline, and validate Song JSON without network or persistence. "
         "Deterministic audio utilities (convert/trim/normalize/probe) never invoke AI."
     ),
 )
@@ -100,6 +312,250 @@ def _audio_result(dst: Path, return_base64: bool) -> dict:
     if return_base64:
         out["base64"] = base64.b64encode(dst.read_bytes()).decode()
     return out
+
+
+# --- deterministic source, candidate, and baseline tools --------------------
+
+
+@mcp.tool()
+def parse_candidate_text(
+    text: str,
+    source_id: str,
+    url: Optional[str] = None,
+    title: Optional[str] = None,
+    retrieved_at: Optional[str] = None,
+) -> dict:
+    """Parse caller-supplied chord-sheet text into one CandidateSource.
+
+    Deterministic and local: no network, cache, model, or persistence access.
+    The raw text is bounded to MAX_JSON_BYTES and MAX_LINES before parsing.
+    """
+
+    def call() -> dict:
+        _bounded_text_lines(text, label="text")
+        _required_text(source_id, label="source_id", max_chars=200)
+        if url is not None and len(url) > 2_048:
+            raise _MCPDeterministicInputError(
+                "input_too_long", "url exceeds the 2048 character limit", field="url"
+            )
+        if title is not None and len(title) > 500:
+            raise _MCPDeterministicInputError(
+                "input_too_long", "title exceeds the 500 character limit", field="title"
+            )
+        if retrieved_at is not None and len(retrieved_at) > 100:
+            raise _MCPDeterministicInputError(
+                "input_too_long",
+                "retrieved_at exceeds the 100 character limit",
+                field="retrieved_at",
+            )
+        candidate = _candidate_from_text(
+            text,
+            source_id,
+            url=url,
+            title=title,
+            retrieved_at=retrieved_at or "1970-01-01T00:00:00+00:00",
+        )
+        if candidate is None:
+            raise _MCPDeterministicInputError(
+                "candidate_not_plausible",
+                "text does not contain enough chord-sheet evidence to form a candidate",
+            )
+        return {"candidate": candidate.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "parse_candidate_text",
+        {
+            "bytes": len(text.encode("utf-8")),
+            "lines": len(text.splitlines()),
+            "sourceId": source_id,
+        },
+        call,
+        lambda result: {
+            "sourceId": result["candidate"]["sourceId"],
+            "lines": len(result["candidate"]["lines"]),
+            "placements": sum(
+                len(line["chordPlacements"]) for line in result["candidate"]["lines"]
+            ),
+        },
+    )
+
+
+@mcp.tool()
+def score_candidate_against_mir(candidate_json: str, mir_json: str) -> dict:
+    """Score one CandidateSource against MIR across all 12 transpositions.
+
+    Deterministic and local: no network, cache, model, or persistence access.
+    """
+
+    def call() -> dict:
+        candidate = _candidate_payload(candidate_json)
+        mir = _mir_payload(mir_json)
+        score = _score_candidate(candidate, mir)
+        return {
+            "sourceId": score.source_id,
+            "score": round(score.score, 6),
+            "transposition": score.transposition,
+            "matched": score.matched,
+            "total": score.total,
+            "conflicts": score.conflicts,
+        }
+
+    return _deterministic_mcp_response(
+        "score_candidate_against_mir",
+        {
+            "candidateBytes": len(candidate_json.encode("utf-8")),
+            "mirBytes": len(mir_json.encode("utf-8")),
+        },
+        call,
+        lambda result: {
+            "sourceId": result["sourceId"],
+            "matched": result["matched"],
+            "total": result["total"],
+            "transposition": result["transposition"],
+        },
+    )
+
+
+@mcp.tool()
+def rank_candidates_deterministically(
+    candidates_json: str, mir_json: Optional[str] = None
+) -> dict:
+    """Rank bounded CandidateSources using the deterministic core service.
+
+    MIR is optional. The tool has no network, cache, model, or persistence access.
+    """
+
+    def call() -> dict:
+        candidates = _candidate_list_payload(candidates_json)
+        ranked = _rank_candidates_deterministically(candidates, _mir_payload(mir_json))
+        return {"ranked": [item.to_dict() for item in ranked]}
+
+    return _deterministic_mcp_response(
+        "rank_candidates_deterministically",
+        {
+            "candidatesBytes": len(candidates_json.encode("utf-8")),
+            "mirBytes": len(mir_json.encode("utf-8")) if mir_json is not None else 0,
+        },
+        call,
+        lambda result: {
+            "candidates": len(result["ranked"]),
+            "topSourceId": result["ranked"][0]["sourceId"] if result["ranked"] else None,
+        },
+    )
+
+
+@mcp.tool()
+def select_candidate_deterministically(
+    candidates_json: str,
+    strategy: Literal["best", "strict"],
+    mir_json: Optional[str] = None,
+) -> dict:
+    """Select a candidate with the explicit ``best`` or ``strict`` strategy.
+
+    Deterministic and local: no network, cache, model, or persistence access.
+    """
+
+    def call() -> dict:
+        candidates = _candidate_list_payload(candidates_json)
+        selection = _select_candidate_deterministically(
+            candidates, _mir_payload(mir_json), strategy=strategy
+        )
+        return selection.to_dict()
+
+    return _deterministic_mcp_response(
+        "select_candidate_deterministically",
+        {
+            "candidatesBytes": len(candidates_json.encode("utf-8")),
+            "mirBytes": len(mir_json.encode("utf-8")) if mir_json is not None else 0,
+            "strategy": strategy,
+        },
+        call,
+        lambda result: {
+            "status": result["status"],
+            "selectedSourceId": result["selectedSourceId"],
+            "candidates": len(result["ranked"]),
+        },
+    )
+
+
+@mcp.tool()
+def build_song_baseline(
+    candidate_json: str,
+    song_id: str,
+    title: str,
+    artist: str,
+    youtube_video_id: Optional[str] = None,
+) -> dict:
+    """Build a schema-valid, untimed Song baseline from one CandidateSource.
+
+    Lyrics and chord placements are copied exactly. Capo is zero. The tool has
+    no network, cache, model, or persistence access.
+    """
+
+    def call() -> dict:
+        candidate = _candidate_payload(candidate_json)
+        _required_text(song_id, label="song_id", max_chars=200)
+        _required_text(title, label="title")
+        _required_text(artist, label="artist")
+        song = _build_song_from_candidate(
+            candidate,
+            song_id=song_id,
+            title=title,
+            artist=artist,
+            youtube_video_id=youtube_video_id,
+        )
+        return {"song": song.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "build_song_baseline",
+        {
+            "candidateBytes": len(candidate_json.encode("utf-8")),
+            "songId": song_id,
+            "youtubeVideoIdPresent": youtube_video_id is not None,
+        },
+        call,
+        lambda result: {
+            "songId": result["song"]["id"],
+            "lines": len(result["song"]["lines"]),
+            "sections": len(result["song"]["sections"]),
+            "timedLines": sum(
+                line["timeSeconds"] is not None for line in result["song"]["lines"]
+            ),
+        },
+    )
+
+
+@mcp.tool()
+def validate_song_json(song_json: str) -> dict:
+    """Validate caller-supplied Song JSON against the existing Song schema.
+
+    Returns the normalized schema-valid document. No network, cache, model, or
+    persistence access occurs.
+    """
+
+    def call() -> dict:
+        parsed = _json_payload(song_json, label="song_json", expected=dict)
+        lines = parsed.get("lines", [])
+        if isinstance(lines, list) and len(lines) > MAX_LINES:
+            raise _MCPDeterministicInputError(
+                "too_many_lines",
+                f"song has {len(lines)} lines; limit is {MAX_LINES}",
+                actualLines=len(lines),
+                maxLines=MAX_LINES,
+            )
+        song = Song.model_validate(parsed)
+        return {"valid": True, "song": song.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "validate_song_json",
+        {"songBytes": len(song_json.encode("utf-8"))},
+        call,
+        lambda result: {
+            "valid": result["valid"],
+            "songId": result["song"]["id"],
+            "lines": len(result["song"]["lines"]),
+        },
+    )
 
 
 # --- pipeline steps ----------------------------------------------------------

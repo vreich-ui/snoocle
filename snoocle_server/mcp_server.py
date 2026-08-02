@@ -54,16 +54,39 @@ from .identity import (
     resolve_identity_from_evidence,
     song_id_has_unknown_segment,
 )
+from .manifest import build_evidence_manifest as _build_evidence_manifest
+from .manifest import lrc_block as _lrc_block
 from .mir import MirAnalysis, analyze_audio as _analyze_audio
+from .mir.base import Beat
+from .mir.beats import extend_beat_grid as _extend_beat_grid
+from .mir.pipeline import analyze_window as _analyze_window
 from .pipeline import PipelineStepError, get_store, run_pipeline_async
 from .reconcile import provider_capabilities
 from .reconcile.admission import reconcile_admitted
 from .reconcile.match import score_candidate as _score_candidate
+from .reconcile.patch_ops import apply_patch as _apply_patch
+from .reconcile.patch_ops import parse_ops_response as _parse_ops_response
+from .quality.gate import evaluate as _evaluate_quality
+from .quality.theory import theory_validity as _theory_validity
 from .schema import Song, song_json_schema
 from .scope import AnalysisScope
 from .store import IdentityCollisionError, backend_label as _store_backend_label
 from .store.identity_rename import rename_song_identity
 from .store.runs import get_run_store
+from .timing.carry_forward import carry_forward_timing as _carry_forward_timing
+from .timing.collapse_guard import guard_against_collapsed_timing as _guard_collapsed
+from .timing.confidence import build_review_queue as _build_review_queue
+from .timing.confidence import score_song as _score_song_confidence
+from .timing.lrc import LrcLine, apply_lrc as _apply_lrc
+from .timing.lrc import fetch_lrc_match as _fetch_lrc_match
+from .timing.lrc import match_lrc_to_lines as _match_lrc_to_lines
+from .timing.offset import estimate_offset as _estimate_offset
+from .timing.realign import retime_sections as _retime_sections
+from .timing.snap import snap_chords as _snap_chords
+
+MAX_BEATS = 10_000
+MAX_LRC_LINES = 5_000
+MAX_MATCHES = MAX_LINES
 
 def _now_iso() -> str:
     from datetime import datetime, timezone
@@ -187,7 +210,55 @@ def _mir_payload(value: str | None) -> MirAnalysis | None:
     if value is None:
         return None
     parsed = _json_payload(value, label="mir_json", expected=dict)
-    return MirAnalysis.model_validate(parsed)
+    mir = MirAnalysis.model_validate(parsed)
+    if len(mir.beats) > MAX_BEATS:
+        raise _MCPDeterministicInputError(
+            "too_many_beats",
+            f"MIR has {len(mir.beats)} beats; limit is {MAX_BEATS}",
+            actualBeats=len(mir.beats),
+            maxBeats=MAX_BEATS,
+        )
+    return mir
+
+
+def _song_payload(value: str, *, label: str = "song_json") -> Song:
+    parsed = _json_payload(value, label=label, expected=dict)
+    lines = parsed.get("lines", [])
+    if isinstance(lines, list) and len(lines) > MAX_LINES:
+        raise _MCPDeterministicInputError(
+            "too_many_lines",
+            f"{label} has {len(lines)} lines; limit is {MAX_LINES}",
+            actualLines=len(lines),
+            maxLines=MAX_LINES,
+        )
+    return Song.model_validate(parsed)
+
+
+def _lrc_payload(value: str) -> list[LrcLine]:
+    parsed = _json_payload(value, label="lrc_json", expected=list)
+    if len(parsed) > MAX_LRC_LINES:
+        raise _MCPDeterministicInputError(
+            "too_many_lrc_lines",
+            f"LRC line count {len(parsed)} exceeds the limit of {MAX_LRC_LINES}",
+            actualLines=len(parsed),
+            maxLines=MAX_LRC_LINES,
+        )
+    try:
+        return [LrcLine(time=float(item["time"]), text=str(item["text"])) for item in parsed]
+    except (KeyError, TypeError, ValueError) as error:
+        raise _MCPDeterministicInputError(
+            "invalid_lrc_lines", "each LRC line must contain numeric time and text"
+        ) from error
+
+
+def _existing_path(value: str, *, label: str) -> Path:
+    _required_text(value, label=label, max_chars=4_096)
+    path = Path(value)
+    if not path.is_file():
+        raise _MCPDeterministicInputError(
+            "file_not_found", f"{label} does not name an existing file", field=label
+        )
+    return path
 
 
 def _validation_details(error: ValidationError) -> list[dict]:
@@ -199,8 +270,17 @@ def _deterministic_mcp_response(
     input_summary: dict,
     call: Callable[[], dict],
     summarize: Callable[[dict], dict],
+    *,
+    network_access: str = "none",
+    cache_access: str = "none",
+    persistence: str = "none",
 ) -> dict:
     start = time.perf_counter()
+    access = {
+        "network": network_access,
+        "cache": cache_access,
+        "persistence": persistence,
+    }
     try:
         result = call()
     except _MCPDeterministicInputError as error:
@@ -215,6 +295,7 @@ def _deterministic_mcp_response(
             "inputSummary": input_summary,
             "outputSummary": {"status": "error", "operation": operation},
             "warnings": [],
+            "access": access,
         }
     except ValidationError as error:
         elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
@@ -232,6 +313,7 @@ def _deterministic_mcp_response(
             "inputSummary": input_summary,
             "outputSummary": {"status": "error", "operation": operation},
             "warnings": [],
+            "access": access,
         }
     except DeterministicPipelineError as error:
         elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
@@ -245,6 +327,7 @@ def _deterministic_mcp_response(
             "inputSummary": input_summary,
             "outputSummary": {"status": "error", "operation": operation},
             "warnings": [],
+            "access": access,
         }
     except Exception:  # noqa: BLE001 - MCP callers receive a stable error, never a traceback
         elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
@@ -261,6 +344,7 @@ def _deterministic_mcp_response(
             "inputSummary": input_summary,
             "outputSummary": {"status": "error", "operation": operation},
             "warnings": [],
+            "access": access,
         }
     elapsed_ms = max(0, round((time.perf_counter() - start) * 1000))
     return {
@@ -273,6 +357,7 @@ def _deterministic_mcp_response(
         "inputSummary": input_summary,
         "outputSummary": summarize(result),
         "warnings": [],
+        "access": access,
     }
 
 
@@ -554,6 +639,512 @@ def validate_song_json(song_json: str) -> dict:
             "valid": result["valid"],
             "songId": result["song"]["id"],
             "lines": len(result["song"]["lines"]),
+        },
+    )
+
+
+# --- deterministic MIR, timing, quality, and evidence leaf tools -----------
+
+
+@mcp.tool()
+def analyze_full_track_mir(
+    audio_path: str, accuracy: Literal["standard", "thorough"] = "standard"
+) -> dict:
+    """Analyze one caller-provided server audio file across the full track.
+
+    Reads only the named local file. No acquisition, network, cache, model, or
+    persistence access occurs.
+    """
+
+    def call() -> dict:
+        path = _existing_path(audio_path, label="audio_path")
+        mir = _analyze_audio(path, accuracy=accuracy)
+        return {"analysis": mir.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "analyze_full_track_mir",
+        {"audioPath": audio_path, "accuracy": accuracy},
+        call,
+        lambda result: {
+            "durationSeconds": result["analysis"]["duration_seconds"],
+            "beats": len(result["analysis"]["beats"]),
+            "chords": len(result["analysis"]["chords"]),
+        },
+    )
+
+
+@mcp.tool()
+def analyze_mir_window(audio_path: str, start_seconds: float, end_seconds: float) -> dict:
+    """Analyze a bounded window of one caller-provided server audio file."""
+
+    def call() -> dict:
+        path = _existing_path(audio_path, label="audio_path")
+        if start_seconds < 0 or end_seconds <= start_seconds:
+            raise _MCPDeterministicInputError(
+                "invalid_time_window",
+                "start_seconds must be non-negative and end_seconds must be greater",
+            )
+        mir = _analyze_window(path, start_seconds, end_seconds)
+        return {"analysis": mir.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "analyze_mir_window",
+        {"audioPath": audio_path, "startSeconds": start_seconds, "endSeconds": end_seconds},
+        call,
+        lambda result: {
+            "beats": len(result["analysis"]["beats"]),
+            "chords": len(result["analysis"]["chords"]),
+            "windows": len(result["analysis"]["analyzed_windows"]),
+        },
+    )
+
+
+@mcp.tool()
+def extend_mir_beat_grid(
+    beats_json: str,
+    duration_seconds: float,
+    time_signature: Optional[str] = None,
+    gap_bars: float = 2.0,
+    min_confirmed_beats: int = 16,
+) -> dict:
+    """Extend a bounded beat grid using the core tempo-continuation service."""
+
+    def call() -> dict:
+        parsed = _json_payload(beats_json, label="beats_json", expected=list)
+        if len(parsed) > MAX_BEATS:
+            raise _MCPDeterministicInputError(
+                "too_many_beats", f"beat count exceeds {MAX_BEATS}", maxBeats=MAX_BEATS
+            )
+        if duration_seconds < 0 or gap_bars < 0 or min_confirmed_beats < 1:
+            raise _MCPDeterministicInputError(
+                "invalid_beat_grid_options",
+                "duration and gap_bars must be non-negative; min_confirmed_beats must be positive",
+            )
+        beats = [Beat.model_validate(item) for item in parsed]
+        extended = _extend_beat_grid(
+            beats,
+            duration_seconds,
+            time_signature,
+            gap_bars=gap_bars,
+            min_confirmed_beats=min_confirmed_beats,
+        )
+        if len(extended) > MAX_BEATS:
+            raise _MCPDeterministicInputError(
+                "too_many_beats", f"extended beat count exceeds {MAX_BEATS}", maxBeats=MAX_BEATS
+            )
+        return {"beats": [beat.model_dump(mode="json") for beat in extended]}
+
+    return _deterministic_mcp_response(
+        "extend_mir_beat_grid",
+        {"beatsBytes": len(beats_json.encode()), "durationSeconds": duration_seconds},
+        call,
+        lambda result: {
+            "beats": len(result["beats"]),
+            "inferred": sum(not beat["detected"] for beat in result["beats"]),
+        },
+    )
+
+
+@mcp.tool()
+def snap_song_to_mir(song_json: str, mir_json: Optional[str] = None) -> dict:
+    """Snap a Song's lines and chord placements to optional MIR evidence."""
+
+    def call() -> dict:
+        song = _snap_chords(_song_payload(song_json), _mir_payload(mir_json))
+        return {"song": song.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "snap_song_to_mir",
+        {"songBytes": len(song_json.encode()), "mirPresent": mir_json is not None},
+        call,
+        lambda result: {
+            "songId": result["song"]["id"],
+            "timedLines": sum(line["timeSeconds"] is not None for line in result["song"]["lines"]),
+        },
+    )
+
+
+@mcp.tool()
+def carry_forward_song_timing(
+    song_json: str,
+    prior_song_json: str,
+    audio_fallback_json: Optional[str] = None,
+    prior_version: Optional[str] = None,
+) -> dict:
+    """Copy only confidently matched timing from a prior Song version."""
+
+    def call() -> dict:
+        updated, stats = _carry_forward_timing(
+            _song_payload(song_json),
+            _song_payload(prior_song_json, label="prior_song_json"),
+            audio_fallback=(
+                _song_payload(audio_fallback_json, label="audio_fallback_json")
+                if audio_fallback_json is not None
+                else None
+            ),
+            prior_version=prior_version,
+        )
+        return {"song": updated.model_dump(mode="json"), "stats": dataclasses.asdict(stats)}
+
+    return _deterministic_mcp_response(
+        "carry_forward_song_timing",
+        {"songBytes": len(song_json.encode()), "priorSongBytes": len(prior_song_json.encode())},
+        call,
+        lambda result: {"songId": result["song"]["id"], **result["stats"]},
+    )
+
+
+@mcp.tool()
+def lookup_lrc(title: str, artist: str, duration_seconds: Optional[float] = None) -> dict:
+    """Look up synced lyrics through LRCLIB; this is the sole networked leaf."""
+
+    def call() -> dict:
+        _required_text(title, label="title")
+        _required_text(artist, label="artist")
+        if duration_seconds is not None and duration_seconds <= 0:
+            raise _MCPDeterministicInputError(
+                "invalid_duration", "duration_seconds must be positive when supplied"
+            )
+        match = _fetch_lrc_match(title, artist, duration_seconds)
+        if match is None:
+            return {"found": False, "match": None}
+        if len(match.lines) > MAX_LRC_LINES:
+            raise _MCPDeterministicInputError(
+                "too_many_lrc_lines", f"LRC result exceeds {MAX_LRC_LINES} lines"
+            )
+        return {
+            "found": True,
+            "match": {
+                "trackName": match.track_name,
+                "artistName": match.artist_name,
+                "lines": [dataclasses.asdict(line) for line in match.lines],
+            },
+        }
+
+    return _deterministic_mcp_response(
+        "lookup_lrc",
+        {"title": title, "artist": artist, "durationSeconds": duration_seconds},
+        call,
+        lambda result: {
+            "found": result["found"],
+            "lines": len(result["match"]["lines"]) if result["match"] else 0,
+        },
+        network_access="lrclib",
+    )
+
+
+@mcp.tool()
+def match_lrc_to_song(lrc_json: str, song_json: str) -> dict:
+    """Monotonically match caller-provided LRC lines to Song lines."""
+
+    def call() -> dict:
+        song = _song_payload(song_json)
+        matches = _match_lrc_to_lines(_lrc_payload(lrc_json), song)
+        return {
+            "matches": [
+                {"lineIndex": idx, "timeSeconds": value[0], "similarity": value[1]}
+                for idx, value in sorted(matches.items())
+            ]
+        }
+
+    return _deterministic_mcp_response(
+        "match_lrc_to_song",
+        {"lrcBytes": len(lrc_json.encode()), "songBytes": len(song_json.encode())},
+        call,
+        lambda result: {"matchedLines": len(result["matches"])},
+    )
+
+
+def _matches_payload(value: str) -> dict[int, tuple[float, float]]:
+    parsed = _json_payload(value, label="matches_json", expected=list)
+    if len(parsed) > MAX_MATCHES:
+        raise _MCPDeterministicInputError(
+            "too_many_matches", f"match count exceeds {MAX_MATCHES}", maxMatches=MAX_MATCHES
+        )
+    result: dict[int, tuple[float, float]] = {}
+    try:
+        for item in parsed:
+            line_index = item["lineIndex"]
+            if not isinstance(line_index, int) or isinstance(line_index, bool) or line_index < 0:
+                raise ValueError
+            time_seconds = float(item["timeSeconds"])
+            similarity = float(item["similarity"])
+            if time_seconds < 0 or not 0 <= similarity <= 1 or line_index in result:
+                raise ValueError
+            result[line_index] = (time_seconds, similarity)
+    except (KeyError, TypeError, ValueError) as error:
+        raise _MCPDeterministicInputError(
+            "invalid_lrc_matches",
+            "matches require unique non-negative lineIndex/timeSeconds and similarity in [0, 1]",
+        ) from error
+    return result
+
+
+@mcp.tool()
+def apply_lrc_to_song(
+    song_json: str, matches_json: str, mir_json: Optional[str] = None
+) -> dict:
+    """Apply matched LRC anchors and interpolate/re-snap remaining timing."""
+
+    def call() -> dict:
+        song = _apply_lrc(
+            _song_payload(song_json), _mir_payload(mir_json), _matches_payload(matches_json)
+        )
+        return {"song": song.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "apply_lrc_to_song",
+        {"songBytes": len(song_json.encode()), "matchesBytes": len(matches_json.encode())},
+        call,
+        lambda result: {
+            "songId": result["song"]["id"],
+            "timedLines": sum(line["timeSeconds"] is not None for line in result["song"]["lines"]),
+        },
+    )
+
+
+@mcp.tool()
+def retime_song_sections(song_json: str, duration_seconds: Optional[float] = None) -> dict:
+    """Derive section boundaries from a Song's line timing."""
+
+    def call() -> dict:
+        if duration_seconds is not None and duration_seconds <= 0:
+            raise _MCPDeterministicInputError("invalid_duration", "duration_seconds must be positive")
+        song, changed = _retime_sections(_song_payload(song_json), duration_seconds)
+        return {"song": song.model_dump(mode="json"), "sectionsChanged": changed}
+
+    return _deterministic_mcp_response(
+        "retime_song_sections",
+        {"songBytes": len(song_json.encode()), "durationSeconds": duration_seconds},
+        call,
+        lambda result: {"songId": result["song"]["id"], "sectionsChanged": result["sectionsChanged"]},
+    )
+
+
+@mcp.tool()
+def guard_song_timing_collapse(
+    song_json: str, duration_seconds: Optional[float] = None
+) -> dict:
+    """Spread repairable collapsed timing runs and report the intervention."""
+
+    def call() -> dict:
+        if duration_seconds is not None and duration_seconds <= 0:
+            raise _MCPDeterministicInputError("invalid_duration", "duration_seconds must be positive")
+        song, entry = _guard_collapsed(_song_payload(song_json), duration_seconds)
+        return {"song": song.model_dump(mode="json"), "provenance": entry.model_dump(mode="json")}
+
+    return _deterministic_mcp_response(
+        "guard_song_timing_collapse",
+        {"songBytes": len(song_json.encode()), "durationSeconds": duration_seconds},
+        call,
+        lambda result: {
+            "songId": result["song"]["id"],
+            "confidence": result["provenance"]["confidence"],
+        },
+    )
+
+
+@mcp.tool()
+def score_song_confidence(
+    song_json: str,
+    candidates_json: str = "[]",
+    mir_json: Optional[str] = None,
+    review_threshold: float = 0.6,
+) -> dict:
+    """Score every placement and build an explicit low-confidence review queue."""
+
+    def call() -> dict:
+        if not 0 <= review_threshold <= 1:
+            raise _MCPDeterministicInputError(
+                "invalid_threshold", "review_threshold must be in [0, 1]"
+            )
+        song, scores = _score_song_confidence(
+            _song_payload(song_json), _candidate_list_payload(candidates_json), _mir_payload(mir_json)
+        )
+        return {
+            "song": song.model_dump(mode="json"),
+            "scores": [dataclasses.asdict(score) for score in scores],
+            "reviewQueue": _build_review_queue(scores, threshold=review_threshold),
+        }
+
+    return _deterministic_mcp_response(
+        "score_song_confidence",
+        {"songBytes": len(song_json.encode()), "candidatesBytes": len(candidates_json.encode())},
+        call,
+        lambda result: {
+            "placements": len(result["scores"]), "reviewItems": len(result["reviewQueue"])
+        },
+    )
+
+
+@mcp.tool()
+def evaluate_song_quality(
+    song_json: str,
+    candidates_json: str = "[]",
+    mir_json: Optional[str] = None,
+    can_search: bool = True,
+    can_retry: bool = True,
+    retries_spent: int = 0,
+    searches_spent: int = 0,
+    sources_expected: bool = True,
+) -> dict:
+    """Grade, attribute faults, and decide escalation in the canonical order."""
+
+    def call() -> dict:
+        if retries_spent < 0 or searches_spent < 0:
+            raise _MCPDeterministicInputError(
+                "invalid_budget", "spent retry and search counts must be non-negative"
+            )
+        decision = _evaluate_quality(
+            _song_payload(song_json),
+            _mir_payload(mir_json),
+            _candidate_list_payload(candidates_json),
+            can_search=can_search,
+            can_retry=can_retry,
+            retries_spent=retries_spent,
+            searches_spent=searches_spent,
+            sources_expected=sources_expected,
+        )
+        return {"quality": decision.to_dict()}
+
+    return _deterministic_mcp_response(
+        "evaluate_song_quality",
+        {"songBytes": len(song_json.encode()), "retriesSpent": retries_spent, "searchesSpent": searches_spent},
+        call,
+        lambda result: {
+            "verdict": result["quality"]["grade"]["verdict"],
+            "fault": result["quality"]["attribution"]["fault"],
+            "retry": result["quality"]["escalation"]["retry"],
+            "search": result["quality"]["escalation"]["search"],
+        },
+    )
+
+
+@mcp.tool()
+def validate_song_theory(song_json: str, key_name: Optional[str] = None) -> dict:
+    """Check whether stored chords are explainable in an explicit or stored key."""
+
+    def call() -> dict:
+        song = _song_payload(song_json)
+        chords = [
+            (line.lineIndex, placement.charIndex, placement.chord)
+            for line in song.lines
+            for placement in line.chordPlacements
+        ]
+        report = _theory_validity(chords, key_name or song.metadata.key)
+        return {"theory": report.to_dict()}
+
+    return _deterministic_mcp_response(
+        "validate_song_theory",
+        {"songBytes": len(song_json.encode()), "keyOverride": key_name},
+        call,
+        lambda result: {
+            "share": result["theory"]["share"], "total": result["theory"]["total"]
+        },
+    )
+
+
+@mcp.tool()
+def calculate_recording_offset(
+    reference_audio_path: str,
+    other_audio_path: str,
+    max_offset_seconds: float = 30.0,
+) -> dict:
+    """Estimate a constant offset between two caller-provided recordings."""
+
+    def call() -> dict:
+        reference = _existing_path(reference_audio_path, label="reference_audio_path")
+        other = _existing_path(other_audio_path, label="other_audio_path")
+        if not 0 < max_offset_seconds <= 300:
+            raise _MCPDeterministicInputError(
+                "invalid_offset_bound", "max_offset_seconds must be in (0, 300]"
+            )
+        estimate = _estimate_offset(reference, other, max_offset_seconds=max_offset_seconds)
+        return {"offsetSeconds": estimate.offset_seconds, "confidence": estimate.confidence}
+
+    return _deterministic_mcp_response(
+        "calculate_recording_offset",
+        {"referenceAudioPath": reference_audio_path, "otherAudioPath": other_audio_path},
+        call,
+        lambda result: result,
+    )
+
+
+@mcp.tool()
+def apply_deterministic_song_patch(song_json: str, patch_json: str) -> dict:
+    """Validate and apply the closed, at-most-20-operation Song patch protocol."""
+
+    def call() -> dict:
+        document = _json_payload(patch_json, label="patch_json", expected=dict)
+        try:
+            ops = _parse_ops_response(document)
+            song, applied = _apply_patch(_song_payload(song_json), ops)
+        except ValueError as error:
+            raise _MCPDeterministicInputError("invalid_patch", str(error)) from error
+        return {
+            "song": song.model_dump(mode="json"),
+            "applied": [dataclasses.asdict(item) for item in applied],
+        }
+
+    return _deterministic_mcp_response(
+        "apply_deterministic_song_patch",
+        {"songBytes": len(song_json.encode()), "patchBytes": len(patch_json.encode())},
+        call,
+        lambda result: {"songId": result["song"]["id"], "operations": len(result["applied"])},
+    )
+
+
+@mcp.tool()
+def build_song_evidence_manifest(
+    candidates_json: str = "[]",
+    mir_json: Optional[str] = None,
+    prior_song_json: Optional[str] = None,
+    listen: bool = True,
+    reconcile: bool = True,
+    guidance: Optional[str] = None,
+    guidance_origin: Optional[str] = None,
+    recording_variant: Optional[str] = None,
+    lrc_status: str = "pending",
+    lrc_lines_matched: int = 0,
+    lrc_lines_total: int = 0,
+) -> dict:
+    """Build the canonical evidence-state manifest without fetching or storing."""
+
+    def call() -> dict:
+        if lrc_status not in {"pending", "hit", "miss", "disabled", "unavailable"}:
+            raise _MCPDeterministicInputError("invalid_lrc_status", "unsupported lrc_status")
+        if lrc_lines_matched < 0 or lrc_lines_total < 0 or lrc_lines_matched > lrc_lines_total:
+            raise _MCPDeterministicInputError(
+                "invalid_lrc_counts", "LRC counts must be non-negative and matched <= total"
+            )
+        if guidance is not None:
+            _bounded_payload(guidance, label="guidance")
+        candidates = _candidate_list_payload(candidates_json)
+        prior = (
+            _song_payload(prior_song_json, label="prior_song_json").model_dump(mode="json")
+            if prior_song_json is not None
+            else None
+        )
+        manifest = _build_evidence_manifest(
+            mir=_mir_payload(mir_json),
+            candidates=candidates,
+            prior_song=prior,
+            scope=AnalysisScope(listen=listen, reconcile=reconcile),
+            guidance=guidance,
+            guidance_origin=guidance_origin,
+            recording_variant=recording_variant,
+            lrc=_lrc_block(lrc_status, lrc_lines_matched, lrc_lines_total),
+        )
+        return {"manifest": manifest}
+
+    return _deterministic_mcp_response(
+        "build_song_evidence_manifest",
+        {"candidatesBytes": len(candidates_json.encode()), "mirPresent": mir_json is not None},
+        call,
+        lambda result: {
+            "mirStatus": result["manifest"].get("mir", {}).get("status"),
+            "sourceCount": result["manifest"].get("sources", {}).get("count", 0),
+            "lrcStatus": result["manifest"].get("lrcAlign", {}).get("status"),
         },
     )
 

@@ -1,8 +1,9 @@
-# Deterministic source, candidate, and baseline MCP tools
+# Deterministic MCP tools
 
-These six MCP tools expose the model-free source-to-baseline portion of
-Snoocle's deterministic core. They are local-only: none uses the network,
-cache, a model provider, or persistence.
+Twenty-two MCP tools expose Snoocle's model-free deterministic core: six
+source-to-baseline operations and sixteen MIR, timing, quality, patch, and
+evidence leaves. All are persistence-free and cache-free. Only `lookup_lrc`
+uses the network, and it is identified as such in every response.
 
 Every response has the same envelope:
 
@@ -16,14 +17,15 @@ Every response has the same envelope:
   "modelCostUSD": 0,
   "inputSummary": {},
   "outputSummary": {},
-  "warnings": []
+  "warnings": [],
+  "access": {"network": "none", "cache": "none", "persistence": "none"}
 }
 ```
 
 Invalid input returns `ok=false` and a structured `error` in the same envelope.
 Validation details omit the rejected payload itself.
 
-## Operations
+## Source-to-baseline operations
 
 | MCP tool | Inputs | Result | Deterministic service |
 |---|---|---|---|
@@ -34,6 +36,33 @@ Validation details omit the rejected payload itself.
 | `build_song_baseline` | `candidate_json`, `song_id`, `title`, `artist`, optional `youtube_video_id` | schema-valid untimed `song` | `deterministic.build_song_from_candidate` |
 | `validate_song_json` | `song_json` | `valid=true` and the normalized `song` | `schema.song.Song.model_validate` |
 
+## MIR, timing, quality, and evidence operations
+
+| MCP tool | Inputs | Result | Deterministic service | Network | Cache | Persistence |
+|---|---|---|---|---|---|---|
+| `analyze_full_track_mir` | local `audio_path`, `accuracy` | full-track `analysis` | `mir.pipeline.analyze_audio` | none | none | none |
+| `analyze_mir_window` | local `audio_path`, `start_seconds`, `end_seconds` | windowed `analysis` | `mir.pipeline.analyze_window` | none | none | none |
+| `extend_mir_beat_grid` | `beats_json`, duration and explicit continuation options | bounded beat grid | `mir.beats.extend_beat_grid` | none | none | none |
+| `snap_song_to_mir` | `song_json`, optional `mir_json` | timed `song` | `timing.snap.snap_chords` | none | none | none |
+| `carry_forward_song_timing` | new/prior Song JSON, optional fallback/version label | `song`, carry statistics | `timing.carry_forward.carry_forward_timing` | none | none | none |
+| `lookup_lrc` | title, artist, optional duration | LRCLIB match or explicit miss | `timing.lrc.fetch_lrc_match` | LRCLIB | none | none |
+| `match_lrc_to_song` | `lrc_json`, `song_json` | monotonic line matches | `timing.lrc.match_lrc_to_lines` | none | none | none |
+| `apply_lrc_to_song` | Song, match, optional MIR JSON | LRC-anchored `song` | `timing.lrc.apply_lrc` | none | none | none |
+| `retime_song_sections` | Song JSON, optional duration | `song`, changed count | `timing.realign.retime_sections` | none | none | none |
+| `guard_song_timing_collapse` | Song JSON, optional duration | guarded `song`, intervention provenance | `timing.collapse_guard.guard_against_collapsed_timing` | none | none | none |
+| `score_song_confidence` | Song, candidate, optional MIR JSON, threshold | scored `song`, scores, review queue | `timing.confidence.score_song` + `build_review_queue` | none | none | none |
+| `evaluate_song_quality` | Song/candidate/optional MIR JSON and spent budgets | grade, fault attribution, escalation | `quality.gate.evaluate` | none | none | none |
+| `validate_song_theory` | Song JSON, optional key override | theory report | `quality.theory.theory_validity` | none | none | none |
+| `calculate_recording_offset` | two local audio paths, maximum offset | offset and confidence | `timing.offset.estimate_offset` | none | none | none |
+| `apply_deterministic_song_patch` | Song JSON and closed patch JSON | patched `song`, applied operations | `reconcile.patch_ops.parse_ops_response` + `apply_patch` | none | none | none |
+| `build_song_evidence_manifest` | optional candidate/MIR/prior Song JSON and request metadata | evidence manifest | `manifest.build_evidence_manifest` | none | none | none |
+
+The audio-analysis and offset tools read only caller-named server files; they
+never acquire recordings implicitly. No leaf accepts a persistence flag,
+because none writes state. Consequently expected-version locking is not
+applicable at this layer. Persistence and optimistic locking belong to the
+explicit orchestrator/store boundary.
+
 `*_json` inputs are JSON strings. A candidate input is one `CandidateSource`
 object; a ranking or selection input is an array of those objects; MIR is one
 `MirAnalysis` object; Song input is one Song object.
@@ -43,12 +72,14 @@ object; a ranking or selection input is an array of those objects; MIR is one
 - Each JSON or text payload is at most 5,000,000 UTF-8 bytes.
 - Candidate arrays contain at most 20 candidates.
 - Candidate text, candidates, and validated Songs contain at most 2,000 lines.
+- MIR and raw beat-grid inputs contain at most 10,000 beats.
+- LRC inputs contain at most 5,000 lines and applied match lists at most 2,000 entries.
+- Deterministic patch inputs contain at most 20 operations.
 - Candidate parsing uses a fixed epoch retrieval timestamp unless
   `retrieved_at` is supplied, so caller-equivalent parses do not depend on wall
   clock time.
 - Baselines copy lyric strings and chord placements in their existing order,
   including each `charIndex`. They clear line and placement timing and set
   display capo to zero.
-- The tools never persist implicitly. The complete deterministic orchestrator,
-  audio/MIR leaf tools, and production pipeline policy are intentionally not
-  exposed by this change.
+- The tools never persist implicitly. Complete deterministic orchestration and
+  production pipeline policy are intentionally outside this leaf layer.

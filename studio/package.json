@@ -5,13 +5,17 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "test:all": "npm run test && npm run test:browser"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@testing-library/jest-dom": "^6.6.4",
     "@testing-library/react": "^16.0.1",
     "@testing-library/user-event": "^14.5.2",

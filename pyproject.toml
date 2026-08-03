@@ -31,6 +31,9 @@ dependencies = [
     # Durable song store (Firestore Native). Uses Application Default
     # Credentials; the project comes from GOOGLE_CLOUD_PROJECT.
     "google-cloud-firestore>=2.11",
+    # Shared temporary audio artifacts for multi-instance Cloud Run. Imported
+    # lazily; local development continues to use the filesystem backend.
+    "google-cloud-storage>=2.16,<4",
     # In-process agentic reconciler (provider "anthropic-agent"): the Anthropic
     # Python SDK. The Docker image already installs it; declared here so dev
     # installs pick it up too. Imported lazily inside the provider, like the

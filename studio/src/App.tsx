@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { getBearerToken, saveBearerToken } from "./api";
+import { AudioWorkspace } from "./AudioWorkspace";
 import { sectionFromPath, sectionPath, studioSections, type StudioSection } from "./navigation";
 import "./studio.css";
 
@@ -61,9 +62,14 @@ export function StudioApp() {
         ))}
       </nav>
       {section === "Tool Studio" ? (
-        <Suspense fallback={<section className="workspace" role="status">Loading Tool Studio…</section>}>
-          <ToolStudio token={token} />
-        </Suspense>
+        <div className="tool-studio-page">
+          <div className="workspace audio-workspace-shell">
+            <AudioWorkspace />
+          </div>
+          <Suspense fallback={<section className="workspace" role="status">Loading Tool Studio…</section>}>
+            <ToolStudio token={token} />
+          </Suspense>
+        </div>
       ) : (
         <section aria-labelledby="section-heading" className="workspace" tabIndex={-1}>
           <p className="eyebrow">Workspace</p>

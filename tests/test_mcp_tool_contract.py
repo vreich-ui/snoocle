@@ -141,7 +141,8 @@ def test_representative_gui_safety_and_presentation_decisions_are_pinned():
     local_mir = TOOL_CONTRACTS["analyze_full_track_mir"]
     assert local_mir.browser_safety == "server_filesystem_restricted"
     assert local_mir.expected_duration == "minutes"
-    assert local_mir.network_access == ()
+    assert local_mir.network_access == ("artifact_backend",)
+    assert "audio_artifact" in local_mir.input_artifact_kinds
 
     align = TOOL_CONTRACTS["align_song_deterministically"]
     assert align.model_use == "none"

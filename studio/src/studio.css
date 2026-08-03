@@ -283,3 +283,29 @@ dd { font-size: .8rem; margin: .2rem 0 0; overflow-wrap: anywhere; }
   .connection { white-space: normal; }
   .catalog-filters, .classification-grid, .telemetry-grid { grid-template-columns: 1fr; }
 }
+
+.tool-studio-page { grid-column: 2; min-width: 0; }
+.audio-workspace-shell { margin-bottom: 2rem; }
+.audio-workspace { border: 1px solid #28354c; border-radius: .65rem; padding: 1.25rem; }
+.audio-inputs { align-items: end; display: grid; gap: .8rem; grid-template-columns: minmax(0, 1fr) auto; }
+.audio-inputs label { display: grid; gap: .4rem; }
+.audio-inputs input { min-width: 0; }
+.audio-inputs button, .audio-actions button {
+  border: 1px solid #7ca6ed;
+  border-radius: .4rem;
+  background: #315da8;
+  color: inherit;
+  padding: .58rem .8rem;
+}
+.audio-preview { background: #0f172a; border: 1px solid #42526d; border-radius: .65rem; display: grid; gap: 1rem; margin-top: 1.25rem; padding: 1rem; }
+.audio-preview > div:first-child { display: flex; gap: .75rem; justify-content: space-between; }
+.audio-preview span { color: #aab8cc; }
+.audio-actions { display: flex; gap: .65rem; }
+
+@media (max-width: 850px) {
+  .tool-studio-page { grid-column: auto; }
+}
+
+@media (max-width: 600px) {
+  .audio-inputs { grid-template-columns: 1fr; }
+}

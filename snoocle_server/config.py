@@ -21,6 +21,19 @@ class Settings(BaseSettings):
     # --- storage ---
     data_dir: Path = Path("data")
     audio_cache_dir: Path = Path("data/audio-cache")
+    # Authenticated, opaque audio references used by Studio and remote MCP
+    # callers. ``auto`` selects GCS when a bucket is configured and the local
+    # atomic-files backend otherwise. Production must configure a private GCS
+    # bucket; Cloud Run's writable filesystem is instance-local and ephemeral.
+    audio_artifact_backend: str = "auto"  # auto | local | gcs
+    audio_artifact_dir: Path = Path("data/audio-artifacts")
+    audio_artifact_gcs_bucket: str = ""
+    audio_artifact_gcs_prefix: str = "audio-artifacts"
+    audio_artifact_ttl_seconds: int = 86400
+    audio_artifact_max_bytes: int = 100 * 1024 * 1024
+    audio_artifact_max_duration_seconds: float = 30 * 60
+    audio_artifact_quota_bytes: int = 1024 * 1024 * 1024
+    audio_artifact_quota_count: int = 50
     # Separated stems and the practice mixes derived from them (B4). Sits
     # beside the audio cache and is equally disposable — everything here can be
     # regenerated from the source audio, it is just expensive to. NOTE on Cloud

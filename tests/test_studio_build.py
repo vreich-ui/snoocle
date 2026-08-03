@@ -37,3 +37,22 @@ def test_docker_builds_studio_before_installing_python_package():
     assert "RUN npm ci" in dockerfile
     assert "RUN npm run build" in dockerfile
     assert "COPY --from=studio-builder /snoocle_server/studio ./snoocle_server/studio" in dockerfile
+
+
+def test_python_version_build_arg_is_global_for_every_python_stage():
+    dockerfile = (REPO / "Dockerfile").read_text()
+    instructions = [
+        (line_number, line.strip())
+        for line_number, line in enumerate(dockerfile.splitlines(), start=1)
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    first_from = next(line_number for line_number, line in instructions if line.startswith("FROM "))
+    python_arg = next(
+        line_number for line_number, line in instructions if line == "ARG PYTHON_VERSION=3.11"
+    )
+
+    assert python_arg < first_from, (
+        "PYTHON_VERSION must be declared before the first FROM so Docker can "
+        "expand it in every later Python stage"
+    )
+    assert dockerfile.count("FROM python:${PYTHON_VERSION}-slim-bookworm") == 2

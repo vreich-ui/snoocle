@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1
 
+# Build arguments used by more than one stage must be declared globally,
+# before the first FROM instruction.
+ARG PYTHON_VERSION=3.11
+
 # The Studio is compiled once during the image build.  Its browser dependencies
 # are never fetched at runtime, and only the generated static files cross into
 # the Python image.
@@ -38,7 +42,6 @@ RUN npm run build
 # Pin one base image and reuse it for both stages so the venv's interpreter
 # path and ABI match exactly. 3.11-slim has broad wheel coverage for the
 # scientific stack (numpy/scipy/librosa/numba).
-ARG PYTHON_VERSION=3.11
 FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \

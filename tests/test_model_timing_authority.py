@@ -228,7 +228,7 @@ def test_a_notes_only_run_that_echoes_the_priors_timing_now_carries_forward_n_of
 
     report = pipeline_mod.run_pipeline(
         TITLE, ARTIST, provider="anthropic", scope=NOTES_ONLY,
-        guidance="the Am in line 1 should be an Am7",
+        guidance="the Am in line 1 should be an Am7", agent_policy="always",
     )
 
     assert report.steps["timing"].startswith(
@@ -610,6 +610,7 @@ def test_listen_off_with_no_prior_and_allow_timing_loss_strips_nothing(
         TITLE, ARTIST, provider="anthropic",
         scope=AnalysisScope(listen=False, reconcile=True),
         allow_timing_loss=True,
+        agent_policy="always",
     )
 
     assert report.steps["timing"] == "skipped (no MIR)"
@@ -643,7 +644,9 @@ def test_a_snap_failure_stays_non_fatal_instead_of_becoming_timing_data_loss(
 
     monkeypatch.setattr(pipeline_mod, "snap_chords", _boom)
 
-    report = pipeline_mod.run_pipeline(TITLE, ARTIST, provider="anthropic")
+    report = pipeline_mod.run_pipeline(
+        TITLE, ARTIST, provider="anthropic", agent_policy="always"
+    )
 
     assert report.steps["timing"].startswith("failed: beat grid blew up")
     assert "restored audio.beats (16 entries)" in report.steps["timing"]
@@ -677,7 +680,9 @@ def test_a_snap_failure_with_no_prior_version_still_keeps_what_the_model_sent(
         lambda song, mir: (_ for _ in ()).throw(RuntimeError("nope")),
     )
 
-    pipeline_mod.run_pipeline(TITLE, ARTIST, provider="anthropic")
+    pipeline_mod.run_pipeline(
+        TITLE, ARTIST, provider="anthropic", agent_policy="always"
+    )
 
     stored = store.get(SONG_ID)
     assert stored.metadata.bpm == BPM
@@ -695,7 +700,9 @@ def test_a_successful_snap_is_not_second_guessed(monkeypatch, store):
     _with_audio(monkeypatch, _mir())
     _use(monkeypatch, _Static(_timed_song()))
 
-    report = pipeline_mod.run_pipeline(TITLE, ARTIST, provider="anthropic")
+    report = pipeline_mod.run_pipeline(
+        TITLE, ARTIST, provider="anthropic", agent_policy="always"
+    )
 
     assert report.steps["timing"] == "ok"
     stored = store.get(SONG_ID)
@@ -737,7 +744,7 @@ def test_the_lines_the_strip_leaves_untimed_are_reported_not_just_graded(
 
     report = pipeline_mod.run_pipeline(
         TITLE, ARTIST, provider="anthropic", scope=NOTES_ONLY,
-        guidance="add the tag line at the end",
+        guidance="add the tag line at the end", agent_policy="always",
     )
 
     assert "1 line(s) and 1 placement(s) left untimed" in report.steps["timing"]

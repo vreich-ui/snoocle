@@ -150,13 +150,13 @@ def test_analyze_api_accepts_accuracy():
     r = client.post(
         "/v1/songs/analyze",
         json={"title": "X", "artist": "Y", "provider": "mock", "skipAudio": True,
-              "accuracy": "fast"},
+              "accuracy": "fast", "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text
 
     r = client.post(
         "/v1/songs/analyze",
         json={"title": "X", "artist": "Y", "provider": "mock", "skipAudio": True,
-              "accuracy": "warp-speed"},
+              "accuracy": "warp-speed", "allowTestOutput": True},
     )
     assert r.status_code == 422

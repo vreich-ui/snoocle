@@ -72,7 +72,7 @@ def test_mock_analyze_is_fully_offline_and_persists(monkeypatch):
 
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Offline", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={"title": "Offline", "artist": "Tester", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -103,7 +103,7 @@ def test_fatal_reconcile_failure_returns_502_naming_step(monkeypatch):
     monkeypatch.setattr(pipeline_mod, "reconcile", fail)
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 502
     assert r.json()["detail"].startswith("reconcile: ")
@@ -119,7 +119,7 @@ def test_fatal_502_detail_includes_step_outcomes(monkeypatch):
     monkeypatch.setattr(pipeline_mod, "reconcile", fail)
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 502
     detail = r.json()["detail"]
@@ -148,7 +148,7 @@ def test_youtube_auth_failure_gets_error_code_and_reason(monkeypatch):
     monkeypatch.setattr(pipeline_mod, "discover_sources", fail_discover)
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Back To Black", "artist": "Amy Winehouse", "provider": "anthropic"},
+        json={"title": "Back To Black", "artist": "Amy Winehouse", "provider": "anthropic", "agentPolicy": "always"},
     )
     assert r.status_code == 502
     body = r.json()
@@ -170,7 +170,7 @@ def test_content_filter_failure_gets_error_code_and_reason(monkeypatch):
     monkeypatch.setattr(pipeline_mod, "reconcile", fail)
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Get Back", "artist": "Corey Heuvel", "provider": "mock", "skipAudio": True},
+        json={"title": "Get Back", "artist": "Corey Heuvel", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 502
     body = r.json()
@@ -185,7 +185,7 @@ def test_non_auth_failures_have_no_error_code(monkeypatch):
     monkeypatch.setattr(pipeline_mod, "reconcile", fail)
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={"title": "Boom", "artist": "Tester", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 502
     assert "errorCode" not in r.json()
@@ -205,7 +205,7 @@ def test_misconfigured_provider_fails_before_expensive_steps(monkeypatch):
 
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "X", "artist": "Anon", "provider": "agent"},
+        json={"title": "X", "artist": "Anon", "provider": "agent", "agentPolicy": "always"},
     )
     assert r.status_code == 502
     body = r.json()
@@ -224,7 +224,7 @@ def test_unknown_provider_fails_before_expensive_steps(monkeypatch):
 
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "X", "artist": "Anon", "provider": "does-not-exist"},
+        json={"title": "X", "artist": "Anon", "provider": "does-not-exist", "agentPolicy": "always"},
     )
     assert r.status_code == 502
     assert r.json()["errorCode"] == "provider_not_configured"
@@ -241,7 +241,7 @@ def test_reconcile_timeout_returns_502(monkeypatch):
     monkeypatch.setattr(pipeline_mod, "reconcile", slow)
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Slow", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={"title": "Slow", "artist": "Tester", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 502
     detail = r.json()["detail"]
@@ -259,7 +259,7 @@ def test_best_effort_discover_failure_does_not_sink_request(monkeypatch):
 
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "X", "artist": "Anon", "provider": "anthropic", "skipAudio": True},
+        json={"title": "X", "artist": "Anon", "provider": "anthropic", "skipAudio": True, "agentPolicy": "always"},
     )
     assert r.status_code == 200, r.text
     steps = r.json()["steps"]
@@ -315,7 +315,7 @@ def test_timing_snap_populates_chord_times_end_to_end(monkeypatch, isolated_stor
 
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "X", "artist": "Anon", "provider": "anthropic"},
+        json={"title": "X", "artist": "Anon", "provider": "anthropic", "agentPolicy": "always"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -388,7 +388,7 @@ def test_timing_collapse_guard_runs_after_snap_and_reports_coverage(monkeypatch,
 
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Y", "artist": "Anon", "provider": "anthropic"},
+        json={"title": "Y", "artist": "Anon", "provider": "anthropic", "agentPolicy": "always"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -440,7 +440,7 @@ class _Recorder:
 
 
 def _no_scope_analyze_body(**extra) -> dict:
-    body = {"title": "X", "artist": "Anon", "provider": "anthropic"}
+    body = {"title": "X", "artist": "Anon", "provider": "anthropic", "agentPolicy": "always"}
     body.update(extra)
     return body
 
@@ -579,6 +579,7 @@ def test_scope_is_recorded_in_the_reconcile_provenance():
         "/v1/songs/analyze",
         json={
             "title": "Scoped", "artist": "Tester", "provider": "mock",
+            "allowTestOutput": True,
             "scope": {"listen": False, "reconcile": True},
             # listen=off reuses the prior version's audio analysis, so it needs
             # one to reuse (tests/test_timing_carry_forward.py).
@@ -597,7 +598,7 @@ def test_scope_is_recorded_in_the_reconcile_provenance():
 def test_absent_scope_writes_no_scope_provenance():
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Unscoped", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={"title": "Unscoped", "artist": "Tester", "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text
     entries = [p for p in r.json()["song"]["provenance"] if p["action"] == "reconciled"]

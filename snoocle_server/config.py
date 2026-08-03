@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # Provider is a runtime choice: anthropic | anthropic-agent | openai |
     # gemini | agent | mock.
     llm_provider: str = "anthropic"
+    # Production orchestration is deterministic-first. ``always`` preserves
+    # the historical full reconciliation experiment; ``never`` forbids model
+    # intervention even when deterministic quality attribution finds a MODEL
+    # fault.
+    agent_policy: str = "unresolved_only"  # never | unresolved_only | always
     llm_model: str = ""  # empty -> provider default
     llm_max_tokens: int = 16000
     llm_temperature: float = 0.2

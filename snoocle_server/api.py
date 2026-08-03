@@ -72,6 +72,7 @@ from .store import (
     count_cookie_lines,
 )
 from .store.run_admission import DuplicateRunError
+from .test_output import TestOutputRejectedError, require_test_output_opt_in
 from .store.identity_rename import IdentityRenameError, rename_song_identity
 from .store.runs import get_run_store
 
@@ -618,6 +619,7 @@ class PipelineRequest(BaseModel):
     artist: Optional[str] = None
     youtubeUrlOrId: Optional[str] = None
     provider: Optional[str] = None
+    agentPolicy: Optional[Literal["never", "unresolved_only", "always"]] = None
     model: Optional[str] = None
     attachAudio: Optional[bool] = None
     skipAudio: bool = False
@@ -682,6 +684,7 @@ class PipelineRequest(BaseModel):
     allowTimingLoss: bool = False
     force: bool = False
     forceReason: Optional[str] = None
+    allowTestOutput: bool = False
 
     @model_validator(mode="after")
     def _identity_or_url(self) -> "PipelineRequest":
@@ -727,6 +730,8 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             force=req.force,
             force_reason=req.forceReason,
             effort_level=req.effortLevel,
+            agent_policy=req.agentPolicy,
+            allow_test_output=req.allowTestOutput,
         )
     except DuplicateRunError as e:
         return _duplicate_response(e)
@@ -757,9 +762,11 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             str(e),
             e.error_code,
         )
-    assert report.reconcile is not None
-    return {
+    response = {
         "songId": report.song_id,
+        "status": report.status,
+        "reason": report.reason,
+        "agentPolicy": report.agent_policy,
         "steps": report.steps,
         "storedVersion": report.stored_version,
         "runId": report.run_id,  # fetch the step trace at /v1/runs/{runId}
@@ -773,8 +780,14 @@ async def post_songs_analyze(req: PipelineRequest) -> dict:
             if report.recording_suggestions is not None
             else {}
         ),
-        **_reconcile_response(report.reconcile),
     }
+    if report.deterministic_result is not None:
+        response["deterministicResult"] = report.deterministic_result
+    if report.agent_patch is not None:
+        response["agentPatch"] = report.agent_patch
+    if report.reconcile is not None:
+        response.update(_reconcile_response(report.reconcile))
+    return response
 
 
 # --- per-song reconciliation notes -------------------------------------------
@@ -1499,6 +1512,7 @@ class SaveSongRequest(BaseModel):
     song: Song
     message: str = "Manual save"
     expectedVersion: Optional[str] = None
+    allowTestOutput: bool = False
 
 
 @app.post("/v1/songs/{song_id}")
@@ -1507,9 +1521,12 @@ def post_song(song_id: str, req: SaveSongRequest) -> dict:
         raise HTTPException(status_code=400, detail="song.id does not match URL")
     try:
         require_resolved_song_id(song_id)
+        require_test_output_opt_in(req.song, req.allowTestOutput)
         saved = get_store().save(req.song, req.message, expected_version=req.expectedVersion)
     except IdentityUnresolvedError as e:
         return _identity_unresolved_response(e)
+    except TestOutputRejectedError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except IdentityCollisionError as e:
         return _error_response(409, str(e), e.code)
     except VersionConflictError as e:
@@ -1517,6 +1534,33 @@ def post_song(song_id: str, req: SaveSongRequest) -> dict:
     except StoreError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"version": saved.version, "timestamp": saved.timestamp, "message": saved.message}
+
+
+@app.get("/v1/diagnostics/mock-songs")
+def get_mock_song_diagnostic() -> dict:
+    """Read-only inventory of stored mock/placeholder artifacts."""
+    from .test_output import mock_output_reasons
+
+    findings = []
+    store = get_store()
+    for song_id in store.list_songs():
+        try:
+            song = store.get(song_id)
+        except Exception as error:  # noqa: BLE001 — diagnostic keeps scanning
+            findings.append({"songId": song_id, "reasons": ["unreadable"], "error": str(error)[:300]})
+            continue
+        reasons = mock_output_reasons(song)
+        if reasons:
+            findings.append(
+                {
+                    "songId": song.id,
+                    "title": song.metadata.title,
+                    "artist": song.metadata.artist,
+                    "version": store.current_version(song.id),
+                    "reasons": reasons,
+                }
+            )
+    return {"count": len(findings), "songs": findings, "readOnly": True}
 
 
 # --- cross-video offset alignment (Phase B / master plan B3) ---------------

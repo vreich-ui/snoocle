@@ -198,7 +198,9 @@ def _audio_fault_run(monkeypatch, store):
         pipeline_mod, "reconcile",
         _Reconciler(_song(TRUE_PROGRESSION, timed=False, section_times=False)),
     )
-    return pipeline_mod.run_pipeline("Quality Gate", "Test", provider="anthropic")
+    return pipeline_mod.run_pipeline(
+        "Quality Gate", "Test", provider="anthropic", agent_policy="always"
+    )
 
 
 def test_an_audio_fault_analyze_run_reports_alternatives_without_analyzing_them(

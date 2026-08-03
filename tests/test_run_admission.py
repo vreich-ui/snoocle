@@ -43,6 +43,7 @@ def _request(**extra) -> dict:
         "artist": "Tester",
         "provider": "mock",
         "skipAudio": True,
+        "allowTestOutput": True,
         **extra,
     }
 

@@ -166,7 +166,13 @@ def _wire(monkeypatch, *, mir: MirAnalysis, candidates: list[CandidateSource]) -
 def _analyze(**extra):
     """The synchronous entry point -- the suite has no async plugin, and
     run_pipeline is the same orchestration behind an asyncio.run."""
-    return pipeline_mod.run_pipeline("Quality Gate", "Test", provider="anthropic", **extra)
+    return pipeline_mod.run_pipeline(
+        "Quality Gate",
+        "Test",
+        provider="anthropic",
+        agent_policy="always",
+        **extra,
+    )
 
 
 def _actions(song: Song) -> list[str]:

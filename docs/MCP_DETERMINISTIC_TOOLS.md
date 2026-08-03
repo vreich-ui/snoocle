@@ -6,6 +6,14 @@ evidence leaves, plus two orchestrators. The leaf tools are persistence-free
 and cache-free. Only `lookup_lrc` uses the network at the leaf layer, and it is
 identified as such in every response.
 
+The full `analyze_and_store_song` entry point is deterministic-first by
+default. Its `agent_policy` is `never | unresolved_only | always`; only an
+actionable MODEL fault under `unresolved_only` can make one lyric-free bounded
+patch call. `list_capabilities` inventories every registered MCP tool and
+states execution type, network/cache/persistence behavior, input/output type,
+and cost class. `diagnose_mock_songs` is the read-only inventory for legacy
+mock/placeholder documents.
+
 Every response has the same envelope:
 
 ```json
@@ -103,5 +111,7 @@ object; a ranking or selection input is an array of those objects; MIR is one
 - Baselines copy lyric strings and chord placements in their existing order,
   including each `charIndex`. They clear line and placement timing and set
   display capo to zero.
-- The tools never persist implicitly. Complete deterministic orchestration and
-  production pipeline policy are intentionally outside this leaf layer.
+- Leaf tools never persist implicitly. The two deterministic orchestrators
+  always write bounded run traces and write Songs only with explicit
+  `persist=true` plus expected-version locking. Production policy lives at the
+  full orchestration entry points.

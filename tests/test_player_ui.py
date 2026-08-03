@@ -184,4 +184,4 @@ def test_js_unit_tests_pass():
         cwd=REPO, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
-    assert "# fail 0" in result.stdout
+    assert "# fail 0" in result.stdout or "ℹ fail 0" in result.stdout

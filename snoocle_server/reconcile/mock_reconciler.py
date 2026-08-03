@@ -91,6 +91,7 @@ def _synthesize_placeholder(
         sections=sections,
         lines=lines,
         provenance=[],
+        testOnly=True,
     )
 
 
@@ -171,4 +172,5 @@ def reconcile_deterministically(
         sections=sections,
         lines=lines,
         provenance=[],
+        testOnly=True,
     )

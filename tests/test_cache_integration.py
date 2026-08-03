@@ -167,7 +167,13 @@ def test_agents_first_user_message_omits_the_manifest_when_absent():
 
 
 def _analyze(**extra) -> dict:
-    body = {"title": "Cache", "artist": "Tester", "provider": "mock", "skipAudio": True}
+    body = {
+        "title": "Cache",
+        "artist": "Tester",
+        "provider": "mock",
+        "skipAudio": True,
+        "allowTestOutput": True,
+    }
     body.update(extra)
     r = client.post("/v1/songs/analyze", json=body)
     assert r.status_code == 200, r.text
@@ -176,6 +182,7 @@ def _analyze(**extra) -> dict:
 
 def test_analyze_response_carries_the_manifest():
     body = _analyze()
+    assert body["song"]["testOnly"] is True
     manifest = body["evidenceManifest"]
     assert set(manifest) >= {"mir", "sources", "priorSong", "lrcAlign", "request"}
     # mock skips LRC entirely, and the manifest says so rather than staying

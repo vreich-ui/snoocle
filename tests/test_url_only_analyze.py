@@ -84,7 +84,7 @@ def test_analyze_from_url_only_derives_identity(monkeypatch):
     r = client.post(
         "/v1/songs/analyze",
         json={"youtubeUrlOrId": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-              "provider": "mock", "skipAudio": True},
+              "provider": "mock", "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -141,7 +141,7 @@ def test_explicit_title_and_artist_survive_a_youtube_url(monkeypatch):
         json={
             "title": "Paint It Black", "artist": "The Rolling Stones",
             "youtubeUrlOrId": "flSmiIne-4k",
-            "provider": "mock", "skipAudio": True,
+            "provider": "mock", "skipAudio": True, "allowTestOutput": True,
         },
     )
     assert r.status_code == 200, r.text
@@ -162,7 +162,7 @@ def test_explicit_artist_survives_alongside_a_derived_title(monkeypatch):
         "/v1/songs/analyze",
         json={
             "artist": "The Rolling Stones", "youtubeUrlOrId": "flSmiIne-4k",
-            "provider": "mock", "skipAudio": True,
+            "provider": "mock", "skipAudio": True, "allowTestOutput": True,
         },
     )
     assert r.status_code == 200, r.text
@@ -182,7 +182,7 @@ def test_explicit_title_survives_alongside_a_derived_artist(monkeypatch):
         "/v1/songs/analyze",
         json={
             "title": "Paint It Black", "youtubeUrlOrId": "flSmiIne-4k",
-            "provider": "mock", "skipAudio": True,
+            "provider": "mock", "skipAudio": True, "allowTestOutput": True,
         },
     )
     assert r.status_code == 200, r.text
@@ -225,7 +225,8 @@ def test_title_artist_still_work_without_url():
     # the original path is unchanged
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Let It Be", "artist": "The Beatles", "provider": "mock", "skipAudio": True},
+        json={"title": "Let It Be", "artist": "The Beatles", "provider": "mock",
+              "skipAudio": True, "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text
     assert r.json()["songId"] == "the-beatles--let-it-be"

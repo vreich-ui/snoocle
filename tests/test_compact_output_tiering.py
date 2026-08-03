@@ -302,6 +302,8 @@ def _pipeline_report():
     return types.SimpleNamespace(
         song_id="example--compact", steps={}, stored_version="v1", run_id="run-1",
         evidence_manifest={}, recording_suggestions=None, reconcile=result,
+        status="completed", reason=None, agent_policy="always",
+        deterministic_result=None, agent_patch=None,
     )
 
 

@@ -93,6 +93,7 @@ def test_full_pipeline_and_versioning():
         "artist": "The Beatles",
         "provider": "mock",
         "skipAudio": True,
+        "allowTestOutput": True,
     }
     r1 = client.post("/v1/songs/analyze", json=req)
     assert r1.status_code == 200, r1.text
@@ -145,7 +146,7 @@ def test_full_pipeline_and_versioning():
 
 
 def test_pipeline_expected_version_conflict():
-    req = {"title": "Let It Be", "artist": "The Beatles", "provider": "mock", "skipAudio": True}
+    req = {"title": "Let It Be", "artist": "The Beatles", "provider": "mock", "skipAudio": True, "allowTestOutput": True}
     r1 = client.post("/v1/songs/analyze", json=req)
     stale = r1.json()["storedVersion"]
     client.post("/v1/songs/analyze", json=req)  # moves latest past `stale`
@@ -157,7 +158,7 @@ def test_analyze_persists_and_survives_new_store_instance(monkeypatch):
     """A song created via analyze is listable/fetchable afterward — the
     persistence acceptance bar (here proven against the same in-memory backend
     the request wrote to; Firestore is proven in test_store.py)."""
-    req = {"title": "Yesterday", "artist": "The Beatles", "provider": "mock", "skipAudio": True}
+    req = {"title": "Yesterday", "artist": "The Beatles", "provider": "mock", "skipAudio": True, "allowTestOutput": True}
     r = client.post("/v1/songs/analyze", json=req)
     assert r.status_code == 200, r.text
     sid = r.json()["songId"]
@@ -199,6 +200,7 @@ def test_reconcile_endpoint_with_inline_candidates(offline_web):
             "artist": "The Beatles",
             "candidates": cands,
             "provider": "mock",
+            "allowTestOutput": True,
         },
     )
     assert r.status_code == 200, r.text

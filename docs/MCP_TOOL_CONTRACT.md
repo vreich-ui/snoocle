@@ -1,10 +1,16 @@
 # MCP tool classification and presentation contract
 
 Snoocle publishes one versioned machine-readable contract for every registered
-MCP tool. GUI Studio and other clients can read it in either place:
+MCP tool. GUI Studio and other clients can read it in either place on current
+MCP 1.x releases:
 
 - `tools/list`: `_meta["snoocle/toolContract"]`
 - `list_capabilities`: each tool's `toolContract` field
+
+`list_capabilities` is the compatibility channel on MCP 1.x SDKs whose FastMCP
+tool model does not expose `_meta`. MCP 1.10's model predates tool `_meta`, so
+the contract attachment does not assume that field exists; standard annotations
+remain attached on both tool-model shapes.
 
 The contract is derived by iterating FastMCP's registered tools and joining each
 one to the exhaustive classification in `snoocle_server/tool_contract.py`. The

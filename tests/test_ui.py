@@ -42,6 +42,29 @@ def test_ui_static_assets_served():
     assert client.get("/ui/style.css").status_code == 200
 
 
+def test_studio_shell_and_compiled_assets_are_served():
+    r = client.get("/studio/")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "/studio/assets/" in r.text
+    asset = next(part.split('"')[0] for part in r.text.split('src="') if "/studio/assets/" in part)
+    assert client.get(asset).status_code == 200
+
+
+def test_studio_direct_route_refresh_uses_the_spa_shell():
+    r = client.get("/studio/runs")
+    assert r.status_code == 200
+    assert "Snoocle Studio" in r.text
+    assert client.get("/studio/assets/not-a-real-file.js").status_code == 404
+
+
+def test_studio_shell_is_exempt_but_api_stays_gated(token_enabled):
+    assert client.get("/studio/configuration").status_code == 200
+    assert client.get("/v1/songs").status_code == 401
+    # Prefix matching must not make similarly named future routes public.
+    assert client.get("/studio-private").status_code == 401
+
+
 def test_workbench_exposes_ranked_source_preferences():
     script = client.get("/ui/app.js").text
     assert "Ranked source sites" in script

@@ -1,4 +1,5 @@
 .venv/
+studio/node_modules/
 __pycache__/
 *.pyc
 *.egg-info/

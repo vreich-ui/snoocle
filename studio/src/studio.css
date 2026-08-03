@@ -1,0 +1,16 @@
+:root { color: #e8edf2; background: #111827; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input { font: inherit; }
+.studio-shell { display: grid; grid-template-columns: 17rem 1fr; min-height: 100vh; }
+header { grid-row: span 2; background: #172033; padding: 2rem 1.25rem; }
+h1, h2, p { margin-top: 0; }
+h1 { font-size: 2rem; }
+.eyebrow { color: #8ab4f8; font-size: .75rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.token-field { display: grid; gap: .4rem; font-size: .82rem; }
+.token-field input { border: 1px solid #526078; border-radius: .35rem; background: #0f172a; color: inherit; padding: .55rem; width: 100%; }
+nav { display: flex; flex-wrap: wrap; gap: .5rem; padding: 1rem 1.5rem; border-bottom: 1px solid #28354c; }
+nav button { border: 1px solid #42526d; border-radius: 999px; background: transparent; color: inherit; cursor: pointer; padding: .45rem .8rem; }
+nav button:hover, nav button:focus-visible, nav button.selected { background: #315da8; border-color: #7ca6ed; outline: none; }
+.workspace { margin: 2.5rem auto; max-width: 50rem; padding: 0 1.5rem; width: 100%; }
+@media (max-width: 700px) { .studio-shell { display: block; } header { padding: 1.25rem; } nav { padding: 1rem; } }

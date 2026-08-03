@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { getBearerToken, saveBearerToken } from "./api";
 import { sectionFromPath, sectionPath, studioSections, type StudioSection } from "./navigation";
 import "./studio.css";
+
+const ToolStudio = lazy(() => import("./ToolStudio").then((module) => ({ default: module.ToolStudio })));
 
 function useCurrentSection() {
   const [section, setSection] = useState<StudioSection>(() => sectionFromPath(window.location.pathname));
@@ -58,11 +60,17 @@ export function StudioApp() {
           </button>
         ))}
       </nav>
-      <section aria-labelledby="section-heading" className="workspace" tabIndex={-1}>
-        <p className="eyebrow">Workspace</p>
-        <h2 id="section-heading">{section}</h2>
-        <p>Connect your Snoocle workflow here. API requests use the bearer token from this tab only.</p>
-      </section>
+      {section === "Tool Studio" ? (
+        <Suspense fallback={<section className="workspace" role="status">Loading Tool Studio…</section>}>
+          <ToolStudio token={token} />
+        </Suspense>
+      ) : (
+        <section aria-labelledby="section-heading" className="workspace" tabIndex={-1}>
+          <p className="eyebrow">Workspace</p>
+          <h2 id="section-heading">{section}</h2>
+          <p>Connect your Snoocle workflow here. API requests use the bearer token from this tab only.</p>
+        </section>
+      )}
     </main>
   );
 }

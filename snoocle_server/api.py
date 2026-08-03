@@ -13,14 +13,20 @@ import os
 import secrets
 import tempfile
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.datastructures import Headers
@@ -30,6 +36,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import __version__
 from .audio import stems
 from .audio import utils as audio_utils
+from .audio.artifacts import (
+    AudioArtifactError,
+    AudioArtifactNotFound,
+    AudioArtifactQuotaError,
+    AudioArtifactValidationError,
+    get_audio_artifact_store,
+)
 from .batch import MAX_ITEMS_PER_SUBMIT, parse_batch_line
 from .audio.acquire import AcquisitionError, YouTubeAuthError, acquire
 from .config import settings
@@ -252,10 +265,23 @@ def _store_error_response(e: StoreError, not_found_status: int = 404) -> HTTPExc
     return HTTPException(status_code=not_found_status, detail=str(e))
 
 
-def _asdict(obj: Any) -> Any:
-    if dataclasses.is_dataclass(obj):
-        return dataclasses.asdict(obj)
-    return obj
+def _artifact_http_error(error: AudioArtifactError) -> HTTPException:
+    if isinstance(error, AudioArtifactNotFound):
+        return HTTPException(status_code=404, detail="audio artifact not found")
+    if isinstance(error, AudioArtifactQuotaError):
+        return HTTPException(status_code=429, detail=str(error))
+    if isinstance(error, AudioArtifactValidationError):
+        return HTTPException(status_code=422, detail=str(error))
+    return HTTPException(status_code=503, detail="audio artifact storage is unavailable")
+
+
+@contextmanager
+def _materialized_audio_ref(audio_ref: str):
+    try:
+        with get_audio_artifact_store().materialize(audio_ref) as path:
+            yield path
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
 
 
 # --- health / meta ---------------------------------------------------------
@@ -326,6 +352,17 @@ def healthz() -> dict:
             "problem": provider_preflight(settings.llm_provider),
         },
         "store": backend_label(),  # "firestore" | "memory"
+        "audioArtifacts": (
+            "gcs"
+            if (
+                settings.audio_artifact_backend.strip().lower() == "gcs"
+                or (
+                    settings.audio_artifact_backend.strip().lower() == "auto"
+                    and settings.audio_artifact_gcs_bucket
+                )
+            )
+            else "local"
+        ),
         "mcpEndpoint": _mcp.settings.streamable_http_path,  # embedded MCP transport
     }
 
@@ -435,18 +472,188 @@ class AcquireRequest(BaseModel):
     youtubeUrlOrId: Optional[str] = None
 
 
-@app.post("/v1/audio/acquire")
-def post_acquire(req: AcquireRequest):
+def _acquire_artifact(req: AcquireRequest) -> dict:
     try:
         acquired = acquire(title=req.title, artist=req.artist, video_url_or_id=req.youtubeUrlOrId)
     except AcquisitionError as e:
         return _acquisition_error_response(e)
-    return _asdict(acquired)
+    try:
+        artifact = get_audio_artifact_store().create(
+            acquired.path,
+            filename=Path(acquired.path).name,
+            source="youtube",
+            youtube_video_id=acquired.video_id,
+        )
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    return {
+        "artifact": artifact.to_public(),
+        "youtubeVideoId": acquired.video_id,
+        "videoTitle": acquired.video_title,
+        "fromCache": acquired.from_cache,
+    }
+
+
+@app.post("/v1/audio/acquire", status_code=201)
+def post_acquire(req: AcquireRequest):
+    """Acquire YouTube audio into an opaque temporary artifact.
+
+    The historical route is retained, but it no longer returns the server's
+    cache path. Use ``artifact.audioRef`` in subsequent REST or MCP calls.
+    """
+    return _acquire_artifact(req)
+
+
+@app.post("/v1/audio/artifacts/acquire", status_code=201)
+def post_audio_artifact_acquire(req: AcquireRequest):
+    return _acquire_artifact(req)
+
+
+async def _save_bounded_artifact_upload(upload: UploadFile) -> tuple[Path, Path]:
+    suffix = Path(upload.filename or "audio.bin").suffix.lower()
+    if len(suffix) > 12 or not all(ch.isalnum() or ch == "." for ch in suffix):
+        suffix = ".bin"
+    directory = Path(tempfile.mkdtemp(prefix="snoocle-artifact-upload-"))
+    destination = directory / f"input{suffix or '.bin'}"
+    written = 0
+    try:
+        with destination.open("wb") as stream:
+            while chunk := await upload.read(1024 * 1024):
+                written += len(chunk)
+                if written > settings.audio_artifact_max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"audio upload exceeds {settings.audio_artifact_max_bytes} bytes"
+                        ),
+                    )
+                stream.write(chunk)
+    except Exception:
+        import shutil
+
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return destination, directory
+
+
+@app.post("/v1/audio/artifacts", status_code=201)
+async def post_audio_artifact(file: UploadFile = File(...)) -> dict:
+    """Validate and retain one uploaded audio file under an opaque reference."""
+    import shutil
+
+    source, directory = await _save_bounded_artifact_upload(file)
+    try:
+        artifact = await run_in_threadpool(
+            get_audio_artifact_store().create,
+            source,
+            filename=file.filename,
+            declared_content_type=file.content_type,
+            source="upload",
+        )
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    return {"artifact": artifact.to_public()}
+
+
+@app.post("/v1/audio/artifacts/cleanup")
+def post_audio_artifact_cleanup() -> dict:
+    try:
+        removed = get_audio_artifact_store().cleanup_expired()
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    return {"removed": removed}
+
+
+@app.get("/v1/audio/artifacts/{audio_ref}")
+def get_audio_artifact(audio_ref: str) -> dict:
+    try:
+        artifact = get_audio_artifact_store().get(audio_ref)
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    return {"artifact": artifact.to_public()}
+
+
+@app.delete("/v1/audio/artifacts/{audio_ref}")
+def delete_audio_artifact(audio_ref: str) -> dict:
+    try:
+        removed = get_audio_artifact_store().delete(audio_ref)
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    if not removed:
+        raise HTTPException(status_code=404, detail="audio artifact not found")
+    return {"audioRef": audio_ref, "deleted": True}
+
+
+def _requested_byte_range(value: str | None, size: int) -> tuple[int, int, bool]:
+    if not value:
+        return 0, size - 1, False
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("only one bytes range is supported")
+    raw = value[6:].strip()
+    if "-" not in raw:
+        raise ValueError("invalid bytes range")
+    first, last = raw.split("-", 1)
+    try:
+        if first:
+            start = int(first)
+            end = int(last) if last else size - 1
+        else:
+            suffix = int(last)
+            if suffix <= 0:
+                raise ValueError("invalid suffix range")
+            start = max(0, size - suffix)
+            end = size - 1
+    except ValueError as error:
+        raise ValueError("invalid bytes range") from error
+    if start < 0 or start >= size or end < start:
+        raise ValueError("bytes range is outside the artifact")
+    return start, min(end, size - 1), True
+
+
+@app.get("/v1/audio/artifacts/{audio_ref}/content")
+def get_audio_artifact_content(audio_ref: str, request: Request):
+    try:
+        store = get_audio_artifact_store()
+        artifact = store.get(audio_ref)
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    try:
+        start, end, partial = _requested_byte_range(request.headers.get("range"), artifact.size_bytes)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=416,
+            detail=str(error),
+            headers={"Content-Range": f"bytes */{artifact.size_bytes}"},
+        ) from error
+    length = end - start + 1
+    from urllib.parse import quote
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "Content-Length": str(length),
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(artifact.filename)}",
+    }
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{artifact.size_bytes}"
+    try:
+        content = store.iter_content(audio_ref, start, end)
+    except AudioArtifactError as error:
+        raise _artifact_http_error(error) from error
+    return StreamingResponse(
+        content,
+        status_code=206 if partial else 200,
+        media_type=artifact.content_type,
+        headers=headers,
+    )
 
 
 class AnalyzeRequest(BaseModel):
     # one of: a server-side audio path, or acquisition parameters
     audioPath: Optional[str] = None
+    audioRef: Optional[str] = None
     title: Optional[str] = None
     artist: Optional[str] = None
     youtubeUrlOrId: Optional[str] = None
@@ -454,30 +661,52 @@ class AnalyzeRequest(BaseModel):
     # standard: honor SNOOCLE_MIR_MAX_ANALYSIS_SECONDS; thorough: full track.
     accuracy: Literal["fast", "standard", "thorough"] = "standard"
 
+    @model_validator(mode="after")
+    def _one_audio_input(self) -> "AnalyzeRequest":
+        if self.audioPath is not None and self.audioRef is not None:
+            raise ValueError("provide at most one of audioPath or audioRef")
+        return self
+
 
 @app.post("/v1/audio/analyze")
 async def post_analyze(req: AnalyzeRequest) -> dict:
     path = req.audioPath
+    audio_ref = req.audioRef
     video_id = None
-    if path is None:
+    if path is None and audio_ref is None:
         try:
             acquired = await run_in_threadpool(
                 acquire, title=req.title, artist=req.artist, video_url_or_id=req.youtubeUrlOrId
             )
         except AcquisitionError as e:
             return _acquisition_error_response(e)
-        path = acquired.path
         video_id = acquired.video_id
-    if not Path(path).exists():
-        raise HTTPException(status_code=404, detail=f"no such audio file: {path}")
-    # MIR is CPU-bound and runs for minutes on a full song; offload it so it
-    # doesn't block the event loop shared with the embedded MCP transport
-    # (same treatment as /v1/audio/analyze/upload).
-    try:
-        analysis = await run_in_threadpool(analyze_audio, path, req.accuracy)
-    except audio_utils.AudioToolError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    return {"audioPath": path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
+        try:
+            artifact = await run_in_threadpool(
+                get_audio_artifact_store().create,
+                acquired.path,
+                filename=Path(acquired.path).name,
+                source="youtube",
+                youtube_video_id=video_id,
+            )
+        except AudioArtifactError as error:
+            raise _artifact_http_error(error) from error
+        audio_ref = artifact.audio_ref
+        path = acquired.path
+    if audio_ref is not None and path is None:
+        with _materialized_audio_ref(audio_ref) as materialized:
+            try:
+                analysis = await run_in_threadpool(analyze_audio, materialized, req.accuracy)
+            except audio_utils.AudioToolError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+    else:
+        if path is None or not Path(path).is_file():
+            raise HTTPException(status_code=404, detail="audio input not found")
+        try:
+            analysis = await run_in_threadpool(analyze_audio, path, req.accuracy)
+        except audio_utils.AudioToolError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"audioRef": audio_ref, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
 
 
 @app.post("/v1/audio/analyze/upload")
@@ -518,6 +747,7 @@ class ReconcileRequest(BaseModel):
     provider: Optional[str] = None  # anthropic | anthropic-agent | openai | gemini | agent | mock
     model: Optional[str] = None
     audioPath: Optional[str] = None
+    audioRef: Optional[str] = None
     attachAudio: Optional[bool] = None
     youtubeVideoId: Optional[str] = None
     # For the "agent" provider: the media the song came from (YouTube watch URL
@@ -531,6 +761,8 @@ class ReconcileRequest(BaseModel):
 
     @model_validator(mode="after")
     def _forced_reason(self) -> "ReconcileRequest":
+        if self.audioPath is not None and self.audioRef is not None:
+            raise ValueError("provide at most one of audioPath or audioRef")
         if self.force and not (self.forceReason or "").strip():
             raise ValueError("forceReason is required when force=true")
         return self
@@ -555,23 +787,28 @@ def post_reconcile(req: ReconcileRequest) -> dict:
     # A MIR in the request is evidence for the reconciliation, not a promise
     # that something downstream is about to re-time the result.
     try:
-        admitted = reconcile_admitted(
-            req.title,
-            req.artist,
-            req.candidates,
-            req.mir,
-            provider=req.provider,
-            model=req.model,
-            audio_path=req.audioPath,
-            attach_audio=req.attachAudio,
-            youtube_video_id=req.youtubeVideoId,
-            media_url=req.mediaUrl,
-            force=req.force,
-            force_reason=req.forceReason,
-            batch_id=req.batchId,
-            effort_level=req.effortLevel,
-            prior_song=req.priorSong,
-        )
+        if req.audioRef is not None:
+            context = _materialized_audio_ref(req.audioRef)
+        else:
+            context = nullcontext(Path(req.audioPath) if req.audioPath is not None else None)
+        with context as resolved_audio:
+            admitted = reconcile_admitted(
+                req.title,
+                req.artist,
+                req.candidates,
+                req.mir,
+                provider=req.provider,
+                model=req.model,
+                audio_path=str(resolved_audio) if resolved_audio is not None else None,
+                attach_audio=req.attachAudio,
+                youtube_video_id=req.youtubeVideoId,
+                media_url=req.mediaUrl,
+                force=req.force,
+                force_reason=req.forceReason,
+                batch_id=req.batchId,
+                effort_level=req.effortLevel,
+                prior_song=req.priorSong,
+            )
         result = admitted.result
     except DuplicateRunError as e:
         return _duplicate_response(e)

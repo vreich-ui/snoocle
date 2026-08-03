@@ -274,6 +274,13 @@ curl -H "Authorization: Bearer $TOKEN" \
     "$URL/v1/audio/analyze/upload"
 ```
 
+Studio's reusable audio preview/upload flow uses opaque temporary artifacts.
+A production service with more than one possible instance must configure the
+private GCS backend; the local backend is development-only because Cloud Run
+filesystems are not shared. See [Temporary audio artifacts](AUDIO_ARTIFACTS.md)
+for required environment variables, bucket IAM, lifecycle cleanup, limits, and
+the no-public-URL security contract.
+
 Identity tokens expire (~1 hour) — re-run `print-identity-token` for a fresh
 one rather than hardcoding it anywhere.
 

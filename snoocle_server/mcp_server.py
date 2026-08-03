@@ -5,9 +5,10 @@ Design notes (patterns reused per the brief):
   analyze_audio / reconcile_song / get_song_version ...), NOT one monolithic
   tool — same shape as Dr-Lurie-Blog/CMS-Agent's step-scoped tools
   (trigger_netlify_build, save_json_blob_publish_by_time).
-- Audio tools accept either a server-side path OR base64 content
-  (`input_base64`) and can return base64 — the CMS-Agent `save_artifact`
-  fallback for agent environments that can't move raw binary.
+- Audio tools prefer an opaque temporary `audio_ref`, while retaining a
+  server-side path or base64 content for backwards-compatible trusted callers.
+  Returned binary outputs are opaque artifacts (and optionally base64), never
+  server paths.
 - Local-first routing (pdf-tool): the deterministic audio tools never touch
   an LLM; reconcile_song is the only AI-invoking tool.
 - save_song exposes expected_version optimistic locking —
@@ -29,6 +30,7 @@ import json
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -37,6 +39,12 @@ from pydantic import ValidationError
 
 from . import __version__
 from .audio import utils as audio_utils
+from .audio.artifacts import (
+    AudioArtifactError,
+    AudioArtifactNotFound,
+    AudioArtifactValidationError,
+    get_audio_artifact_store,
+)
 from .audio.acquire import acquire as _acquire
 from .config import settings
 from .deterministic import (
@@ -275,6 +283,42 @@ def _existing_path(value: str, *, label: str) -> Path:
     return path
 
 
+@contextmanager
+def _resolved_audio_input(
+    audio_path: str | None,
+    audio_ref: str | None,
+    *,
+    label: str = "audio",
+):
+    """Resolve an opaque artifact or the deprecated trusted local-path input."""
+    if audio_path is not None and audio_ref is not None:
+        raise _MCPDeterministicInputError(
+            "invalid_audio_source",
+            f"provide at most one of {label}_path or {label}_ref",
+        )
+    if audio_ref is not None:
+        try:
+            with get_audio_artifact_store().materialize(audio_ref) as path:
+                yield path
+        except AudioArtifactNotFound as error:
+            raise _MCPDeterministicInputError(
+                "audio_artifact_not_found",
+                f"{label}_ref does not name an available audio artifact",
+                field=f"{label}_ref",
+            ) from error
+        except AudioArtifactError as error:
+            raise _MCPDeterministicInputError(
+                "audio_artifact_unavailable",
+                f"{label}_ref could not be resolved because artifact storage is unavailable",
+                field=f"{label}_ref",
+            ) from error
+        return
+    if audio_path is not None:
+        yield _existing_path(audio_path, label=f"{label}_path")
+        return
+    yield None
+
+
 def _validation_details(error: ValidationError) -> list[dict]:
     return json.loads(error.json(include_input=False, include_url=False))
 
@@ -406,8 +450,36 @@ def _materialize_input(
     raise ValueError("provide input_path or input_base64")
 
 
+@contextmanager
+def _materialized_tool_input(
+    input_path: str | None,
+    input_ref: str | None,
+    input_base64: str | None,
+    input_format: str,
+):
+    sources = sum(value is not None for value in (input_path, input_ref, input_base64))
+    if sources != 1:
+        raise ValueError("provide exactly one of input_ref, input_path, or input_base64")
+    if input_ref is not None or input_path is not None:
+        with _resolved_audio_input(input_path, input_ref, label="input") as resolved:
+            if resolved is None:  # pragma: no cover - guarded above
+                raise ValueError("audio input is required")
+            yield resolved
+        return
+    yield _materialize_input(None, input_base64, input_format)
+
+
 def _audio_result(dst: Path, return_base64: bool) -> dict:
-    out: dict = {"path": str(dst), "probe": dataclasses.asdict(audio_utils.probe(dst))}
+    try:
+        artifact = get_audio_artifact_store().create(
+            dst, filename=dst.name, source="mcp"
+        )
+    except AudioArtifactError as error:
+        raise RuntimeError("audio artifact storage could not retain the output") from error
+    out: dict = {
+        "artifact": artifact.to_public(),
+        "probe": dataclasses.asdict(audio_utils.probe(dst)),
+    }
     if return_base64:
         out["base64"] = base64.b64encode(dst.read_bytes()).decode()
     return out
@@ -662,54 +734,77 @@ def validate_song_json(song_json: str) -> dict:
 
 @mcp.tool()
 def analyze_full_track_mir(
-    audio_path: str, accuracy: Literal["standard", "thorough"] = "standard"
+    audio_path: Optional[str] = None,
+    accuracy: Literal["standard", "thorough"] = "standard",
+    audio_ref: Optional[str] = None,
 ) -> dict:
     """Analyze one caller-provided server audio file across the full track.
 
-    Reads only the named local file. No acquisition, network, cache, model, or
-    persistence access occurs.
+    Resolves an opaque artifact or reads the named legacy local file. No
+    acquisition, cache, model, or persistence access occurs; an artifact may
+    read the configured shared backend.
     """
 
     def call() -> dict:
-        path = _existing_path(audio_path, label="audio_path")
-        mir = _analyze_audio(path, accuracy=accuracy)
+        with _resolved_audio_input(audio_path, audio_ref) as path:
+            if path is None:
+                raise _MCPDeterministicInputError(
+                    "missing_audio_source", "provide audio_ref or audio_path"
+                )
+            mir = _analyze_audio(path, accuracy=accuracy)
         return {"analysis": mir.model_dump(mode="json")}
 
     return _deterministic_mcp_response(
         "analyze_full_track_mir",
-        {"audioPath": audio_path, "accuracy": accuracy},
+        {"audioRef": audio_ref, "legacyAudioPath": audio_path is not None, "accuracy": accuracy},
         call,
         lambda result: {
             "durationSeconds": result["analysis"]["duration_seconds"],
             "beats": len(result["analysis"]["beats"]),
             "chords": len(result["analysis"]["chords"]),
         },
+        network_access="artifact_backend" if audio_ref is not None else "none",
     )
 
 
 @mcp.tool()
-def analyze_mir_window(audio_path: str, start_seconds: float, end_seconds: float) -> dict:
+def analyze_mir_window(
+    audio_path: Optional[str] = None,
+    start_seconds: float = 0.0,
+    end_seconds: float = 0.0,
+    audio_ref: Optional[str] = None,
+) -> dict:
     """Analyze a bounded window of one caller-provided server audio file."""
 
     def call() -> dict:
-        path = _existing_path(audio_path, label="audio_path")
-        if start_seconds < 0 or end_seconds <= start_seconds:
-            raise _MCPDeterministicInputError(
-                "invalid_time_window",
-                "start_seconds must be non-negative and end_seconds must be greater",
-            )
-        mir = _analyze_window(path, start_seconds, end_seconds)
+        with _resolved_audio_input(audio_path, audio_ref) as path:
+            if path is None:
+                raise _MCPDeterministicInputError(
+                    "missing_audio_source", "provide audio_ref or audio_path"
+                )
+            if start_seconds < 0 or end_seconds <= start_seconds:
+                raise _MCPDeterministicInputError(
+                    "invalid_time_window",
+                    "start_seconds must be non-negative and end_seconds must be greater",
+                )
+            mir = _analyze_window(path, start_seconds, end_seconds)
         return {"analysis": mir.model_dump(mode="json")}
 
     return _deterministic_mcp_response(
         "analyze_mir_window",
-        {"audioPath": audio_path, "startSeconds": start_seconds, "endSeconds": end_seconds},
+        {
+            "audioRef": audio_ref,
+            "legacyAudioPath": audio_path is not None,
+            "startSeconds": start_seconds,
+            "endSeconds": end_seconds,
+        },
         call,
         lambda result: {
             "beats": len(result["analysis"]["beats"]),
             "chords": len(result["analysis"]["chords"]),
             "windows": len(result["analysis"]["analyzed_windows"]),
         },
+        network_access="artifact_backend" if audio_ref is not None else "none",
     )
 
 
@@ -1060,27 +1155,49 @@ def validate_song_theory(song_json: str, key_name: Optional[str] = None) -> dict
 
 @mcp.tool()
 def calculate_recording_offset(
-    reference_audio_path: str,
-    other_audio_path: str,
+    reference_audio_path: str = "",
+    other_audio_path: str = "",
     max_offset_seconds: float = 30.0,
+    reference_audio_ref: Optional[str] = None,
+    other_audio_ref: Optional[str] = None,
 ) -> dict:
     """Estimate a constant offset between two caller-provided recordings."""
 
     def call() -> dict:
-        reference = _existing_path(reference_audio_path, label="reference_audio_path")
-        other = _existing_path(other_audio_path, label="other_audio_path")
-        if not 0 < max_offset_seconds <= 300:
-            raise _MCPDeterministicInputError(
-                "invalid_offset_bound", "max_offset_seconds must be in (0, 300]"
-            )
-        estimate = _estimate_offset(reference, other, max_offset_seconds=max_offset_seconds)
+        with _resolved_audio_input(
+            reference_audio_path or None, reference_audio_ref, label="reference_audio"
+        ) as reference:
+            with _resolved_audio_input(
+                other_audio_path or None, other_audio_ref, label="other_audio"
+            ) as other:
+                if reference is None or other is None:
+                    raise _MCPDeterministicInputError(
+                        "missing_audio_source", "provide both reference and other audio"
+                    )
+                if not 0 < max_offset_seconds <= 300:
+                    raise _MCPDeterministicInputError(
+                        "invalid_offset_bound", "max_offset_seconds must be in (0, 300]"
+                    )
+                estimate = _estimate_offset(
+                    reference, other, max_offset_seconds=max_offset_seconds
+                )
         return {"offsetSeconds": estimate.offset_seconds, "confidence": estimate.confidence}
 
     return _deterministic_mcp_response(
         "calculate_recording_offset",
-        {"referenceAudioPath": reference_audio_path, "otherAudioPath": other_audio_path},
+        {
+            "referenceAudioRef": reference_audio_ref,
+            "otherAudioRef": other_audio_ref,
+            "legacyReferencePath": bool(reference_audio_path),
+            "legacyOtherPath": bool(other_audio_path),
+        },
         call,
         lambda result: result,
+        network_access=(
+            "artifact_backend"
+            if reference_audio_ref is not None or other_audio_ref is not None
+            else "none"
+        ),
     )
 
 
@@ -1292,17 +1409,19 @@ def _resolve_alignment_mir(
     mir_json: str | None,
     cached_mir_json: str | None,
     audio_path: str | None,
+    audio_ref: str | None,
     recording_id: str | None,
     mir_accuracy: str,
     refresh_mir_cache: bool,
 ) -> tuple[MirAnalysis | None, dict[str, str], str | None]:
     sources = sum(
-        value is not None for value in (mir_json, cached_mir_json, audio_path, recording_id)
+        value is not None
+        for value in (mir_json, cached_mir_json, audio_path, audio_ref, recording_id)
     )
     if sources > 1:
         raise _MCPDeterministicInputError(
             "invalid_mir_source",
-            "provide at most one of mir_json, cached_mir_json, audio_path, or recording_id",
+            "provide at most one of mir_json, cached_mir_json, audio_path, audio_ref, or recording_id",
         )
     cache = {"audio": "not_applicable", "mir": "not_applicable"}
     if mir_json is not None:
@@ -1312,8 +1431,21 @@ def _resolve_alignment_mir(
         return _mir_payload(cached_mir_json), cache, None
     path: str | None = None
     resolved_recording_id = recording_id
-    if audio_path is not None:
-        path = str(_existing_path(audio_path, label="audio_path"))
+    if audio_path is not None or audio_ref is not None:
+        with _resolved_audio_input(audio_path, audio_ref) as resolved:
+            if resolved is None:  # pragma: no cover - guarded by branch
+                raise _MCPDeterministicInputError(
+                    "missing_audio_source", "provide audio_ref or audio_path"
+                )
+            path = str(resolved)
+            mir, info = _analyze_cached(
+                path,
+                accuracy=mir_accuracy,
+                compute=lambda: _analyze_audio(path, accuracy=mir_accuracy),
+                refresh=refresh_mir_cache,
+            )
+        cache["mir"] = info.status
+        return mir, cache, resolved_recording_id
     elif recording_id is not None:
         acquired = _acquire(video_url_or_id=recording_id)
         path = acquired.path
@@ -1339,6 +1471,7 @@ def _align_song_worker(
     mir_json: str | None,
     cached_mir_json: str | None,
     audio_path: str | None,
+    audio_ref: str | None,
     recording_id: str | None,
     candidates_json: str,
     lrc_json: str | None,
@@ -1357,6 +1490,7 @@ def _align_song_worker(
             mir_json=mir_json,
             cached_mir_json=cached_mir_json,
             audio_path=audio_path,
+            audio_ref=audio_ref,
             recording_id=recording_id,
             mir_accuracy=mir_accuracy,
             refresh_mir_cache=refresh_mir_cache,
@@ -1436,6 +1570,7 @@ def _align_song_worker(
             "mirSource": (
                 "json" if mir_json is not None else
                 "cache" if cached_mir_json is not None else
+                "artifact" if audio_ref is not None else
                 "audio" if audio_path is not None else
                 "recording" if recording_id is not None else "none"
             ),
@@ -1450,7 +1585,11 @@ def _align_song_worker(
             "stored": result["persistence"]["stored"],
         },
         network_access=",".join(network) or "none",
-        cache_access="mir,audio" if audio_path is not None or recording_id is not None else "none",
+        cache_access=(
+            "mir,audio"
+            if audio_path is not None or audio_ref is not None or recording_id is not None
+            else "none"
+        ),
         persistence="run_trace_and_optional_song",
     )
     if response["ok"]:
@@ -1466,6 +1605,7 @@ async def align_song_deterministically(
     mir_json: str = "",
     cached_mir_json: str = "",
     audio_path: Optional[str] = None,
+    audio_ref: Optional[str] = None,
     recording_id: Optional[str] = None,
     candidates_json: str = "[]",
     lrc_json: str = "",
@@ -1489,6 +1629,7 @@ async def align_song_deterministically(
         mir_json=mir_json or None,
         cached_mir_json=cached_mir_json or None,
         audio_path=audio_path,
+        audio_ref=audio_ref,
         recording_id=recording_id,
         candidates_json=candidates_json,
         lrc_json=lrc_json or None,
@@ -1505,6 +1646,7 @@ def _process_song_worker(
     title: str,
     artist: str,
     audio_path: str | None,
+    audio_ref: str | None,
     recording_id: str | None,
     mir_json: str | None,
     candidates_json: str | None,
@@ -1536,26 +1678,22 @@ def _process_song_worker(
         candidates = _optional_candidates_payload(candidates_json)
         lrc_lines = _optional_lrc_payload(lrc_json)
         mir = _mir_payload(mir_json)
-        resolved_audio_path = (
-            str(_existing_path(audio_path, label="audio_path"))
-            if audio_path is not None
-            else None
-        )
-        result = _process_song_deterministically(
-            title=title,
-            artist=artist,
-            audio_path=resolved_audio_path,
-            recording_id=recording_id,
-            mir=mir,
-            candidates=candidates,
-            lrc_lines=lrc_lines,
-            use_lrc=use_lrc,
-            selection_strategy=selection_strategy,
-            max_candidates=max_candidates,
-            mir_accuracy=mir_accuracy,
-            refresh_mir_cache=refresh_mir_cache,
-            refresh_discovery_cache=refresh_discovery_cache,
-        )
+        with _resolved_audio_input(audio_path, audio_ref) as resolved_audio:
+            result = _process_song_deterministically(
+                title=title,
+                artist=artist,
+                audio_path=str(resolved_audio) if resolved_audio is not None else None,
+                recording_id=recording_id,
+                mir=mir,
+                candidates=candidates,
+                lrc_lines=lrc_lines,
+                use_lrc=use_lrc,
+                selection_strategy=selection_strategy,
+                max_candidates=max_candidates,
+                mir_accuracy=mir_accuracy,
+                refresh_mir_cache=refresh_mir_cache,
+                refresh_discovery_cache=refresh_discovery_cache,
+            )
         payload = result.to_dict()
         persisted = {"requested": persist, "stored": False}
         if persist and result.alignment is not None:
@@ -1602,7 +1740,7 @@ def _process_song_worker(
         return payload
 
     network = []
-    if audio_path is None and mir_json is None:
+    if audio_path is None and audio_ref is None and mir_json is None:
         network.append("audio_acquisition")
     if candidates_json is None:
         network.append("discovery")
@@ -1613,7 +1751,8 @@ def _process_song_worker(
         {
             "title": title,
             "artist": artist,
-            "callerAudio": audio_path is not None,
+            "callerAudio": audio_path is not None or audio_ref is not None,
+            "audioRef": audio_ref,
             "callerMir": mir_json is not None,
             "callerCandidates": candidates_json is not None,
             "persist": persist,
@@ -1639,6 +1778,7 @@ async def process_song_deterministically(
     title: str,
     artist: str,
     audio_path: Optional[str] = None,
+    audio_ref: Optional[str] = None,
     recording_id: Optional[str] = None,
     mir_json: str = "",
     candidates_json: str = "",
@@ -1663,6 +1803,7 @@ async def process_song_deterministically(
         title=title,
         artist=artist,
         audio_path=audio_path,
+        audio_ref=audio_ref,
         recording_id=recording_id,
         mir_json=mir_json or None,
         candidates_json=candidates_json or None,
@@ -1679,6 +1820,18 @@ async def process_song_deterministically(
 
 
 # --- pipeline steps ----------------------------------------------------------
+
+
+def _store_acquired_audio(acquired, *, source: Literal["youtube", "mcp"] = "youtube"):
+    try:
+        return get_audio_artifact_store().create(
+            acquired.path,
+            filename=Path(acquired.path).name,
+            source=source,
+            youtube_video_id=acquired.video_id,
+        )
+    except AudioArtifactError as error:
+        raise RuntimeError("audio artifact storage could not retain the recording") from error
 
 
 @mcp.tool()
@@ -1698,12 +1851,20 @@ def acquire_audio(
 ) -> dict:
     """Acquire the song's recording from YouTube server-side (personal-use
     tool). Give a video URL/id, or title+artist to search. Cached by video id."""
-    return dataclasses.asdict(_acquire(title=title, artist=artist, video_url_or_id=youtube_url_or_id))
+    acquired = _acquire(title=title, artist=artist, video_url_or_id=youtube_url_or_id)
+    artifact = _store_acquired_audio(acquired)
+    return {
+        "artifact": artifact.to_public(),
+        "youtubeVideoId": acquired.video_id,
+        "videoTitle": acquired.video_title,
+        "fromCache": acquired.from_cache,
+    }
 
 
 @mcp.tool()
 def analyze_audio(
     audio_path: Optional[str] = None,
+    audio_ref: Optional[str] = None,
     input_base64: Optional[str] = None,
     input_format: str = "bin",
     title: Optional[str] = None,
@@ -1720,16 +1881,51 @@ def analyze_audio(
     fetch from YouTube first. Chords are the sounding harmony, never a
     fretboard shape."""
     video_id = None
-    if audio_path is None and input_base64 is None:
+    result_audio_ref = audio_ref
+    supplied = sum(value is not None for value in (audio_path, audio_ref, input_base64))
+    if supplied > 1:
+        raise ValueError("provide at most one of audio_ref, audio_path, or input_base64")
+    if supplied == 0:
         acquired = _acquire(title=title, artist=artist, video_url_or_id=youtube_url_or_id)
         audio_path = acquired.path
         video_id = acquired.video_id
+        result_audio_ref = _store_acquired_audio(acquired).audio_ref
+        analysis = _analyze_audio(audio_path, accuracy=accuracy)
+    elif audio_ref is not None:
+        with _resolved_audio_input(None, audio_ref) as resolved:
+            if resolved is None:  # pragma: no cover - guarded above
+                raise ValueError("audio_ref is required")
+            analysis = _analyze_audio(resolved, accuracy=accuracy)
+    elif input_base64 is not None:
+        if len(input_base64) > ((settings.audio_artifact_max_bytes + 2) // 3) * 4 + 8:
+            raise ValueError("uploaded audio exceeds the configured artifact size limit")
+        materialized = _materialize_input(None, input_base64, input_format)
+        analysis = _analyze_audio(materialized, accuracy=accuracy)
+        try:
+            artifact = get_audio_artifact_store().create(
+                materialized,
+                filename=f"input.{input_format.lstrip('.')}",
+                source="mcp",
+            )
+        except AudioArtifactValidationError:
+            # Backwards compatibility: this input has historically accepted
+            # ffmpeg-readable video containers too. Analyze those ephemerally,
+            # but do not mislabel them as reusable audio artifacts.
+            result_audio_ref = None
+        except AudioArtifactError as error:
+            raise RuntimeError("audio artifact storage could not retain the upload") from error
+        else:
+            result_audio_ref = artifact.audio_ref
     else:
-        # A client-supplied path (validated) or uploaded bytes (materialized to
-        # a temp file). Video containers decode fine — MIR strips video first.
-        audio_path = str(_materialize_input(audio_path, input_base64, input_format))
-    analysis = _analyze_audio(audio_path, accuracy=accuracy)
-    return {"audioPath": audio_path, "youtubeVideoId": video_id, "analysis": analysis.model_dump()}
+        with _resolved_audio_input(audio_path, None) as resolved:
+            if resolved is None:  # pragma: no cover - guarded above
+                raise ValueError("audio_path is required")
+            analysis = _analyze_audio(resolved, accuracy=accuracy)
+    return {
+        "audioRef": result_audio_ref,
+        "youtubeVideoId": video_id,
+        "analysis": analysis.model_dump(),
+    }
 
 
 @mcp.tool()
@@ -1741,6 +1937,7 @@ def reconcile_song(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     audio_path: Optional[str] = None,
+    audio_ref: Optional[str] = None,
     attach_audio: Optional[bool] = None,
     youtube_video_id: Optional[str] = None,
     media_url: Optional[str] = None,
@@ -1779,23 +1976,24 @@ def reconcile_song(
     # either), so no deterministic pass will re-time it and the model's timing
     # must survive intact. See reconcile/engine.py's TimingAuthority.
     try:
-        admitted = reconcile_admitted(
-            title,
-            artist,
-            candidates,
-            mir,
-            provider=provider,
-            model=model,
-            audio_path=audio_path,
-            attach_audio=attach_audio,
-            youtube_video_id=youtube_video_id,
-            media_url=media_url,
-            force=force,
-            force_reason=force_reason,
-            batch_id=batch_id,
-            effort_level=effort_level,
-            prior_song=prior_song,
-        )
+        with _resolved_audio_input(audio_path, audio_ref) as resolved_audio:
+            admitted = reconcile_admitted(
+                title,
+                artist,
+                candidates,
+                mir,
+                provider=provider,
+                model=model,
+                audio_path=str(resolved_audio) if resolved_audio is not None else None,
+                attach_audio=attach_audio,
+                youtube_video_id=youtube_video_id,
+                media_url=media_url,
+                force=force,
+                force_reason=force_reason,
+                batch_id=batch_id,
+                effort_level=effort_level,
+                prior_song=prior_song,
+            )
     except IdentityUnresolvedError as error:
         return _identity_error(error)
     except Exception as error:
@@ -2312,17 +2510,18 @@ def clear_song_notes(song_id: str) -> dict:
 def convert_audio(
     output_format: str,
     input_path: Optional[str] = None,
+    input_ref: Optional[str] = None,
     input_base64: Optional[str] = None,
     input_format: str = "bin",
     return_base64: bool = False,
 ) -> dict:
     """Convert an audio file between formats (mp3/wav/m4a/flac/ogg/opus) with
-    ffmpeg — deterministic, no AI. Provide input_path (server-side) or
-    input_base64 (+input_format) for clients that can't reference files."""
-    src = _materialize_input(input_path, input_base64, input_format)
-    dst = src.parent / f"{src.stem}.converted.{output_format.lstrip('.')}"
-    audio_utils.convert(src, dst)
-    return _audio_result(dst, return_base64)
+    ffmpeg — deterministic, no AI. Prefer input_ref; input_path (trusted local
+    callers) and input_base64 (+input_format) remain compatible."""
+    with _materialized_tool_input(input_path, input_ref, input_base64, input_format) as src:
+        dst = src.parent / f"{src.stem}.converted.{output_format.lstrip('.')}"
+        audio_utils.convert(src, dst)
+        return _audio_result(dst, return_base64)
 
 
 @mcp.tool()
@@ -2330,6 +2529,7 @@ def trim_audio(
     start_seconds: float,
     end_seconds: float,
     input_path: Optional[str] = None,
+    input_ref: Optional[str] = None,
     input_base64: Optional[str] = None,
     input_format: str = "bin",
     output_format: Optional[str] = None,
@@ -2337,16 +2537,17 @@ def trim_audio(
 ) -> dict:
     """Crop an audio file to [start_seconds, end_seconds) with ffmpeg —
     deterministic, exact cut points, no AI."""
-    src = _materialize_input(input_path, input_base64, input_format)
-    fmt = (output_format or src.suffix.lstrip(".") or "wav").lstrip(".")
-    dst = src.parent / f"{src.stem}.trimmed.{fmt}"
-    audio_utils.trim(src, dst, start_seconds, end_seconds)
-    return _audio_result(dst, return_base64)
+    with _materialized_tool_input(input_path, input_ref, input_base64, input_format) as src:
+        fmt = (output_format or src.suffix.lstrip(".") or "wav").lstrip(".")
+        dst = src.parent / f"{src.stem}.trimmed.{fmt}"
+        audio_utils.trim(src, dst, start_seconds, end_seconds)
+        return _audio_result(dst, return_base64)
 
 
 @mcp.tool()
 def normalize_audio(
     input_path: Optional[str] = None,
+    input_ref: Optional[str] = None,
     input_base64: Optional[str] = None,
     input_format: str = "bin",
     target_lufs: float = -16.0,
@@ -2354,23 +2555,24 @@ def normalize_audio(
     return_base64: bool = False,
 ) -> dict:
     """EBU R128 loudness-normalize an audio file with ffmpeg — no AI."""
-    src = _materialize_input(input_path, input_base64, input_format)
-    fmt = (output_format or src.suffix.lstrip(".") or "wav").lstrip(".")
-    dst = src.parent / f"{src.stem}.normalized.{fmt}"
-    audio_utils.normalize(src, dst, target_lufs=target_lufs)
-    return _audio_result(dst, return_base64)
+    with _materialized_tool_input(input_path, input_ref, input_base64, input_format) as src:
+        fmt = (output_format or src.suffix.lstrip(".") or "wav").lstrip(".")
+        dst = src.parent / f"{src.stem}.normalized.{fmt}"
+        audio_utils.normalize(src, dst, target_lufs=target_lufs)
+        return _audio_result(dst, return_base64)
 
 
 @mcp.tool()
 def probe_audio(
     input_path: Optional[str] = None,
+    input_ref: Optional[str] = None,
     input_base64: Optional[str] = None,
     input_format: str = "bin",
 ) -> dict:
     """Inspect an audio file (duration, codec, sample rate, channels) with
     ffprobe — no AI."""
-    src = _materialize_input(input_path, input_base64, input_format)
-    return dataclasses.asdict(audio_utils.probe(src))
+    with _materialized_tool_input(input_path, input_ref, input_base64, input_format) as src:
+        return dataclasses.asdict(audio_utils.probe(src))
 
 
 # --- meta --------------------------------------------------------------------

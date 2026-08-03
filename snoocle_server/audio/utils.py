@@ -40,6 +40,7 @@ class AudioProbe:
     sample_rate: int
     channels: int
     codec: str
+    video_streams: int = 0
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -76,6 +77,7 @@ def probe(path: str | Path) -> AudioProbe:
         sample_rate=int(st.get("sample_rate") or 0),
         channels=int(st.get("channels") or 0),
         codec=st.get("codec_name", ""),
+        video_streams=sum(1 for stream in info.get("streams", []) if stream.get("codec_type") == "video"),
     )
 
 

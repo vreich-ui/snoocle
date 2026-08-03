@@ -58,8 +58,9 @@ annotations:
 - `confirmation_required`: has persistent effects, model cost, or another
   deliberate side effect a GUI should confirm.
 - `server_filesystem_restricted`: accepts a server-local path. A browser must
-  not be allowed to supply arbitrary paths; it may use a documented upload or
-  base64 input when that tool supports one.
+  not be allowed to supply arbitrary paths. Current audio tools also accept an
+  opaque `audio_ref` created by the authenticated artifact API; `audio_path`
+  remains only for trusted local MCP callers and backwards compatibility.
 
 `expectedDuration` is a coarse UI scheduling hint (`instant`, `seconds`, or
 `minutes`), not a timeout. `specializedRenderer` selects a richer viewer when

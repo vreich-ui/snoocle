@@ -29,7 +29,8 @@ RUN npm run build
 #     filesystem is ephemeral and songs must survive instance restarts. The
 #     store uses Application Default Credentials; set GOOGLE_CLOUD_PROJECT at
 #     deploy time (the runtime service account needs roles/datastore.user).
-#   * /data holds only the audio-cache (a best-effort, disposable cache).
+#   * /data holds only disposable caches/local-dev artifacts. Production audio
+#     artifacts use the private GCS backend documented in docs/AUDIO_ARTIFACTS.md.
 #   * Deploy with --timeout=3600: a real analyze can take 2-8 min and Cloud
 #     Run's default 300s request timeout would silently kill it.
 # =============================================================================

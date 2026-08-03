@@ -102,8 +102,15 @@ class _Recorder:
 
 
 def _analyze(**extra):
-    body = {"title": "Paint It Black", "artist": "The Rolling Stones", "provider": "anthropic"}
+    body = {
+        "title": "Paint It Black",
+        "artist": "The Rolling Stones",
+        "provider": "anthropic",
+        "agentPolicy": "always",
+    }
     body.update(extra)
+    if body["provider"] == "mock":
+        body.setdefault("allowTestOutput", True)
     return client.post("/v1/songs/analyze", json=body)
 
 

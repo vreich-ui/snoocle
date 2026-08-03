@@ -103,7 +103,13 @@ def isolated_stores(monkeypatch):
 def _make_song_via_mock() -> tuple[str, str]:
     r = client.post(
         "/v1/songs/analyze",
-        json={"title": "Eval", "artist": "Tester", "provider": "mock", "skipAudio": True},
+        json={
+            "title": "Eval",
+            "artist": "Tester",
+            "provider": "mock",
+            "skipAudio": True,
+            "allowTestOutput": True,
+        },
     )
     assert r.status_code == 200, r.text
     return r.json()["songId"], r.json()["storedVersion"]

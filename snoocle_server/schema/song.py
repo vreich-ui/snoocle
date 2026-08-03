@@ -267,6 +267,10 @@ class Song(_Model):
     # a non-None value means "re-analyzed under the correct id over there",
     # while every prior version of THIS id remains fully readable.
     supersededBy: Optional[str] = None
+    # Explicit taint bit for output produced by provider=mock. Test artifacts
+    # remain schema-valid and inspectable, but production storage requires an
+    # explicit allow_test_output opt-in.
+    testOnly: bool = False
 
     @field_validator("id")
     @classmethod

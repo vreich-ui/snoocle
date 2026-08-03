@@ -81,14 +81,16 @@ class StageObservation:
     input_summary: dict[str, Any] = field(default_factory=dict)
     output_summary: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    model_calls: int = 0
+    model_cost_usd: float = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "elapsedMs": self.elapsed_ms,
             "cacheStatus": self.cache_status,
-            "modelCalls": 0,
-            "modelCostUSD": 0,
+            "modelCalls": self.model_calls,
+            "modelCostUSD": self.model_cost_usd,
             "inputSummary": self.input_summary,
             "outputSummary": self.output_summary,
             "warnings": list(self.warnings),

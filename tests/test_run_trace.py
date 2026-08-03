@@ -226,7 +226,7 @@ def test_analyze_returns_run_id_and_trace_is_fetchable():
     r = client.post(
         "/v1/songs/analyze",
         json={"title": "Offline", "artist": "Tester", "provider": "mock",
-              "skipAudio": True, "analysisDepth": "fast"},
+              "skipAudio": True, "analysisDepth": "fast", "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text
     run_id = r.json()["runId"]
@@ -253,6 +253,7 @@ def test_guidance_and_prior_song_are_accepted():
     r = client.post(
         "/v1/songs/analyze",
         json={"title": "Fixme", "artist": "Tester", "provider": "mock", "skipAudio": True,
-              "guidance": "the chorus is G not C", "priorSong": {"any": "shape"}},
+              "guidance": "the chorus is G not C", "priorSong": {"any": "shape"},
+              "allowTestOutput": True},
     )
     assert r.status_code == 200, r.text

@@ -316,7 +316,12 @@ class _StaticReconciler:
 
 
 def _analyze(**extra):
-    body = {"title": "Rain", "artist": "CCR", "provider": "anthropic"}
+    body = {
+        "title": "Rain",
+        "artist": "CCR",
+        "provider": "anthropic",
+        "agentPolicy": "always",
+    }
     body.update(extra)
     return client.post("/v1/songs/analyze", json=body)
 

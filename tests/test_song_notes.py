@@ -515,7 +515,8 @@ def test_analyze_rejects_over_cap_guidance_at_the_rest_boundary(client, monkeypa
     ok = client.post(
         "/v1/songs/analyze",
         json={"title": "Fixme", "artist": "Tester", "provider": "mock",
-              "skipAudio": True, "guidance": "y" * MAX_NOTES_CHARS},
+              "skipAudio": True, "guidance": "y" * MAX_NOTES_CHARS,
+              "allowTestOutput": True},
     )
     assert ok.status_code == 200, ok.text
     assert client.get(f"/v1/songs/{SONG_ID}/notes").json()["correction"]["notes"] == (
@@ -610,7 +611,7 @@ def _analyze(client, **extra) -> dict:
     r = client.post(
         "/v1/songs/analyze",
         json={"title": "Fixme", "artist": "Tester", "provider": "mock",
-              "skipAudio": True, **extra},
+              "skipAudio": True, "allowTestOutput": True, **extra},
     )
     assert r.status_code == 200, r.text
     return r.json()
@@ -851,6 +852,7 @@ def test_mcp_analyze_takes_guidance_and_exposes_what_it_left_behind(client, reco
         mcp_mod.analyze_and_store_song(
             title="Fixme", artist="Tester", provider="mock", skip_audio=True,
             guidance="change the C to a B in line 12",
+            allow_test_output=True,
         )
     )
     assert out["songId"] == SONG_ID

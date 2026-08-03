@@ -1,5 +1,12 @@
 # Snoocle server — architecture
 
+> Deterministic-first migration: production analysis now defaults to
+> `agentPolicy=unresolved_only`. The complete ordering diagram, mock-output
+> migration rule, benchmark command, and acceptance matrix are maintained in
+> [DETERMINISTIC_ACCEPTANCE.md](DETERMINISTIC_ACCEPTANCE.md). Use
+> `agentPolicy=always` only to preserve the historical full-reconciliation
+> experiment during comparison or migration.
+
 One Python service (FastAPI + an MCP server sharing the same service layer).
 Durable state lives in **Firestore** (the song store); the audio cache is
 disposable local disk. Everything else is stateless and env-configured

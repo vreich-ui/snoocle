@@ -40,6 +40,11 @@ class DeterministicProcessResult:
     cache: dict[str, str]
     alignment: DeterministicAlignmentResult | None = None
     selection: dict[str, Any] | None = None
+    # Internal evidence retained for the deterministic-first policy layer.
+    # These are deliberately omitted from ``to_dict``: callers receive the
+    # bounded summaries/conflict packet, never full source or MIR payloads.
+    mir: MirAnalysis | None = None
+    candidates: tuple[CandidateSource, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         stages = [item.to_dict() for item in self.observations]
@@ -106,6 +111,7 @@ def process_song_deterministically_service(
     mir_accuracy: str = "standard",
     refresh_mir_cache: bool = False,
     refresh_discovery_cache: bool = False,
+    skip_audio: bool = False,
 ) -> DeterministicProcessResult:
     """Process one song through the complete deterministic service chain."""
     observations: list[StageObservation] = []
@@ -182,25 +188,46 @@ def process_song_deterministically_service(
                 output_summary={"source": "caller_mir"},
             )
         )
-    else:
-        acquired, observation = observe(
-            "acquire_audio",
-            lambda: acquire_audio(
-                title=identity.title,
-                artist=identity.artist,
-                video_url_or_id=recording_id,
-            ),
-            input_summary={"recordingIdPresent": recording_id is not None},
-            summarize=lambda value: {
-                "recordingId": value.video_id,
-                "durationSeconds": value.duration_seconds,
-            },
+    elif skip_audio:
+        observations.append(
+            StageObservation(
+                name="acquire_audio",
+                elapsed_ms=0,
+                input_summary={"required": False, "skipAudio": True},
+                output_summary={"source": "skipped"},
+            )
         )
-        cache["audio"] = "hit" if acquired.from_cache else "miss"
-        observation = _with_cache_status(observation, cache["audio"])
-        observations.append(observation)
-        resolved_path = acquired.path
-        youtube_video_id = acquired.video_id
+    else:
+        try:
+            acquired, observation = observe(
+                "acquire_audio",
+                lambda: acquire_audio(
+                    title=identity.title,
+                    artist=identity.artist,
+                    video_url_or_id=recording_id,
+                ),
+                input_summary={"recordingIdPresent": recording_id is not None},
+                summarize=lambda value: {
+                    "recordingId": value.video_id,
+                    "durationSeconds": value.duration_seconds,
+                },
+            )
+        except Exception as error:  # acquisition is evidence, not authority
+            observations.append(
+                StageObservation(
+                    name="acquire_audio",
+                    elapsed_ms=0,
+                    input_summary={"recordingIdPresent": recording_id is not None},
+                    output_summary={"status": "failed", "errorType": type(error).__name__},
+                    warnings=(str(error)[:500],),
+                )
+            )
+        else:
+            cache["audio"] = "hit" if acquired.from_cache else "miss"
+            observation = _with_cache_status(observation, cache["audio"])
+            observations.append(observation)
+            resolved_path = acquired.path
+            youtube_video_id = acquired.video_id
 
     if mir is not None:
         resolved_mir = mir
@@ -216,26 +243,59 @@ def process_song_deterministically_service(
                 },
             )
         )
+    elif skip_audio:
+        resolved_mir = None
+        observations.append(
+            StageObservation(
+                name="mir",
+                elapsed_ms=0,
+                input_summary={"skipAudio": True},
+                output_summary={"status": "skipped"},
+            )
+        )
     else:
         if resolved_path is None:
-            raise ValueError("audio or MIR evidence is required")
-        (resolved_mir, mir_info), observation = observe(
-            "mir",
-            lambda: analyze_cached(
-                resolved_path,
-                accuracy=mir_accuracy,
-                compute=lambda: analyze_audio(resolved_path, accuracy=mir_accuracy),
-                refresh=refresh_mir_cache,
-            ),
-            input_summary={"accuracy": mir_accuracy, "refresh": refresh_mir_cache},
-            summarize=lambda value: {
-                "durationSeconds": value[0].duration_seconds,
-                "beats": len(value[0].beats),
-                "chords": len(value[0].chords),
-            },
-        )
-        cache["mir"] = mir_info.status
-        observations.append(_with_cache_status(observation, mir_info.status))
+            resolved_mir = None
+            observations.append(
+                StageObservation(
+                    name="mir",
+                    elapsed_ms=0,
+                    input_summary={"audioPresent": False},
+                    output_summary={"status": "skipped"},
+                    warnings=("audio acquisition did not produce a path",),
+                )
+            )
+        else:
+            try:
+                (resolved_mir, mir_info), observation = observe(
+                    "mir",
+                    lambda: analyze_cached(
+                        resolved_path,
+                        accuracy=mir_accuracy,
+                        compute=lambda: analyze_audio(resolved_path, accuracy=mir_accuracy),
+                        refresh=refresh_mir_cache,
+                    ),
+                    input_summary={"accuracy": mir_accuracy, "refresh": refresh_mir_cache},
+                    summarize=lambda value: {
+                        "durationSeconds": value[0].duration_seconds,
+                        "beats": len(value[0].beats),
+                        "chords": len(value[0].chords),
+                    },
+                )
+            except Exception as error:
+                resolved_mir = None
+                observations.append(
+                    StageObservation(
+                        name="mir",
+                        elapsed_ms=0,
+                        input_summary={"accuracy": mir_accuracy, "refresh": refresh_mir_cache},
+                        output_summary={"status": "failed", "errorType": type(error).__name__},
+                        warnings=(str(error)[:500],),
+                    )
+                )
+            else:
+                cache["mir"] = mir_info.status
+                observations.append(_with_cache_status(observation, mir_info.status))
 
     if candidates is not None:
         resolved_candidates = list(candidates)
@@ -248,22 +308,49 @@ def process_song_deterministically_service(
             )
         )
     else:
-        (resolved_candidates, discovery_info), observation = observe(
-            "discovery",
-            lambda: discover_cached(
-                identity.title,
-                identity.artist,
-                max_candidates=max_candidates,
-                discover=lambda: discover_sources(
+        try:
+            (resolved_candidates, discovery_info), observation = observe(
+                "discovery",
+                lambda: discover_cached(
                     identity.title,
                     identity.artist,
                     max_candidates=max_candidates,
+                    discover=lambda: discover_sources(
+                        identity.title,
+                        identity.artist,
+                        max_candidates=max_candidates,
+                    ),
+                    refresh=refresh_discovery_cache,
                 ),
-                refresh=refresh_discovery_cache,
-            ),
-            input_summary={"maxCandidates": max_candidates, "refresh": refresh_discovery_cache},
-            summarize=lambda value: {"candidates": len(value[0])},
-        )
+                input_summary={"maxCandidates": max_candidates, "refresh": refresh_discovery_cache},
+                summarize=lambda value: {"candidates": len(value[0])},
+            )
+        except Exception as error:
+            observations.append(
+                StageObservation(
+                    name="discovery",
+                    elapsed_ms=0,
+                    input_summary={"maxCandidates": max_candidates, "refresh": refresh_discovery_cache},
+                    output_summary={"status": "failed", "errorType": type(error).__name__},
+                    warnings=(str(error)[:500],),
+                )
+            )
+            selection = {
+                "status": "needs_review",
+                "reason": "source_discovery_failed",
+                "selectedSourceId": None,
+                "ranked": [],
+                "conflicts": [{"type": "source_discovery", "reason": type(error).__name__}],
+            }
+            return DeterministicProcessResult(
+                status="needs_review",
+                reason="source_discovery_failed",
+                song_id=song_id,
+                observations=observations,
+                cache=cache,
+                selection=selection,
+                mir=resolved_mir,
+            )
         cache["discovery"] = discovery_info.status
         observations.append(_with_cache_status(observation, discovery_info.status))
 
@@ -294,6 +381,8 @@ def process_song_deterministically_service(
             observations=observations,
             cache=cache,
             selection=selection_payload,
+            mir=resolved_mir,
+            candidates=tuple(resolved_candidates),
         )
 
     baseline, observation = observe(
@@ -331,4 +420,6 @@ def process_song_deterministically_service(
         cache=cache,
         alignment=alignment,
         selection=selection_payload,
+        mir=resolved_mir,
+        candidates=tuple(resolved_candidates),
     )

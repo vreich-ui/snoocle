@@ -91,6 +91,7 @@ from .timing.lrc import match_lrc_to_lines as _match_lrc_to_lines
 from .timing.offset import estimate_offset as _estimate_offset
 from .timing.realign import retime_sections as _retime_sections
 from .timing.snap import snap_chords as _snap_chords
+from .test_output import TestOutputRejectedError, require_test_output_opt_in
 
 MAX_BEATS = 10_000
 MAX_LRC_LINES = 5_000
@@ -1826,6 +1827,8 @@ async def analyze_and_store_song(
     force_reason: Optional[str] = None,
     batch_id: Optional[str] = None,
     effort_level: Optional[str] = None,
+    agent_policy: Optional[Literal["never", "unresolved_only", "always"]] = None,
+    allow_test_output: bool = False,
 ) -> dict:
     """Full pipeline: (resolve) -> discover -> acquire -> MIR -> reconcile ->
     commit a new version to the Firestore-backed store (never overwrites;
@@ -1905,6 +1908,8 @@ async def analyze_and_store_song(
             force_reason=force_reason,
             batch_id=batch_id,
             effort_level=effort_level,
+            agent_policy=agent_policy,
+            allow_test_output=allow_test_output,
         )
     except PipelineStepError as error:
         if error.error_code == "identity_unresolved" and isinstance(error.__cause__, IdentityUnresolvedError):
@@ -1920,14 +1925,22 @@ async def analyze_and_store_song(
                 else {"code": "budget_exceeded", "error": str(error)}
             )
         raise
-    assert report.reconcile is not None
-    return {
+    response = {
         "songId": report.song_id,
+        "status": report.status,
+        "reason": report.reason,
+        "agentPolicy": report.agent_policy,
         "steps": report.steps,
         "storedVersion": report.stored_version,
         "runId": report.run_id,
-        "song": report.reconcile.song.model_dump(),
     }
+    if report.deterministic_result is not None:
+        response["deterministicResult"] = report.deterministic_result
+    if report.agent_patch is not None:
+        response["agentPatch"] = report.agent_patch
+    if report.reconcile is not None:
+        response["song"] = report.reconcile.song.model_dump()
+    return response
 
 
 @mcp.tool()
@@ -2032,7 +2045,12 @@ def diff_song_versions(song_id: str, version_a: str, version_b: str) -> str:
 
 
 @mcp.tool()
-def save_song(song_json: str, message: str = "Manual save", expected_version: Optional[str] = None) -> dict:
+def save_song(
+    song_json: str,
+    message: str = "Manual save",
+    expected_version: Optional[str] = None,
+    allow_test_output: bool = False,
+) -> dict:
     """Validate and commit a Song JSON as a new version. expected_version
     enables optimistic locking (save-if-version-unchanged): the save is
     rejected if the stored version moved since you read it. Provenance is
@@ -2040,13 +2058,163 @@ def save_song(song_json: str, message: str = "Manual save", expected_version: Op
     song = Song.model_validate_json(song_json)
     try:
         require_resolved_song_id(song.id)
+        require_test_output_opt_in(song, allow_test_output)
     except IdentityUnresolvedError as error:
         return _identity_error(error)
+    except TestOutputRejectedError as error:
+        return {"error": {"code": error.error_code, "message": str(error)}}
     try:
         saved = get_store().save(song, message, expected_version=expected_version)
     except IdentityCollisionError as error:
         return _identity_collision_error(error)
     return dataclasses.asdict(saved)
+
+
+@mcp.tool()
+def diagnose_mock_songs() -> dict:
+    """Read-only inventory of stored testOnly/mock/placeholder Song documents."""
+    from .test_output import mock_output_reasons
+
+    findings = []
+    store = get_store()
+    for song_id in store.list_songs():
+        try:
+            song = store.get(song_id)
+        except Exception as error:  # noqa: BLE001
+            findings.append({"songId": song_id, "reasons": ["unreadable"], "error": str(error)[:300]})
+            continue
+        reasons = mock_output_reasons(song)
+        if reasons:
+            findings.append(
+                {
+                    "songId": song.id,
+                    "title": song.metadata.title,
+                    "artist": song.metadata.artist,
+                    "version": store.current_version(song.id),
+                    "reasons": reasons,
+                }
+            )
+    return {"count": len(findings), "songs": findings, "readOnly": True}
+
+
+def _capability_group(name: str) -> str:
+    groups = {
+        "identity": {
+            "set_song_identity", "list_songs_needing_identity",
+        },
+        "source retrieval": {"discover_song", "lookup_lrc"},
+        "parsing": {
+            "parse_candidate_text", "validate_song_json", "get_song_schema",
+            "match_lrc_to_song",
+        },
+        "audio": {
+            "acquire_audio", "convert_audio", "trim_audio", "normalize_audio",
+            "probe_audio", "calculate_recording_offset",
+        },
+        "MIR": {
+            "analyze_audio", "analyze_full_track_mir", "analyze_mir_window",
+            "extend_mir_beat_grid",
+        },
+        "baseline": {
+            "score_candidate_against_mir", "rank_candidates_deterministically",
+            "select_candidate_deterministically", "build_song_baseline",
+        },
+        "alignment": {
+            "snap_song_to_mir", "carry_forward_song_timing", "apply_lrc_to_song",
+            "retime_song_sections", "guard_song_timing_collapse",
+            "score_song_confidence", "apply_deterministic_song_patch",
+            "align_song_deterministically", "process_song_deterministically",
+            "realign_song_to_recording",
+        },
+        "quality": {
+            "evaluate_song_quality", "validate_song_theory",
+            "build_song_evidence_manifest",
+        },
+        "agent reconciliation": {
+            "reconcile_song", "analyze_and_store_song", "get_agent_config",
+            "set_agent_config", "reset_agent_config",
+        },
+        "diagnostics": {
+            "server_status", "diagnose_mock_songs", "list_capabilities",
+            "list_song_runs", "get_run", "get_usage_summary", "get_scorecard",
+            "score_song_version",
+        },
+    }
+    for group, names in groups.items():
+        if name in names:
+            return group
+    return "storage"
+
+
+@mcp.tool()
+def list_capabilities() -> dict:
+    """Describe every registered MCP tool and its operational behavior."""
+    registered = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
+    network_tools = {
+        "discover_song", "acquire_audio", "lookup_lrc", "analyze_and_store_song",
+        "realign_song_to_recording", "process_song_deterministically",
+    }
+    cache_tools = {
+        "discover_song", "acquire_audio", "analyze_audio",
+        "analyze_full_track_mir", "analyze_mir_window",
+        "align_song_deterministically", "process_song_deterministically",
+        "analyze_and_store_song", "realign_song_to_recording",
+    }
+    writes = {
+        "save_song", "set_song_identity", "set_song_notes", "clear_song_notes",
+        "set_agent_config", "reset_agent_config", "set_gold_version",
+        "calculate_recording_offset", "analyze_and_store_song",
+        "realign_song_to_recording",
+    }
+    optional_writes = {
+        "align_song_deterministically", "process_song_deterministically",
+    }
+    model_tools = {"reconcile_song"}
+    conditional_model_tools = {
+        "analyze_and_store_song", "realign_song_to_recording",
+    }
+
+    entries = []
+    for name, tool in sorted(registered.items()):
+        if name in model_tools:
+            execution = "model-backed"
+            cost_class = "model"
+        elif name in conditional_model_tools:
+            execution = "deterministic-first; model-backed only by explicit policy or actionable MODEL conflict"
+            cost_class = "conditional-model"
+        else:
+            execution = "deterministic"
+            cost_class = "none"
+        if name in writes:
+            persistence = "writes"
+        elif name in optional_writes:
+            persistence = "run trace; Song write only when persist=true with expected-version locking"
+        else:
+            persistence = "read-only or none"
+        parameters = getattr(tool, "parameters", None) or getattr(tool, "input_schema", None)
+        output_schema = getattr(tool, "output_schema", None)
+        entries.append(
+            {
+                "name": name,
+                "group": _capability_group(name),
+                "execution": execution,
+                "networkAccess": "possible" if name in network_tools else "none",
+                "persistence": persistence,
+                "inputType": parameters or "typed MCP arguments",
+                "outputType": output_schema or "structured JSON",
+                "cacheBehavior": "may read/write deterministic cache" if name in cache_tools else "none",
+                "costClass": cost_class,
+            }
+        )
+    grouped: dict[str, list[dict]] = {}
+    for entry in entries:
+        grouped.setdefault(entry["group"], []).append(entry)
+    return {
+        "toolCount": len(entries),
+        "coveredToolCount": len(entries),
+        "groups": grouped,
+        "tools": entries,
+    }
 
 
 @mcp.tool()

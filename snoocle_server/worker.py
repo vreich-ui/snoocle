@@ -451,6 +451,8 @@ def run_pipeline_job(job: dict) -> dict:
         provider=job.get("provider"),
         analysis_depth=job.get("analysisDepth"),
         batch_id=job.get("batchId"),
+        agent_policy=job.get("agentPolicy"),
+        allow_test_output=bool(job.get("allowTestOutput", False)),
     ))
     return {
         "songId": report.song_id,

@@ -44,6 +44,7 @@ Reliability contract (POST /v1/songs/analyze):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -60,6 +61,16 @@ from .audio.acquire import (
 )
 from .config import settings
 from .correction_routing import classify_correction
+from .deterministic_policy import (
+    AgentPolicyError,
+    model_conflict_is_actionable,
+    resolve_agent_policy,
+    run_bounded_agent_patch,
+)
+from .deterministic_process import (
+    DeterministicProcessResult,
+    process_song_deterministically_service,
+)
 from .discovery import CandidateSource, discover_sources
 from .discovery.cache import DiscoveryCacheInfo, discover_cached
 from .discovery.prefetch import infer_recording_variant
@@ -112,6 +123,7 @@ from .timing.collapse_guard import guard_against_collapsed_timing
 from .timing.confidence import build_review_queue, score_song
 from .timing.lrc import apply_lrc, fetch_lrc, fetch_lrc_match, match_lrc_to_lines
 from .timing.snap import snap_chords
+from .test_output import require_test_output_opt_in
 
 log = logging.getLogger(__name__)
 
@@ -182,6 +194,11 @@ class PipelineReport:
     # (see recordings.py). Reported, never acted on: analyzing one is an
     # explicit operator action, because it is a full second analysis.
     recording_suggestions: RecordingSuggestions | None = None
+    status: str = "completed"
+    reason: str | None = None
+    agent_policy: str = "always"
+    deterministic_result: dict | None = None
+    agent_patch: dict | None = None
 
 
 def get_store() -> SongRepository:
@@ -343,7 +360,9 @@ def _step_store(
     result: ReconcileResult,
     song_id: str,
     expected_version: str | None,
+    allow_test_output: bool = False,
 ) -> SaveResult:
+    require_test_output_opt_in(result.song, allow_test_output)
     prior = store.current_version(song_id)
     if prior is not None:
         # append-only provenance: extend the stored history with this run's entries
@@ -387,6 +406,221 @@ async def _timed_step(name: str, fn, timeout: float):
     return result
 
 
+def _deterministic_status(result) -> tuple[str, str | None]:
+    verdict = result.quality.grade.verdict
+    if verdict == "fail":
+        return "needs_review", "quality_gate_failed"
+    if verdict == "unknown":
+        return "needs_review", "quality_evidence_insufficient"
+    if result.review_queue:
+        return "needs_review", "low_confidence_placements"
+    return "completed", None
+
+
+async def _run_deterministic_first_pipeline(
+    title: str | None,
+    artist: str | None,
+    *,
+    youtube_url_or_id: str | None,
+    provider: str | None,
+    model: str | None,
+    skip_audio: bool,
+    max_candidates: int | None,
+    expected_version: str | None,
+    store: SongRepository | None,
+    accuracy: str | None,
+    refresh_cache: bool,
+    agent_policy: str,
+    allow_test_output: bool,
+) -> PipelineReport:
+    """Run the production deterministic path, with at most one compact patch."""
+    steps: dict[str, str] = {}
+    if missing_identity_fields(artist, title):
+        if not youtube_url_or_id:
+            raise PipelineStepError(
+                "resolve",
+                "provide title and artist, or youtube_url_or_id to derive them",
+                error_code="identity_unresolved",
+            )
+        try:
+            meta, identity = await _timed_step(
+                "resolve",
+                lambda: _step_resolve(youtube_url_or_id),
+                settings.acquire_timeout_seconds,
+            )
+        except Exception as error:  # noqa: BLE001
+            raise PipelineStepError("resolve", str(error)) from error
+        if identity is None:
+            raise PipelineStepError(
+                "resolve",
+                "deterministic media metadata did not resolve both title and artist",
+                error_code="identity_unresolved",
+            )
+        title = title or identity.title
+        artist = artist or identity.artist
+        youtube_url_or_id = youtube_url_or_id or meta.video_id
+        steps["resolve"] = f"ok: {identity.describe()} (from {meta.video_id})"
+
+    assert title is not None and artist is not None
+    try:
+        processed: DeterministicProcessResult = await _timed_step(
+            "deterministic",
+            lambda: process_song_deterministically_service(
+                title=title,
+                artist=artist,
+                recording_id=youtube_url_or_id,
+                use_lrc=settings.lrclib_enabled,
+                selection_strategy="strict",
+                max_candidates=max_candidates or settings.source_prefetch_max,
+                mir_accuracy=accuracy or "standard",
+                refresh_mir_cache=refresh_cache,
+                refresh_discovery_cache=refresh_cache,
+                skip_audio=skip_audio,
+            ),
+            settings.acquire_timeout_seconds
+            + settings.mir_timeout_seconds
+            + settings.discover_timeout_seconds,
+        )
+    except asyncio.TimeoutError as error:
+        raise PipelineStepError(
+            "deterministic", "deterministic processing timed out", steps=steps
+        ) from error
+    except Exception as error:  # noqa: BLE001
+        raise PipelineStepError("deterministic", str(error), steps=steps) from error
+
+    report = PipelineReport(
+        song_id=processed.song_id,
+        steps=steps,
+        candidates=list(processed.candidates),
+        mir=processed.mir,
+        status=processed.status,
+        reason=processed.reason,
+        agent_policy=agent_policy,
+    )
+    report.steps["deterministic"] = (
+        f"{processed.status}"
+        + (f": {processed.reason}" if processed.reason else "")
+    )
+
+    patch_outcome = None
+    if agent_policy == "unresolved_only" and model_conflict_is_actionable(processed):
+        try:
+            patch_outcome = await _timed_step(
+                "agent-patch",
+                lambda: run_bounded_agent_patch(
+                    processed, provider_name=provider, model=model
+                ),
+                settings.reconcile_timeout_seconds,
+            )
+        except (AgentPolicyError, ProviderError) as error:
+            report.steps["agent"] = f"not invoked: {error}"
+            report.reason = "bounded_agent_patch_unavailable"
+        else:
+            processed.alignment = patch_outcome.alignment
+            processed.observations = patch_outcome.alignment.observations
+            processed.status, processed.reason = _deterministic_status(
+                patch_outcome.alignment
+            )
+            report.status, report.reason = processed.status, processed.reason
+            report.agent_patch = patch_outcome.to_dict()
+            report.steps["agent"] = (
+                f"ok: {len(patch_outcome.applied_operations)} bounded patch "
+                f"operation(s); deterministic post-passes rerun"
+            )
+    elif agent_policy == "never":
+        report.steps["agent"] = "skipped (agent_policy=never)"
+    else:
+        fault = (
+            processed.alignment.quality.attribution.fault.value
+            if processed.alignment is not None
+            else "none"
+        )
+        report.steps["agent"] = (
+            "skipped (deterministic result requires no bounded MODEL patch; "
+            f"fault={fault})"
+        )
+
+    payload = processed.to_dict()
+    if patch_outcome is not None:
+        payload["totals"]["modelCalls"] = 1
+        payload["totals"]["modelCostUSD"] = patch_outcome.cost_usd
+        payload["agentPatch"] = patch_outcome.to_dict()
+    report.deterministic_result = payload
+
+    recorder = start_run(
+        report.song_id,
+        "deterministic" if patch_outcome is None else patch_outcome.provider,
+        accuracy or "standard",
+    )
+    report.run_id = recorder.trace.run_id
+    for observation in payload.get("stages", []):
+        recorder.step(
+            "deterministic",
+            observation.get("name", "stage"),
+            json.dumps(observation.get("outputSummary") or {}, sort_keys=True),
+            detail={
+                "elapsedMs": observation.get("elapsedMs", 0),
+                "cacheStatus": observation.get("cacheStatus", "not_applicable"),
+                "modelCalls": observation.get("modelCalls", 0),
+                "modelCostUSD": observation.get("modelCostUSD", 0),
+                "inputSummary": observation.get("inputSummary") or {},
+                "outputSummary": observation.get("outputSummary") or {},
+                "warnings": observation.get("warnings") or [],
+            },
+            duration_seconds=float(observation.get("elapsedMs", 0)) / 1000,
+        )
+    if processed.alignment is not None:
+        recorder.set_quality(processed.alignment.quality.to_dict())
+        recorder.set_review_queue(processed.alignment.review_queue)
+    if patch_outcome is not None:
+        recorder.record_model_usage(patch_outcome.model, patch_outcome.usage)
+    recorder.finish(
+        "ok" if processed.status == "completed" else "needs_review",
+        model=patch_outcome.model if patch_outcome is not None else "",
+    )
+    _persist_trace(recorder)
+
+    if processed.status != "completed" or processed.alignment is None:
+        report.steps["store"] = "skipped (deterministic result needs review)"
+        return report
+
+    result = ReconcileResult(
+        song=processed.alignment.song,
+        provider="deterministic" if patch_outcome is None else patch_outcome.provider,
+        model="none" if patch_outcome is None else patch_outcome.model,
+        attempts=0 if patch_outcome is None else 1,
+        audio_attached=False,
+        usage={} if patch_outcome is None else patch_outcome.usage,
+        trace=recorder.trace,
+        patch_ops_applied=(
+            0 if patch_outcome is None else len(patch_outcome.applied_operations)
+        ),
+        output_format="deterministic" if patch_outcome is None else "patch",
+    )
+    report.reconcile = result
+    store = store or get_store()
+    try:
+        saved = await _timed_step(
+            "store",
+            lambda: _step_store(
+                store,
+                result,
+                report.song_id,
+                expected_version,
+                allow_test_output,
+            ),
+            settings.store_timeout_seconds,
+        )
+    except VersionConflictError:
+        raise
+    except Exception as error:  # noqa: BLE001
+        raise PipelineStepError("store", str(error), steps=report.steps) from error
+    report.stored_version = saved.version
+    report.stored_timestamp = saved.timestamp
+    report.steps["store"] = f"ok: version {saved.version}"
+    return report
+
+
 async def run_pipeline_async(
     title: str | None,
     artist: str | None,
@@ -409,8 +643,42 @@ async def run_pipeline_async(
     force_reason: str | None = None,
     batch_id: str | None = None,
     effort_level: str | None = None,
+    agent_policy: str | None = None,
+    allow_test_output: bool = False,
 ) -> PipelineReport:
+    # An explicitly requested mock provider is a test workflow and preserves
+    # the historical mock pipeline unless the caller explicitly chooses a
+    # different policy. All production/default calls remain deterministic-first.
+    preserve_correction_flow = bool(guidance or prior_song or scope is not None)
+    policy_value = (
+        "always"
+        if agent_policy is None and (provider == "mock" or preserve_correction_flow)
+        else (agent_policy or settings.agent_policy)
+    )
+    resolved_policy = resolve_agent_policy(policy_value)
+    if resolved_policy != "always":
+        return await _run_deterministic_first_pipeline(
+            title,
+            artist,
+            youtube_url_or_id=youtube_url_or_id,
+            provider=provider,
+            model=model,
+            skip_audio=skip_audio,
+            max_candidates=max_candidates,
+            expected_version=expected_version,
+            store=store,
+            accuracy=effort_level or analysis_depth or accuracy,
+            refresh_cache=refresh_cache,
+            agent_policy=resolved_policy,
+            allow_test_output=allow_test_output,
+        )
     resolved_provider = (provider or settings.llm_provider).lower()
+    if resolved_provider == "mock" and provider is None:
+        raise PipelineStepError(
+            "reconcile",
+            "provider=mock must be explicitly requested",
+            error_code="mock_provider_not_explicit",
+        )
     # analysisDepth is the canonical control; the older `accuracy` field is
     # honored as its source when a depth isn't given explicitly. The chosen
     # profile drives MIR accuracy, agent effort, the tool budget, and syncMap.
@@ -1528,7 +1796,9 @@ async def run_pipeline_async(
     try:
         saved = await _timed_step(
             "store",
-            lambda: _step_store(store, result, song_id, expected_version),
+            lambda: _step_store(
+                store, result, song_id, expected_version, allow_test_output
+            ),
             settings.store_timeout_seconds,
         )
     except VersionConflictError:
@@ -1900,6 +2170,8 @@ def run_pipeline(
     force_reason: str | None = None,
     batch_id: str | None = None,
     effort_level: str | None = None,
+    agent_policy: str | None = None,
+    allow_test_output: bool = False,
 ) -> PipelineReport:
     """Synchronous wrapper around :func:`run_pipeline_async` for callers that
     are not already inside an event loop (e.g. simple scripts). The API and MCP
@@ -1927,5 +2199,7 @@ def run_pipeline(
             force_reason=force_reason,
             batch_id=batch_id,
             effort_level=effort_level,
+            agent_policy=agent_policy,
+            allow_test_output=allow_test_output,
         )
     )

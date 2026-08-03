@@ -337,6 +337,28 @@ class AgentMcpProvider(LLMProvider):
             raise ProviderError("agent provider requires engine-injected context")
 
         ctx = self.context
+        compact_packet = ctx.get("compact_conflict_packet")
+        if compact_packet is not None:
+            # Deterministic-first escalation is intentionally a different,
+            # much smaller contract than full reconciliation.  The remote
+            # agent receives exactly one bounded conflict packet and returns
+            # closed patch operations; no MIR dump, candidates, lyrics, Song
+            # JSON, schema, provenance, or source URLs are added here.
+            args = {"request": {"conflictPacket": compact_packet}}
+            try:
+                text = asyncio.run(self._call_tool(args))
+            except ProviderError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                wrapped = _find_provider_error(e)
+                if wrapped is not None:
+                    raise wrapped from e
+                raise ProviderError(f"agent: MCP call failed: {e}") from e
+            return LLMResponse(
+                text=text,
+                provider=self.name,
+                model=f"mcp:{settings.agent_mcp_tool}",
+            )
         mir = ctx.get("mir")
         request: dict = {
             "songId": ctx["song_id"],

@@ -92,6 +92,11 @@ from .timing.offset import estimate_offset as _estimate_offset
 from .timing.realign import retime_sections as _retime_sections
 from .timing.snap import snap_chords as _snap_chords
 from .test_output import TestOutputRejectedError, require_test_output_opt_in
+from .tool_contract import (
+    TOOL_CONTRACT_VERSION,
+    apply_tool_contract,
+    registered_tool_contracts,
+)
 
 MAX_BEATS = 10_000
 MAX_LRC_LINES = 5_000
@@ -2097,119 +2102,64 @@ def diagnose_mock_songs() -> dict:
     return {"count": len(findings), "songs": findings, "readOnly": True}
 
 
-def _capability_group(name: str) -> str:
-    groups = {
-        "identity": {
-            "set_song_identity", "list_songs_needing_identity",
-        },
-        "source retrieval": {"discover_song", "lookup_lrc"},
-        "parsing": {
-            "parse_candidate_text", "validate_song_json", "get_song_schema",
-            "match_lrc_to_song",
-        },
-        "audio": {
-            "acquire_audio", "convert_audio", "trim_audio", "normalize_audio",
-            "probe_audio", "calculate_recording_offset",
-        },
-        "MIR": {
-            "analyze_audio", "analyze_full_track_mir", "analyze_mir_window",
-            "extend_mir_beat_grid",
-        },
-        "baseline": {
-            "score_candidate_against_mir", "rank_candidates_deterministically",
-            "select_candidate_deterministically", "build_song_baseline",
-        },
-        "alignment": {
-            "snap_song_to_mir", "carry_forward_song_timing", "apply_lrc_to_song",
-            "retime_song_sections", "guard_song_timing_collapse",
-            "score_song_confidence", "apply_deterministic_song_patch",
-            "align_song_deterministically", "process_song_deterministically",
-            "realign_song_to_recording",
-        },
-        "quality": {
-            "evaluate_song_quality", "validate_song_theory",
-            "build_song_evidence_manifest",
-        },
-        "agent reconciliation": {
-            "reconcile_song", "analyze_and_store_song", "get_agent_config",
-            "set_agent_config", "reset_agent_config",
-        },
-        "diagnostics": {
-            "server_status", "diagnose_mock_songs", "list_capabilities",
-            "list_song_runs", "get_run", "get_usage_summary", "get_scorecard",
-            "score_song_version",
-        },
-    }
-    for group, names in groups.items():
-        if name in names:
-            return group
-    return "storage"
-
-
 @mcp.tool()
 def list_capabilities() -> dict:
-    """Describe every registered MCP tool and its operational behavior."""
-    registered = getattr(getattr(mcp, "_tool_manager", None), "_tools", {})
-    network_tools = {
-        "discover_song", "acquire_audio", "lookup_lrc", "analyze_and_store_song",
-        "realign_song_to_recording", "process_song_deterministically",
-    }
-    cache_tools = {
-        "discover_song", "acquire_audio", "analyze_audio",
-        "analyze_full_track_mir", "analyze_mir_window",
-        "align_song_deterministically", "process_song_deterministically",
-        "analyze_and_store_song", "realign_song_to_recording",
-    }
-    writes = {
-        "save_song", "set_song_identity", "set_song_notes", "clear_song_notes",
-        "set_agent_config", "reset_agent_config", "set_gold_version",
-        "calculate_recording_offset", "analyze_and_store_song",
-        "realign_song_to_recording",
-    }
-    optional_writes = {
-        "align_song_deterministically", "process_song_deterministically",
-    }
-    model_tools = {"reconcile_song"}
-    conditional_model_tools = {
-        "analyze_and_store_song", "realign_song_to_recording",
-    }
+    """Describe every registered MCP tool and its operational behavior.
 
+    Existing capability keys remain stable. ``toolContract`` is the exhaustive
+    GUI-facing contract also published on each tool's namespaced MCP ``_meta``.
+    """
     entries = []
-    for name, tool in sorted(registered.items()):
-        if name in model_tools:
-            execution = "model-backed"
-            cost_class = "model"
-        elif name in conditional_model_tools:
-            execution = "deterministic-first; model-backed only by explicit policy or actionable MODEL conflict"
-            cost_class = "conditional-model"
-        else:
-            execution = "deterministic"
-            cost_class = "none"
-        if name in writes:
+    for name, tool, contract in registered_tool_contracts(mcp):
+        if "song_version_optional" in contract.persistence:
+            persistence = (
+                "run trace; Song write only when persist=true with expected-version locking"
+            )
+        elif any(kind.endswith("_write") or kind == "filesystem" for kind in contract.persistence):
             persistence = "writes"
-        elif name in optional_writes:
-            persistence = "run trace; Song write only when persist=true with expected-version locking"
+        elif contract.persistence:
+            persistence = "reads"
         else:
             persistence = "read-only or none"
         parameters = getattr(tool, "parameters", None) or getattr(tool, "input_schema", None)
         output_schema = getattr(tool, "output_schema", None)
+        contract_wire = contract.to_wire()
         entries.append(
             {
                 "name": name,
-                "group": _capability_group(name),
-                "execution": execution,
-                "networkAccess": "possible" if name in network_tools else "none",
+                "group": contract.category,
+                "execution": contract.execution,
+                "networkAccess": "possible" if contract.network_access else "none",
                 "persistence": persistence,
                 "inputType": parameters or "typed MCP arguments",
                 "outputType": output_schema or "structured JSON",
-                "cacheBehavior": "may read/write deterministic cache" if name in cache_tools else "none",
-                "costClass": cost_class,
+                "cacheBehavior": {
+                    "none": "none",
+                    "read": "may read deterministic cache",
+                    "read_write": "may read/write deterministic cache",
+                }[contract.cache_behavior],
+                "costClass": contract.cost_class,
+                "title": contract.title,
+                "browserSafety": contract.browser_safety,
+                "inputArtifactKinds": list(contract.input_artifact_kinds),
+                "outputArtifactKinds": list(contract.output_artifact_kinds),
+                "accessMode": contract.access_mode,
+                "readOnly": contract.read_only,
+                "destructive": contract.destructive,
+                "idempotent": contract.idempotent,
+                "networkAccessKinds": list(contract.network_access),
+                "modelUse": contract.model_use,
+                "persistenceKinds": list(contract.persistence),
+                "expectedDuration": contract.expected_duration,
+                "specializedRenderer": contract.specialized_renderer,
+                "toolContract": contract_wire,
             }
         )
     grouped: dict[str, list[dict]] = {}
     for entry in entries:
         grouped.setdefault(entry["group"], []).append(entry)
     return {
+        "contractVersion": TOOL_CONTRACT_VERSION,
         "toolCount": len(entries),
         "coveredToolCount": len(entries),
         "groups": grouped,
@@ -2595,6 +2545,11 @@ def score_song_version(song_id: str, candidate_version: str | None = None) -> di
     return {"songId": song_id, "goldVersion": gold_version,
             "candidateVersion": candidate_version or get_store().current_version(song_id),
             "metrics": score_song(cand, gold)}
+
+
+# Attach the contract only after the final decorator has populated FastMCP's
+# registry. Import fails closed if either side grows without the other.
+apply_tool_contract(mcp)
 
 
 _LOCALHOST_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]

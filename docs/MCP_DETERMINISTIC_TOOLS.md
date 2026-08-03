@@ -14,6 +14,11 @@ states execution type, network/cache/persistence behavior, input/output type,
 and cost class. `diagnose_mock_songs` is the read-only inventory for legacy
 mock/placeholder documents.
 
+All registered tools, including these deterministic tools, publish standard MCP
+risk annotations plus the versioned Snoocle GUI contract documented in
+[`MCP_TOOL_CONTRACT.md`](MCP_TOOL_CONTRACT.md). Registration fails closed if a
+tool has not been classified.
+
 Every response has the same envelope:
 
 ```json

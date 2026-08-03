@@ -27,6 +27,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "snoocle_server"
 UI = PKG / "ui"
+STUDIO = PKG / "studio"
 
 
 def _package_data_patterns() -> list[str]:
@@ -85,6 +86,17 @@ def test_the_glob_actually_reaches_the_player_and_its_vendor_files():
 @pytest.mark.parametrize("rel", ["ui/index.html", "ui/app.js", "ui/admin-d.js", "ui/tokens.css"])
 def test_admin_assets_still_covered(rel):
     assert _matches(rel, _package_data_patterns())
+
+
+def test_built_studio_assets_are_declared_as_package_data():
+    """The installed wheel, not the source checkout, serves /studio/."""
+    assert (STUDIO / "index.html").exists()
+    missing = [
+        str(p.relative_to(PKG)).replace("\\", "/")
+        for p in sorted(STUDIO.rglob("*"))
+        if p.is_file() and not _matches(str(p.relative_to(PKG)).replace("\\", "/"), _package_data_patterns())
+    ]
+    assert not missing
 
 
 # --- dependency ceilings ------------------------------------------------------

@@ -102,7 +102,7 @@ include = ["snoocle_server*"]
 # source tree. tests/test_packaging.py fails the build if a ui/ file stops being
 # matched.
 [tool.setuptools.package-data]
-snoocle_server = ["ui/**/*"]
+snoocle_server = ["ui/**/*", "studio/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

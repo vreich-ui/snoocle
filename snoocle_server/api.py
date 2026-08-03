@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
@@ -131,12 +132,17 @@ app = FastAPI(
 # Paths that never require a credential: liveness probes, the static GUI shell
 # (it carries no secrets — every /v1 call it makes is still gated), and the
 # OAuth endpoints themselves, which are by definition reached without a token.
-_ALWAYS_OPEN_PREFIXES = ("/ui", "/oauth/", "/.well-known/")
+_ALWAYS_OPEN_PREFIXES = ("/oauth/", "/.well-known/")
+_ALWAYS_OPEN_STATIC_ROOTS = ("/ui", "/studio")
 _ALWAYS_OPEN_EXACT = ("/healthz", "/health", "/")
 
 
 def _is_open_path(path: str) -> bool:
-    return path in _ALWAYS_OPEN_EXACT or path.startswith(_ALWAYS_OPEN_PREFIXES)
+    return (
+        path in _ALWAYS_OPEN_EXACT
+        or path.startswith(_ALWAYS_OPEN_PREFIXES)
+        or any(path == root or path.startswith(root + "/") for root in _ALWAYS_OPEN_STATIC_ROOTS)
+    )
 
 
 class _BearerTokenMiddleware:
@@ -2054,10 +2060,33 @@ class _RevalidatingStatic(StaticFiles):
         return response
 
 
+class _StudioStatic(_RevalidatingStatic):
+    """Serve the Studio SPA while preserving real asset 404s.
+
+    Vite creates one HTML entry point, but browser refreshes on client-side
+    routes such as ``/studio/runs`` still reach this server.  Only extensionless
+    paths fall back to that entry point; a misspelled JavaScript or CSS asset
+    remains a 404 instead of being returned as HTML.
+    """
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404 and not Path(path).suffix:
+                return await super().get_response("index.html", scope)
+            raise
+
+
 app.mount(
     "/ui",
     _RevalidatingStatic(directory=str(Path(__file__).parent / "ui"), html=True),
     name="ui",
+)
+app.mount(
+    "/studio",
+    _StudioStatic(directory=str(Path(__file__).parent / "studio"), html=True),
+    name="studio",
 )
 
 

@@ -1,5 +1,16 @@
 # syntax=docker/dockerfile:1
 
+# The Studio is compiled once during the image build.  Its browser dependencies
+# are never fetched at runtime, and only the generated static files cross into
+# the Python image.
+FROM node:24-bookworm-slim AS studio-builder
+
+WORKDIR /studio
+COPY studio/package.json studio/package-lock.json ./
+RUN npm ci
+COPY studio ./
+RUN npm run build
+
 # =============================================================================
 # Snoocle server — production image for Google Cloud Run
 #
@@ -66,6 +77,9 @@ WORKDIR /app
 # Only the package metadata + source are needed to build the wheel.
 COPY pyproject.toml ./
 COPY snoocle_server ./snoocle_server
+# The wheel and runtime server only see the Vite output, not node_modules or
+# the TypeScript source tree.
+COPY --from=studio-builder /snoocle_server/studio ./snoocle_server/studio
 
 # Install the app plus the extras this service needs to run its core pipeline:
 #   .[mir]           librosa/soundfile/numpy/scipy fallbacks for MIR analysis

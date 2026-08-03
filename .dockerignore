@@ -22,6 +22,7 @@ build/
 dist/
 .venv/
 venv/
+studio/node_modules/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/

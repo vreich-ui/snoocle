@@ -12,6 +12,7 @@ from snoocle_server.tool_contract import (
     TOOL_CONTRACT_VERSION,
     TOOL_META_KEY,
     ToolContractError,
+    apply_tool_contract,
     validate_registered_tool_contract,
 )
 
@@ -28,7 +29,10 @@ def test_every_registered_tool_has_exactly_one_contract_entry():
         contract = TOOL_CONTRACTS[name]
         assert tool.title == contract.title
         assert tool.annotations == contract.annotations()
-        assert tool.meta == {TOOL_META_KEY: contract.to_wire()}
+        if "meta" in type(tool).model_fields:
+            assert tool.meta == {TOOL_META_KEY: contract.to_wire()}
+        else:
+            assert not hasattr(tool, "meta")
 
 
 def test_contract_rejects_a_new_unclassified_registered_tool():
@@ -47,6 +51,25 @@ def test_contract_rejects_a_stale_entry(monkeypatch):
         validate_registered_tool_contract(mcp_server.mcp)
 
 
+def test_contract_supports_fastmcp_versions_without_tool_meta():
+    class LegacyTool:
+        __slots__ = ("title", "annotations")
+        model_fields = {"title": object(), "annotations": object()}
+
+        def __init__(self):
+            self.title = None
+            self.annotations = None
+
+    tools = {name: LegacyTool() for name in TOOL_CONTRACTS}
+    legacy_mcp = SimpleNamespace(_tool_manager=SimpleNamespace(_tools=tools))
+
+    apply_tool_contract(legacy_mcp)
+
+    assert tools["get_song"].title == "Get Song"
+    assert tools["get_song"].annotations == TOOL_CONTRACTS["get_song"].annotations()
+    assert not hasattr(tools["get_song"], "meta")
+
+
 @pytest.mark.anyio
 async def test_tools_list_publishes_standard_annotations_and_namespaced_metadata():
     listed = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
@@ -56,7 +79,10 @@ async def test_tools_list_publishes_standard_annotations_and_namespaced_metadata
         protocol_tool = listed[name]
         assert protocol_tool.title == contract.title
         assert protocol_tool.annotations == contract.annotations()
-        assert protocol_tool.meta == {TOOL_META_KEY: contract.to_wire()}
+        if "meta" in type(protocol_tool).model_fields:
+            assert protocol_tool.meta == {TOOL_META_KEY: contract.to_wire()}
+        else:
+            assert not hasattr(protocol_tool, "meta")
 
 
 def test_capability_catalog_preserves_legacy_fields_and_adds_the_full_contract():

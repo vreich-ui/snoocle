@@ -481,7 +481,14 @@ def apply_tool_contract(mcp: Any) -> None:
         contract = TOOL_CONTRACTS[name]
         tool.title = contract.title
         tool.annotations = contract.annotations()
-        tool.meta = {**(tool.meta or {}), TOOL_META_KEY: contract.to_wire()}
+        # FastMCP 1.10 (the declared dependency floor) supports titles and all
+        # standard annotations, but its internal Tool model predates MCP tool
+        # ``_meta``. Newer 1.x releases expose ``meta``. Keep the standard hints
+        # on every supported release and publish the extension on tools/list
+        # only where the SDK can represent it; list_capabilities always carries
+        # the same complete contract.
+        if "meta" in getattr(type(tool), "model_fields", {}):
+            tool.meta = {**(tool.meta or {}), TOOL_META_KEY: contract.to_wire()}
 
 
 def registered_tool_contracts(mcp: Any) -> list[tuple[str, Any, ToolContract]]:

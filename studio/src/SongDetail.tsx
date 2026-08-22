@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "./api";
 import {
   apiBlob,
@@ -11,6 +11,7 @@ import {
 } from "./client";
 import { runDetailPath, songDetailPath } from "./navigation";
 import { Sheet } from "./Sheet";
+import { formatCost, formatDateTime, orDash, pairOrDash } from "./format";
 import { useApi } from "./useApi";
 
 interface SongDetailProps {
@@ -75,12 +76,16 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
   const [renameMissing, setRenameMissing] = useState<string[]>([]);
   const [renameNotice, setRenameNotice] = useState("");
 
+  // Seed the rename fields once per song. Keying this on song.data alone lets a
+  // later re-resolve overwrite whatever the user has typed — which silently
+  // reverts an edit in progress and leaves the Rename button disabled.
+  const seededFor = useRef("");
   useEffect(() => {
-    if (song.data) {
-      setArtistInput(song.data.metadata.artist);
-      setTitleInput(song.data.metadata.title);
-    }
-  }, [song.data]);
+    if (!song.data || seededFor.current === songId) return;
+    seededFor.current = songId;
+    setArtistInput(song.data.metadata.artist);
+    setTitleInput(song.data.metadata.title);
+  }, [song.data, songId]);
 
   const [versionA, setVersionA] = useState("");
   const [versionB, setVersionB] = useState("");
@@ -245,7 +250,7 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
                   {versionList.map((version) => (
                     <tr key={version.version}>
                       <td><code>{version.version.slice(0, 10)}</code></td>
-                      <td>{new Date(version.timestamp).toLocaleString()}</td>
+                      <td>{formatDateTime(version.timestamp)}</td>
                       <td>{version.message}</td>
                     </tr>
                   ))}
@@ -298,10 +303,10 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
                   <tr key={run.runId} className="row-button" onClick={() => onNavigate(runDetailPath(run.runId))}>
                     <td><code>{run.runId.slice(0, 10)}</code></td>
                     <td>{run.status}</td>
-                    <td>{run.provider} / {run.model}</td>
-                    <td>{new Date(run.startedAt).toLocaleString()}</td>
-                    <td>{run.stepCount}</td>
-                    <td>${run.costUSD.toFixed(4)}</td>
+                    <td>{pairOrDash(run.provider, run.model)}</td>
+                    <td>{formatDateTime(run.startedAt)}</td>
+                    <td>{orDash(run.stepCount)}</td>
+                    <td>{formatCost(run.costUSD)}</td>
                   </tr>
                 ))}
               </tbody>

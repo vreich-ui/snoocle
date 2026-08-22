@@ -34,6 +34,16 @@ const runsBody = {
   }],
 };
 
+/** A real July run: written before costUSD/effortLevel/batchId existed. */
+const legacyRunsBody = {
+  songId: song.id,
+  runs: [{
+    runId: "17f2eb8ef20a4525", songId: song.id, provider: "anthropic-agent", model: "claude-opus-4-8",
+    depth: "standard", status: "ok", startedAt: "2026-07-31T07:03:13+00:00",
+    finishedAt: "2026-07-31T07:07:01+00:00", error: null, stepCount: 9,
+  }],
+};
+
 const goldBody = { songId: song.id, goldVersion: null };
 const notesBody = { songId: song.id, notes: "", updatedAt: null, preference: null, correction: null };
 
@@ -91,11 +101,17 @@ describe("SongDetail", () => {
     const user = userEvent.setup();
     render(<SongDetail songId={song.id} token="tab-token" onNavigate={onNavigate} />);
     await screen.findByText("Karma Police — Radiohead");
+    await screen.findByText(/run-1/);
 
     const titleInput = screen.getByLabelText("Title");
     await user.clear(titleInput);
     await user.type(titleInput, "Karma Police (Live)");
-    await user.click(screen.getByRole("button", { name: "Rename song" }));
+    // The form seeds from the fetched song, so assert it actually holds the edit
+    // (and the button is live) before clicking — otherwise this races the loads.
+    await waitFor(() => expect(titleInput).toHaveValue("Karma Police (Live)"));
+    const renameButton = screen.getByRole("button", { name: "Rename song" });
+    await waitFor(() => expect(renameButton).toBeEnabled());
+    await user.click(renameButton);
 
     await waitFor(() => expect(onNavigate).toHaveBeenCalledWith("/studio/library/radiohead--karma-police-live"));
   });
@@ -116,12 +132,27 @@ describe("SongDetail", () => {
     const user = userEvent.setup();
     render(<SongDetail songId={song.id} token="tab-token" onNavigate={onNavigate} />);
     await screen.findByText("Karma Police — Radiohead");
+    await screen.findByText(/run-1/);
 
     const artistInput = screen.getByLabelText("Artist");
     await user.clear(artistInput);
-    await user.click(screen.getByRole("button", { name: "Rename song" }));
+    await waitFor(() => expect(artistInput).toHaveValue(""));
+    const renameButton = screen.getByRole("button", { name: "Rename song" });
+    await waitFor(() => expect(renameButton).toBeEnabled());
+    await user.click(renameButton);
 
     expect(await screen.findByText("Missing: artist")).toBeVisible();
     expect(onNavigate).not.toHaveBeenCalled();
+  });
+  it("renders a song whose runs predate costUSD, instead of blanking the page", async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === `/v1/songs/${song.id}/runs`) return jsonResponse(200, legacyRunsBody);
+      return route(path);
+    });
+
+    render(<SongDetail songId={song.id} token="tab-token" onNavigate={onNavigate} />);
+
+    expect(await screen.findByText(/17f2eb8/)).toBeVisible();
+    expect(screen.getByText("Karma Police — Radiohead")).toBeVisible();
   });
 });

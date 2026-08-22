@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { type NeedsIdentityResponse, type SongsResponse, type SongSummary } from "./client";
 import { songDetailPath } from "./navigation";
+import { formatDateTime } from "./format";
 import { useApi } from "./useApi";
 
 interface LibraryProps {
@@ -60,7 +61,7 @@ export function Library({ token, onNavigate }: LibraryProps) {
                   <strong>{item.title} — {item.artist}</strong>
                   <code>{item.id}</code>
                   <span className="song-row-meta">
-                    <span>{new Date(item.updatedAt).toLocaleString()}</span>
+                    <span>{formatDateTime(item.updatedAt)}</span>
                     {needsIdentityIds.has(item.id) && <span className="status-pill">Needs identity</span>}
                     {item.hasTiming && <span className="safety-badge safe">Timed</span>}
                   </span>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { fetchRecentRuns, type QueueResponse, type RunDetail, type RunSummary } from "./client";
 import { runDetailPath } from "./navigation";
+import { formatCost, formatDateTime, orDash, pairOrDash } from "./format";
 import { useApi } from "./useApi";
 
 interface RunsProps {
@@ -93,12 +94,12 @@ function RunDetailView({ runId, token, onNavigate }: RunDetailViewProps) {
       {data.status === "error" && data.error && <p className="error" role="alert">{data.error}</p>}
       <dl className="classification-grid">
         <div><dt>Status</dt><dd>{data.status}</dd></div>
-        <div><dt>Provider / model</dt><dd>{data.provider} / {data.model}</dd></div>
-        <div><dt>Depth</dt><dd>{data.depth}</dd></div>
-        <div><dt>Effort</dt><dd>{data.effortLevel}</dd></div>
-        <div><dt>Started</dt><dd>{new Date(data.startedAt).toLocaleString()}</dd></div>
-        <div><dt>Finished</dt><dd>{data.finishedAt ? new Date(data.finishedAt).toLocaleString() : "—"}</dd></div>
-        <div><dt>Cost</dt><dd>${data.costUSD.toFixed(4)}</dd></div>
+        <div><dt>Provider / model</dt><dd>{pairOrDash(data.provider, data.model)}</dd></div>
+        <div><dt>Depth</dt><dd>{orDash(data.depth)}</dd></div>
+        <div><dt>Effort</dt><dd>{orDash(data.effortLevel)}</dd></div>
+        <div><dt>Started</dt><dd>{formatDateTime(data.startedAt)}</dd></div>
+        <div><dt>Finished</dt><dd>{formatDateTime(data.finishedAt)}</dd></div>
+        <div><dt>Cost</dt><dd>{formatCost(data.costUSD)}</dd></div>
       </dl>
       <div className="run-steps">
         {data.steps.map((step) => (
@@ -145,7 +146,7 @@ export function Runs({ token, detailId, onNavigate }: RunsProps) {
             <p className="muted">
               {queue.data.workerSeenRecently ? "Worker seen recently" : "No recent worker heartbeat"}
               {queue.data.lastWorker ? ` · ${queue.data.lastWorker}` : ""}
-              {queue.data.lastHeartbeatAt ? ` · ${new Date(queue.data.lastHeartbeatAt).toLocaleString()}` : ""}
+              {queue.data.lastHeartbeatAt ? ` · ${formatDateTime(queue.data.lastHeartbeatAt)}` : ""}
             </p>
             {queue.data.jobs.length === 0 ? (
               <p className="muted">Queue is empty.</p>
@@ -159,7 +160,7 @@ export function Runs({ token, detailId, onNavigate }: RunsProps) {
                         <td>{job.label}</td>
                         <td>{job.kind}</td>
                         <td>{job.status}</td>
-                        <td>{new Date(job.queuedAt).toLocaleString()}</td>
+                        <td>{formatDateTime(job.queuedAt)}</td>
                         <td>{job.worker ?? "—"}</td>
                         <td>{job.attempts}</td>
                       </tr>
@@ -193,9 +194,9 @@ export function Runs({ token, detailId, onNavigate }: RunsProps) {
                       <td><code>{run.runId.slice(0, 10)}</code></td>
                       <td><code>{run.songId}</code></td>
                       <td>{run.status}</td>
-                      <td>{run.provider} / {run.model}</td>
-                      <td>{new Date(run.startedAt).toLocaleString()}</td>
-                      <td>${run.costUSD.toFixed(4)}</td>
+                      <td>{pairOrDash(run.provider, run.model)}</td>
+                      <td>{formatDateTime(run.startedAt)}</td>
+                      <td>{formatCost(run.costUSD)}</td>
                     </tr>
                   ))}
                 </tbody>

@@ -181,20 +181,25 @@ export interface NotesResponse {
 
 // --- runs -------------------------------------------------------------
 
+/**
+ * Everything but the identifiers is optional on purpose: these are historical
+ * records, and a run written before a field existed simply has no such key.
+ * costUSD/effortLevel/batchId are absent on every run older than they are.
+ */
 export interface RunSummary {
   runId: string;
   songId: string;
-  provider: string;
-  model: string;
-  depth: string;
   status: string;
-  startedAt: string;
-  finishedAt: string | null;
-  error: string | null;
-  stepCount: number;
-  costUSD: number;
-  effortLevel: string;
-  batchId: string | null;
+  provider?: string;
+  model?: string;
+  depth?: string;
+  startedAt?: string;
+  finishedAt?: string | null;
+  error?: string | null;
+  stepCount?: number;
+  costUSD?: number;
+  effortLevel?: string;
+  batchId?: string | null;
 }
 
 export interface SongRunsResponse {
@@ -256,5 +261,5 @@ export async function fetchRecentRuns(limit: number): Promise<RunSummary[]> {
     items.map((item) => apiJson<SongRunsResponse>(`/v1/songs/${encodeURIComponent(item.id)}/runs`)),
   );
   const runs = settled.flatMap((result) => (result.status === "fulfilled" ? result.value.runs : []));
-  return runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, limit);
+  return runs.sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? "")).slice(0, limit);
 }

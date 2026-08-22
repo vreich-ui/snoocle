@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { getBearerToken, saveBearerToken } from "./api";
 import { AudioWorkspace } from "./AudioWorkspace";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { isImplemented, routeFromPath, sectionPath, sectionPlan, studioSections, type StudioRoute, type StudioSection } from "./navigation";
 import "./studio.css";
 
@@ -70,6 +71,7 @@ export function StudioApp() {
           </button>
         ))}
       </nav>
+      <ErrorBoundary resetKey={`${section}:${detailId ?? ""}`}>
       {section === "Tool Studio" ? (
         <div className="tool-studio-page">
           <div className="workspace audio-workspace-shell">
@@ -98,6 +100,7 @@ export function StudioApp() {
           <p className="muted">Until this section is built, the working equivalent lives in the existing admin at <a href="/ui/">/ui/</a>.</p>
         </section>
       )}
+      </ErrorBoundary>
     </main>
   );
 }

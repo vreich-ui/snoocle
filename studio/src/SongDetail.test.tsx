@@ -34,6 +34,16 @@ const runsBody = {
   }],
 };
 
+/** A real July run: written before costUSD/effortLevel/batchId existed. */
+const legacyRunsBody = {
+  songId: song.id,
+  runs: [{
+    runId: "17f2eb8ef20a4525", songId: song.id, provider: "anthropic-agent", model: "claude-opus-4-8",
+    depth: "standard", status: "ok", startedAt: "2026-07-31T07:03:13+00:00",
+    finishedAt: "2026-07-31T07:07:01+00:00", error: null, stepCount: 9,
+  }],
+};
+
 const goldBody = { songId: song.id, goldVersion: null };
 const notesBody = { songId: song.id, notes: "", updatedAt: null, preference: null, correction: null };
 
@@ -123,5 +133,16 @@ describe("SongDetail", () => {
 
     expect(await screen.findByText("Missing: artist")).toBeVisible();
     expect(onNavigate).not.toHaveBeenCalled();
+  });
+  it("renders a song whose runs predate costUSD, instead of blanking the page", async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === `/v1/songs/${song.id}/runs`) return jsonResponse(200, legacyRunsBody);
+      return route(path);
+    });
+
+    render(<SongDetail songId={song.id} token="tab-token" onNavigate={onNavigate} />);
+
+    expect(await screen.findByText(/17f2eb8/)).toBeVisible();
+    expect(screen.getByText("Karma Police — Radiohead")).toBeVisible();
   });
 });

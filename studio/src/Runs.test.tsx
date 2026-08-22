@@ -55,4 +55,29 @@ describe("Runs", () => {
     expect(screen.getByText("Queue is empty.")).toBeVisible();
     expect(await screen.findByText("No runs yet.")).toBeVisible();
   });
+  it("renders a run written before costUSD/effortLevel existed", async () => {
+    const legacyRun = {
+      runId: "c5825eaccaca4ba8",
+      songId: "unknown--unknown",
+      provider: "anthropic-agent",
+      model: "claude-opus-4-8",
+      depth: "standard",
+      status: "ok",
+      startedAt: "2026-07-31T07:03:13+00:00",
+      finishedAt: "2026-07-31T07:07:56+00:00",
+      error: null,
+      stepCount: 7,
+    };
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/v1/queue") return jsonResponse(200, queueBody);
+      if (path === "/v1/songs") return jsonResponse(200, { songs: ["unknown--unknown"], items: [{ id: "unknown--unknown", title: "Unknown", artist: "Unknown", latestVersion: "abc", updatedAt: "2026-07-31T07:07:56Z", youtubeVideoId: null, hasTiming: true }] });
+      if (path === "/v1/songs/unknown--unknown/runs") return jsonResponse(200, { songId: "unknown--unknown", runs: [legacyRun] });
+      return jsonResponse(404, { detail: `unhandled ${path}` });
+    });
+
+    render(<Runs token="tab-token" onNavigate={onNavigate} />);
+
+    expect(await screen.findByText(/c5825ea/)).toBeVisible();
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+  });
 });

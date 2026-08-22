@@ -11,6 +11,7 @@ import {
 } from "./client";
 import { runDetailPath, songDetailPath } from "./navigation";
 import { Sheet } from "./Sheet";
+import { formatCost, formatDateTime, orDash, pairOrDash } from "./format";
 import { useApi } from "./useApi";
 
 interface SongDetailProps {
@@ -245,7 +246,7 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
                   {versionList.map((version) => (
                     <tr key={version.version}>
                       <td><code>{version.version.slice(0, 10)}</code></td>
-                      <td>{new Date(version.timestamp).toLocaleString()}</td>
+                      <td>{formatDateTime(version.timestamp)}</td>
                       <td>{version.message}</td>
                     </tr>
                   ))}
@@ -298,10 +299,10 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
                   <tr key={run.runId} className="row-button" onClick={() => onNavigate(runDetailPath(run.runId))}>
                     <td><code>{run.runId.slice(0, 10)}</code></td>
                     <td>{run.status}</td>
-                    <td>{run.provider} / {run.model}</td>
-                    <td>{new Date(run.startedAt).toLocaleString()}</td>
-                    <td>{run.stepCount}</td>
-                    <td>${run.costUSD.toFixed(4)}</td>
+                    <td>{pairOrDash(run.provider, run.model)}</td>
+                    <td>{formatDateTime(run.startedAt)}</td>
+                    <td>{orDash(run.stepCount)}</td>
+                    <td>{formatCost(run.costUSD)}</td>
                   </tr>
                 ))}
               </tbody>

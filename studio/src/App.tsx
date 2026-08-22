@@ -1,30 +1,38 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { getBearerToken, saveBearerToken } from "./api";
 import { AudioWorkspace } from "./AudioWorkspace";
-import { isImplemented, sectionFromPath, sectionPath, sectionPlan, studioSections, type StudioSection } from "./navigation";
+import { isImplemented, routeFromPath, sectionPath, sectionPlan, studioSections, type StudioRoute, type StudioSection } from "./navigation";
 import "./studio.css";
 
 const ToolStudio = lazy(() => import("./ToolStudio").then((module) => ({ default: module.ToolStudio })));
+const Library = lazy(() => import("./Library").then((module) => ({ default: module.Library })));
+const SongDetail = lazy(() => import("./SongDetail").then((module) => ({ default: module.SongDetail })));
+const Runs = lazy(() => import("./Runs").then((module) => ({ default: module.Runs })));
 
-function useCurrentSection() {
-  const [section, setSection] = useState<StudioSection>(() => sectionFromPath(window.location.pathname));
+function useCurrentRoute() {
+  const [route, setRoute] = useState<StudioRoute>(() => routeFromPath(window.location.pathname));
 
   useEffect(() => {
-    const sync = () => setSection(sectionFromPath(window.location.pathname));
+    const sync = () => setRoute(routeFromPath(window.location.pathname));
     window.addEventListener("popstate", sync);
     return () => window.removeEventListener("popstate", sync);
   }, []);
 
-  const navigate = (next: StudioSection) => {
-    window.history.pushState({}, "", sectionPath(next));
-    setSection(next);
+  // Song/run detail routes are not section paths, so navigate() takes an
+  // arbitrary path (a back button, a table row) rather than a StudioSection.
+  const navigate = (path: string) => {
+    window.history.pushState({}, "", path);
+    setRoute(routeFromPath(path));
   };
 
-  return { section, navigate };
+  const navigateSection = (section: StudioSection) => navigate(sectionPath(section));
+
+  return { route, navigate, navigateSection };
 }
 
 export function StudioApp() {
-  const { section, navigate } = useCurrentSection();
+  const { route, navigate, navigateSection } = useCurrentRoute();
+  const { section, detailId } = route;
   const [token, setToken] = useState(getBearerToken);
 
   const onTokenChange = (value: string) => {
@@ -54,7 +62,7 @@ export function StudioApp() {
             aria-current={section === item ? "page" : undefined}
             className={[section === item ? "selected" : "", isImplemented(item) ? "" : "unbuilt"].filter(Boolean).join(" ")}
             key={item}
-            onClick={() => navigate(item)}
+            onClick={() => navigateSection(item)}
             title={isImplemented(item) ? undefined : `${item} — not built yet`}
             type="button"
           >
@@ -71,6 +79,16 @@ export function StudioApp() {
             <ToolStudio token={token} />
           </Suspense>
         </div>
+      ) : section === "Library" ? (
+        <Suspense fallback={<section className="workspace" role="status">Loading Library…</section>}>
+          {detailId
+            ? <SongDetail songId={detailId} token={token} onNavigate={navigate} />
+            : <Library token={token} onNavigate={navigate} />}
+        </Suspense>
+      ) : section === "Runs" ? (
+        <Suspense fallback={<section className="workspace" role="status">Loading Runs…</section>}>
+          <Runs token={token} detailId={detailId} onNavigate={navigate} />
+        </Suspense>
       ) : (
         <section aria-labelledby="section-heading" className="workspace" tabIndex={-1}>
           <p className="eyebrow">Workspace</p>

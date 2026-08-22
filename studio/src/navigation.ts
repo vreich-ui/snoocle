@@ -18,12 +18,40 @@ export function sectionPath(section: StudioSection): string {
   return `/studio/${section.toLowerCase().replaceAll(" ", "-")}`;
 }
 
-export function sectionFromPath(pathname: string): StudioSection {
-  const match = studioSections.find((section) => sectionPath(section) === pathname);
-  return match ?? defaultSection;
+export interface StudioRoute {
+  section: StudioSection;
+  detailId?: string;
 }
 
-export const implementedSections = ["Tool Studio"] as const satisfies readonly StudioSection[];
+const LIBRARY_DETAIL_PREFIX = "/studio/library/";
+const RUNS_DETAIL_PREFIX = "/studio/runs/";
+
+/** A detail path (song or run) is not itself a section path, so it is matched separately, after the exact section match fails. */
+export function routeFromPath(pathname: string): StudioRoute {
+  const section = studioSections.find((item) => sectionPath(item) === pathname);
+  if (section) return { section };
+  if (pathname.startsWith(LIBRARY_DETAIL_PREFIX) && pathname.length > LIBRARY_DETAIL_PREFIX.length) {
+    return { section: "Library", detailId: decodeURIComponent(pathname.slice(LIBRARY_DETAIL_PREFIX.length)) };
+  }
+  if (pathname.startsWith(RUNS_DETAIL_PREFIX) && pathname.length > RUNS_DETAIL_PREFIX.length) {
+    return { section: "Runs", detailId: decodeURIComponent(pathname.slice(RUNS_DETAIL_PREFIX.length)) };
+  }
+  return { section: defaultSection };
+}
+
+export function sectionFromPath(pathname: string): StudioSection {
+  return routeFromPath(pathname).section;
+}
+
+export function songDetailPath(songId: string): string {
+  return `/studio/library/${encodeURIComponent(songId)}`;
+}
+
+export function runDetailPath(runId: string): string {
+  return `/studio/runs/${encodeURIComponent(runId)}`;
+}
+
+export const implementedSections = ["Tool Studio", "Library", "Runs"] as const satisfies readonly StudioSection[];
 
 export function isImplemented(section: StudioSection): boolean {
   return (implementedSections as readonly StudioSection[]).includes(section);

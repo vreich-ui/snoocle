@@ -333,3 +333,92 @@ dd { font-size: .8rem; margin: .2rem 0 0; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
   .audio-inputs { grid-template-columns: 1fr; }
 }
+
+/* --- Library / Song detail / Runs ------------------------------------- */
+
+.library, .song-detail, .runs, .run-detail { max-width: 64rem; }
+
+.library-search { margin-top: 1rem; max-width: 22rem; }
+.catalog-count { margin-top: .6rem; }
+
+.song-list { display: grid; gap: .5rem; margin-top: 1rem; }
+.song-row {
+  background: #141f35;
+  border: 1px solid #2f3d58;
+  border-radius: .55rem;
+  color: inherit;
+  display: grid;
+  gap: .35rem;
+  padding: .7rem .9rem;
+  text-align: left;
+  width: 100%;
+}
+.song-row:hover { border-color: #6b89b9; }
+.song-row code { color: #aabbd3; font-size: .72rem; overflow-wrap: anywhere; }
+.song-row-meta { align-items: center; color: #93a5bf; display: flex; flex-wrap: wrap; font-size: .72rem; gap: .6rem; }
+
+.back-link {
+  background: transparent;
+  border: 1px solid #42526d;
+  border-radius: 999px;
+  color: inherit;
+  margin-bottom: 1.25rem;
+  padding: .45rem .8rem;
+}
+
+.song-meta { margin-top: .8rem; }
+
+.table-wrap { margin-top: .75rem; overflow-x: auto; }
+table { border-collapse: collapse; font-size: .82rem; width: 100%; }
+th, td { border-bottom: 1px solid #28354c; padding: .5rem .65rem; text-align: left; white-space: nowrap; }
+th { color: #8fa4c3; font-size: .68rem; letter-spacing: .05em; text-transform: uppercase; }
+tr.row-button { cursor: pointer; }
+tr.row-button:hover { background: #141f35; }
+
+.stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .6rem;
+  margin: .8rem 0;
+}
+.stat-row div {
+  background: #111b2f;
+  border: 1px solid #283751;
+  border-radius: .45rem;
+  min-width: 5rem;
+  padding: .5rem .75rem;
+}
+
+.diff-controls { align-items: end; display: flex; flex-wrap: wrap; gap: .75rem; margin: .8rem 0; }
+.diff-controls select { min-width: 8rem; }
+.diff-output, .run-steps pre {
+  background: #080f1d;
+  border: 1px solid #273651;
+  border-radius: .45rem;
+  font-size: .75rem;
+  max-height: 30rem;
+  overflow: auto;
+  padding: .8rem;
+  white-space: pre-wrap;
+}
+
+.run-steps { display: grid; gap: .5rem; margin-top: .75rem; }
+.run-steps details {
+  background: #111b2f;
+  border: 1px solid #283751;
+  border-radius: .45rem;
+  padding: .6rem .85rem;
+}
+.run-steps pre { margin-top: .5rem; max-height: 22rem; }
+
+.sheet {
+  background: #0e192c;
+  border: 1px solid #283751;
+  border-radius: .55rem;
+  overflow: auto;
+  padding: 1rem;
+}
+
+@media (max-width: 850px) {
+  .library, .song-detail, .runs, .run-detail { max-width: 100%; }
+}

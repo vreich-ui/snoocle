@@ -16,3 +16,8 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
   if (token) headers.set("Authorization", `Bearer ${token}`);
   return fetch(path, { ...init, headers });
 }
+
+/** /mcp answers an absent or bad bearer token with an OAuth-style 401 body. */
+export function looksUnauthorized(message: string): boolean {
+  return /invalid_token|unauthorized|authorization required|\b401\b/i.test(message);
+}

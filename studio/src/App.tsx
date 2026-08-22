@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { getBearerToken, saveBearerToken } from "./api";
 import { AudioWorkspace } from "./AudioWorkspace";
-import { sectionFromPath, sectionPath, studioSections, type StudioSection } from "./navigation";
+import { isImplemented, sectionFromPath, sectionPath, sectionPlan, studioSections, type StudioSection } from "./navigation";
 import "./studio.css";
 
 const ToolStudio = lazy(() => import("./ToolStudio").then((module) => ({ default: module.ToolStudio })));
@@ -52,9 +52,10 @@ export function StudioApp() {
         {studioSections.map((item) => (
           <button
             aria-current={section === item ? "page" : undefined}
-            className={section === item ? "selected" : ""}
+            className={[section === item ? "selected" : "", isImplemented(item) ? "" : "unbuilt"].filter(Boolean).join(" ")}
             key={item}
             onClick={() => navigate(item)}
+            title={isImplemented(item) ? undefined : `${item} — not built yet`}
             type="button"
           >
             {item}
@@ -74,7 +75,9 @@ export function StudioApp() {
         <section aria-labelledby="section-heading" className="workspace" tabIndex={-1}>
           <p className="eyebrow">Workspace</p>
           <h2 id="section-heading">{section}</h2>
-          <p>Connect your Snoocle workflow here. API requests use the bearer token from this tab only.</p>
+          <span className="status-pill">Not built yet</span>
+          <p>{sectionPlan[section]}</p>
+          <p className="muted">Until this section is built, the working equivalent lives in the existing admin at <a href="/ui/">/ui/</a>.</p>
         </section>
       )}
     </main>

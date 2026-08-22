@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { apiFetch } from "./api";
 import {
   apiBlob,
@@ -76,12 +76,16 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
   const [renameMissing, setRenameMissing] = useState<string[]>([]);
   const [renameNotice, setRenameNotice] = useState("");
 
+  // Seed the rename fields once per song. Keying this on song.data alone lets a
+  // later re-resolve overwrite whatever the user has typed — which silently
+  // reverts an edit in progress and leaves the Rename button disabled.
+  const seededFor = useRef("");
   useEffect(() => {
-    if (song.data) {
-      setArtistInput(song.data.metadata.artist);
-      setTitleInput(song.data.metadata.title);
-    }
-  }, [song.data]);
+    if (!song.data || seededFor.current === songId) return;
+    seededFor.current = songId;
+    setArtistInput(song.data.metadata.artist);
+    setTitleInput(song.data.metadata.title);
+  }, [song.data, songId]);
 
   const [versionA, setVersionA] = useState("");
   const [versionB, setVersionB] = useState("");

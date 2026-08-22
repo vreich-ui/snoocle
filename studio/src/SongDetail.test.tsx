@@ -101,11 +101,17 @@ describe("SongDetail", () => {
     const user = userEvent.setup();
     render(<SongDetail songId={song.id} token="tab-token" onNavigate={onNavigate} />);
     await screen.findByText("Karma Police — Radiohead");
+    await screen.findByText(/run-1/);
 
     const titleInput = screen.getByLabelText("Title");
     await user.clear(titleInput);
     await user.type(titleInput, "Karma Police (Live)");
-    await user.click(screen.getByRole("button", { name: "Rename song" }));
+    // The form seeds from the fetched song, so assert it actually holds the edit
+    // (and the button is live) before clicking — otherwise this races the loads.
+    await waitFor(() => expect(titleInput).toHaveValue("Karma Police (Live)"));
+    const renameButton = screen.getByRole("button", { name: "Rename song" });
+    await waitFor(() => expect(renameButton).toBeEnabled());
+    await user.click(renameButton);
 
     await waitFor(() => expect(onNavigate).toHaveBeenCalledWith("/studio/library/radiohead--karma-police-live"));
   });
@@ -126,10 +132,14 @@ describe("SongDetail", () => {
     const user = userEvent.setup();
     render(<SongDetail songId={song.id} token="tab-token" onNavigate={onNavigate} />);
     await screen.findByText("Karma Police — Radiohead");
+    await screen.findByText(/run-1/);
 
     const artistInput = screen.getByLabelText("Artist");
     await user.clear(artistInput);
-    await user.click(screen.getByRole("button", { name: "Rename song" }));
+    await waitFor(() => expect(artistInput).toHaveValue(""));
+    const renameButton = screen.getByRole("button", { name: "Rename song" });
+    await waitFor(() => expect(renameButton).toBeEnabled());
+    await user.click(renameButton);
 
     expect(await screen.findByText("Missing: artist")).toBeVisible();
     expect(onNavigate).not.toHaveBeenCalled();

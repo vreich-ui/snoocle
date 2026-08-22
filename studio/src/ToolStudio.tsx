@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { looksUnauthorized } from "./api";
 import { SchemaForm, type JsonSchema } from "./SchemaForm";
 import { clearHistory, loadHistory, newHistoryId, saveHistory, type InvocationHistoryEntry } from "./history";
 import { createToolStudioClient, type ToolStudioClient } from "./mcp";
@@ -20,7 +21,7 @@ interface ToolStudioProps {
   clientFactory?: ClientFactory;
 }
 
-type ConnectionState = "connecting" | "connected" | "error";
+type ConnectionState = "unauthenticated" | "connecting" | "connected" | "error" | "rejected";
 
 const emptyTelemetry: ResultTelemetry = {
   elapsedMs: 0,
@@ -46,7 +47,7 @@ function isAbort(error: unknown): boolean {
 export function ToolStudio({ token, clientFactory = createToolStudioClient }: ToolStudioProps) {
   const clientRef = useRef<ToolStudioClient | undefined>(undefined);
   const abortRef = useRef<AbortController | undefined>(undefined);
-  const [connection, setConnection] = useState<ConnectionState>("connecting");
+  const [connection, setConnection] = useState<ConnectionState>(() => (token ? "connecting" : "unauthenticated"));
   const [connectionError, setConnectionError] = useState("");
   const [tools, setTools] = useState<StudioTool[]>([]);
   const [selectedName, setSelectedName] = useState("");
@@ -64,12 +65,18 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
 
   useEffect(() => {
     let active = true;
-    const client = clientFactory(token);
-    clientRef.current = client;
-    setConnection("connecting");
     setConnectionError("");
     setTools([]);
     setSelectedName("");
+    if (!token) {
+      setConnection("unauthenticated");
+      return () => {
+        active = false;
+      };
+    }
+    const client = clientFactory(token);
+    clientRef.current = client;
+    setConnection("connecting");
     client.connectAndDiscover().then((discovered) => {
       if (!active) return;
       setTools(discovered);
@@ -77,8 +84,9 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
       setConnection("connected");
     }).catch((error: unknown) => {
       if (!active) return;
-      setConnection("error");
-      setConnectionError(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      setConnection(looksUnauthorized(message) ? "rejected" : "error");
+      setConnectionError(message);
     });
     return () => {
       active = false;
@@ -164,9 +172,32 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
           <p className="muted">Official MCP client → same-origin <code>/mcp</code>. No proxy and no hand-written tool inventory.</p>
         </div>
         <div className={`connection ${connection}`} role="status">
-          {connection === "connecting" ? "Connecting…" : connection === "connected" ? `Connected · ${tools.length} tools · ${runnableCount} browser-runnable` : "Connection failed"}
+          {connection === "unauthenticated"
+            ? "No token"
+            : connection === "rejected"
+              ? "Token rejected"
+              : connection === "connecting"
+                ? "Connecting…"
+                : connection === "connected"
+                  ? `Connected · ${tools.length} tools · ${runnableCount} browser-runnable`
+                  : "Connection failed"}
         </div>
       </section>
+
+      {connection === "unauthenticated" && (
+        <section className="connection-error notice" role="status">
+          <strong>Enter a bearer token to connect.</strong>
+          <p>Paste the server's SNOOCLE_API_TOKEN into the sidebar. It stays in this browser tab only and is never stored or sent anywhere but this server.</p>
+        </section>
+      )}
+
+      {connection === "rejected" && (
+        <section className="connection-error" role="alert">
+          <strong>The bearer token was rejected.</strong>
+          <p>/mcp answered 401. Check that the value matches SNOOCLE_API_TOKEN on the server, then retry.</p>
+          <button type="button" onClick={() => setRetry((value) => value + 1)}>Retry connection</button>
+        </section>
+      )}
 
       {connection === "error" && (
         <section className="connection-error" role="alert">
@@ -285,7 +316,7 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
                 </section>
               )}
             </>
-          ) : <p className="muted">{connection === "connecting" ? "Discovering tools…" : "Select a tool from the live catalog."}</p>}
+          ) : <p className="muted">{connection === "connecting" ? "Discovering tools…" : connection === "unauthenticated" ? "Connect with a bearer token to load the live tool catalog." : "Select a tool from the live catalog."}</p>}
         </section>
 
         <aside className="history" aria-label="Local invocation history">

@@ -186,7 +186,8 @@ TOOL_CONTRACTS: dict[str, ToolContract] = {
         ("candidate_source", "song_identity"), ("song",), renderer="song",
     ),
     "validate_song_json": _contract(
-        "validate_song_json", "parsing", "safe", ("song",), ("song_validation", "song"),
+        "validate_song_json", "parsing", "safe", ("song", "song_version"),
+        ("song_validation", "song"), network=("store_backend",), persistence=("song_store_read",),
         renderer="song",
     ),
     "analyze_full_track_mir": _contract(
@@ -206,43 +207,55 @@ TOOL_CONTRACTS: dict[str, ToolContract] = {
         renderer="mir",
     ),
     "snap_song_to_mir": _contract(
-        "snap_song_to_mir", "alignment", "safe", ("song", "mir_analysis"), ("song",),
+        "snap_song_to_mir", "alignment", "safe", ("song", "song_version", "mir_analysis"),
+        ("song",), network=("store_backend",), persistence=("song_store_read",),
         renderer="song",
     ),
     "carry_forward_song_timing": _contract(
         "carry_forward_song_timing", "alignment", "safe", ("song", "song_version"),
-        ("song", "timing_report"), renderer="song",
+        ("song", "timing_report"), network=("store_backend",), persistence=("song_store_read",),
+        renderer="song",
     ),
     "lookup_lrc": _contract(
         "lookup_lrc", "source retrieval", "safe", ("song_identity",), ("lrc",),
         network=("external:lrclib",), duration="seconds", renderer="lrc",
     ),
     "match_lrc_to_song": _contract(
-        "match_lrc_to_song", "parsing", "safe", ("lrc", "song"), ("lrc_matches",),
+        "match_lrc_to_song", "parsing", "safe", ("lrc", "song", "song_version"), ("lrc_matches",),
+        network=("store_backend",), persistence=("song_store_read",),
         renderer="lrc",
     ),
     "apply_lrc_to_song": _contract(
-        "apply_lrc_to_song", "alignment", "safe", ("song", "lrc_matches", "mir_analysis"),
-        ("song",), renderer="song",
+        "apply_lrc_to_song", "alignment", "safe",
+        ("song", "song_version", "lrc_matches", "mir_analysis"),
+        ("song",), network=("store_backend",), persistence=("song_store_read",),
+        renderer="song",
     ),
     "retime_song_sections": _contract(
-        "retime_song_sections", "alignment", "safe", ("song",), ("song", "timing_report"),
+        "retime_song_sections", "alignment", "safe", ("song", "song_version"),
+        ("song", "timing_report"), network=("store_backend",), persistence=("song_store_read",),
         renderer="song",
     ),
     "guard_song_timing_collapse": _contract(
-        "guard_song_timing_collapse", "alignment", "safe", ("song",),
-        ("song", "timing_report"), renderer="song",
+        "guard_song_timing_collapse", "alignment", "safe", ("song", "song_version"),
+        ("song", "timing_report"), network=("store_backend",), persistence=("song_store_read",),
+        renderer="song",
     ),
     "score_song_confidence": _contract(
-        "score_song_confidence", "alignment", "safe", ("song", "candidate_source", "mir_analysis"),
-        ("song", "confidence_report", "review_queue"), renderer="quality_report",
+        "score_song_confidence", "alignment", "safe",
+        ("song", "song_version", "candidate_source", "mir_analysis"),
+        ("song", "confidence_report", "review_queue"), network=("store_backend",),
+        persistence=("song_store_read",), renderer="quality_report",
     ),
     "evaluate_song_quality": _contract(
-        "evaluate_song_quality", "quality", "safe", ("song", "candidate_source", "mir_analysis"),
-        ("quality_report",), renderer="quality_report",
+        "evaluate_song_quality", "quality", "safe",
+        ("song", "song_version", "candidate_source", "mir_analysis"),
+        ("quality_report",), network=("store_backend",), persistence=("song_store_read",),
+        renderer="quality_report",
     ),
     "validate_song_theory": _contract(
-        "validate_song_theory", "quality", "safe", ("song",), ("theory_report",),
+        "validate_song_theory", "quality", "safe", ("song", "song_version"), ("theory_report",),
+        network=("store_backend",), persistence=("song_store_read",),
         duration="seconds", renderer="quality_report",
     ),
     "calculate_recording_offset": _contract(
@@ -252,12 +265,15 @@ TOOL_CONTRACTS: dict[str, ToolContract] = {
         renderer="recording_offset",
     ),
     "apply_deterministic_song_patch": _contract(
-        "apply_deterministic_song_patch", "alignment", "safe", ("song", "song_patch"),
-        ("song", "applied_patch"), renderer="song",
+        "apply_deterministic_song_patch", "alignment", "safe",
+        ("song", "song_version", "song_patch"),
+        ("song", "applied_patch"), network=("store_backend",), persistence=("song_store_read",),
+        renderer="song",
     ),
     "build_song_evidence_manifest": _contract(
         "build_song_evidence_manifest", "quality", "safe",
-        ("candidate_collection", "mir_analysis", "song"), ("evidence_manifest",),
+        ("candidate_collection", "mir_analysis", "song", "song_version"), ("evidence_manifest",),
+        network=("store_backend",), persistence=("song_store_read",),
         renderer="evidence_manifest",
     ),
     "align_song_deterministically": _contract(

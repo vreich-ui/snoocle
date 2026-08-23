@@ -62,8 +62,12 @@ def make_worker(server, store, run_job, **overrides) -> Worker:
     # Everything above the transport — paths, payloads, status codes — is the
     # genuine protocol.
     worker.client.close()
-    worker.client = httpx.Client(
-        transport=server._transport,
+    # Use TestClient itself rather than reaching for its private _transport:
+    # since Starlette 1.x that transport is async, and handing it to a plain
+    # sync httpx.Client yields a response whose stream is not a SyncByteStream.
+    # TestClient is an httpx.Client subclass that owns the sync/async bridge.
+    worker.client = TestClient(
+        app,
         base_url="http://testserver",
         headers={"User-Agent": "snoocle-worker/test"},
     )

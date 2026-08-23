@@ -15,6 +15,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -e ".[dev,mir]"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       # test_mcp_tools_over_stdio spawns the server as a subprocess and fails to
       # decode its first stdout frame outside a real terminal. Deselected so a
       # known-environmental failure cannot mask a real one; fix it and drop this.

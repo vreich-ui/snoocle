@@ -2,9 +2,17 @@
 
 Twenty-four MCP tools expose Snoocle's model-free deterministic core: six
 source-to-baseline operations and sixteen MIR, timing, quality, patch, and
-evidence leaves, plus two orchestrators. The leaf tools are persistence-free
-and cache-free. Only `lookup_lrc` uses the network at the leaf layer, and it is
-identified as such in every response.
+evidence leaves, plus two orchestrators. The leaf tools never write state, and
+most accept caller-supplied Song JSON with no network, cache, or persistence
+access. Any leaf that takes a Song (or a prior Song) also accepts a
+`song_id`/`song_version` reference in place of the inline JSON — `<name>_json`
+and `<name>_id` are mutually exclusive, `<name>_version` is only valid
+alongside `<name>_id`, and loading by id is an explicit, caller-requested read
+of the song store, reported as `songSource`/`songVersion` (or
+`priorSongSource`/`priorSongVersion` for a prior Song) in the result and as
+non-`none` `network`/`persistence` in the response envelope. Only `lookup_lrc`
+uses the network unconditionally at the leaf layer, and every conditional
+network/cache/persistence access is identified as such in every response.
 
 The full `analyze_and_store_song` entry point is deterministic-first by
 default. Its `agent_policy` is `never | unresolved_only | always`; only an
@@ -48,7 +56,7 @@ Validation details omit the rejected payload itself.
 | `rank_candidates_deterministically` | `candidates_json`, optional `mir_json` | ordered `ranked` candidates | `deterministic.rank_candidates_deterministically` |
 | `select_candidate_deterministically` | `candidates_json`, explicit `strategy` (`best` or `strict`), optional `mir_json` | selection status, ranking, and compact conflicts | `deterministic.select_candidate_deterministically` |
 | `build_song_baseline` | `candidate_json`, `song_id`, `title`, `artist`, optional `youtube_video_id` | schema-valid untimed `song` | `deterministic.build_song_from_candidate` |
-| `validate_song_json` | `song_json` | `valid=true` and the normalized `song` | `schema.song.Song.model_validate` |
+| `validate_song_json` | `song_json` or `song_id`/`song_version` | `valid=true` and the normalized `song` | `schema.song.Song.model_validate` |
 
 ## MIR, timing, quality, and evidence operations
 
@@ -57,25 +65,27 @@ Validation details omit the rejected payload itself.
 | `analyze_full_track_mir` | local `audio_path`, `accuracy` | full-track `analysis` | `mir.pipeline.analyze_audio` | none | none | none |
 | `analyze_mir_window` | local `audio_path`, `start_seconds`, `end_seconds` | windowed `analysis` | `mir.pipeline.analyze_window` | none | none | none |
 | `extend_mir_beat_grid` | `beats_json`, duration and explicit continuation options | bounded beat grid | `mir.beats.extend_beat_grid` | none | none | none |
-| `snap_song_to_mir` | `song_json`, optional `mir_json` | timed `song` | `timing.snap.snap_chords` | none | none | none |
-| `carry_forward_song_timing` | new/prior Song JSON, optional fallback/version label | `song`, carry statistics | `timing.carry_forward.carry_forward_timing` | none | none | none |
+| `snap_song_to_mir` | Song (JSON or `song_id`/`song_version`), optional `mir_json` | timed `song`, `songSource`/`songVersion` | `timing.snap.snap_chords` | none / `store_backend` | none | none / `song_store_read` |
+| `carry_forward_song_timing` | new and prior Song (each JSON or `song_id`/`song_version`), optional fallback/version label | `song`, carry statistics, `songSource`/`songVersion`, `priorSongSource`/`priorSongVersion` | `timing.carry_forward.carry_forward_timing` | none / `store_backend` | none | none / `song_store_read` |
 | `lookup_lrc` | title, artist, optional duration | LRCLIB match or explicit miss | `timing.lrc.fetch_lrc_match` | LRCLIB | none | none |
-| `match_lrc_to_song` | `lrc_json`, `song_json` | monotonic line matches | `timing.lrc.match_lrc_to_lines` | none | none | none |
-| `apply_lrc_to_song` | Song, match, optional MIR JSON | LRC-anchored `song` | `timing.lrc.apply_lrc` | none | none | none |
-| `retime_song_sections` | Song JSON, optional duration | `song`, changed count | `timing.realign.retime_sections` | none | none | none |
-| `guard_song_timing_collapse` | Song JSON, optional duration | guarded `song`, intervention provenance | `timing.collapse_guard.guard_against_collapsed_timing` | none | none | none |
-| `score_song_confidence` | Song, candidate, optional MIR JSON, threshold | scored `song`, scores, review queue | `timing.confidence.score_song` + `build_review_queue` | none | none | none |
-| `evaluate_song_quality` | Song/candidate/optional MIR JSON and spent budgets | grade, fault attribution, escalation | `quality.gate.evaluate` | none | none | none |
-| `validate_song_theory` | Song JSON, optional key override | theory report | `quality.theory.theory_validity` | none | none | none |
+| `match_lrc_to_song` | `lrc_json`, Song (JSON or `song_id`/`song_version`) | monotonic line matches, `songSource`/`songVersion` | `timing.lrc.match_lrc_to_lines` | none / `store_backend` | none | none / `song_store_read` |
+| `apply_lrc_to_song` | Song (JSON or `song_id`/`song_version`), match, optional MIR JSON | LRC-anchored `song`, `songSource`/`songVersion` | `timing.lrc.apply_lrc` | none / `store_backend` | none | none / `song_store_read` |
+| `retime_song_sections` | Song (JSON or `song_id`/`song_version`), optional duration | `song`, changed count, `songSource`/`songVersion` | `timing.realign.retime_sections` | none / `store_backend` | none | none / `song_store_read` |
+| `guard_song_timing_collapse` | Song (JSON or `song_id`/`song_version`), optional duration | guarded `song`, intervention provenance, `songSource`/`songVersion` | `timing.collapse_guard.guard_against_collapsed_timing` | none / `store_backend` | none | none / `song_store_read` |
+| `score_song_confidence` | Song (JSON or `song_id`/`song_version`), candidate, optional MIR JSON, threshold | scored `song`, scores, review queue, `songSource`/`songVersion` | `timing.confidence.score_song` + `build_review_queue` | none / `store_backend` | none | none / `song_store_read` |
+| `evaluate_song_quality` | Song (JSON or `song_id`/`song_version`), candidate, optional MIR JSON and spent budgets | grade, fault attribution, escalation, `songSource`/`songVersion` | `quality.gate.evaluate` | none / `store_backend` | none | none / `song_store_read` |
+| `validate_song_theory` | Song (JSON or `song_id`/`song_version`), optional key override | theory report, `songSource`/`songVersion` | `quality.theory.theory_validity` | none / `store_backend` | none | none / `song_store_read` |
 | `calculate_recording_offset` | two local audio paths, maximum offset | offset and confidence | `timing.offset.estimate_offset` | none | none | none |
-| `apply_deterministic_song_patch` | Song JSON and closed patch JSON | patched `song`, applied operations | `reconcile.patch_ops.parse_ops_response` + `apply_patch` | none | none | none |
-| `build_song_evidence_manifest` | optional candidate/MIR/prior Song JSON and request metadata | evidence manifest | `manifest.build_evidence_manifest` | none | none | none |
+| `apply_deterministic_song_patch` | Song (JSON or `song_id`/`song_version`) and closed patch JSON | patched `song`, applied operations, `songSource`/`songVersion` | `reconcile.patch_ops.parse_ops_response` + `apply_patch` | none / `store_backend` | none | none / `song_store_read` |
+| `build_song_evidence_manifest` | optional candidate/MIR/prior Song (JSON or `prior_song_id`/`prior_song_version`) and request metadata | evidence manifest, `priorSongSource`/`priorSongVersion` | `manifest.build_evidence_manifest` | none / `store_backend` | none | none / `song_store_read` |
 
 The audio-analysis and offset tools read only caller-named server files; they
 never acquire recordings implicitly. No leaf accepts a persistence flag,
 because none writes state. Consequently expected-version locking is not
-applicable at this layer. Persistence and optimistic locking belong to the
-explicit orchestrator/store boundary.
+applicable at this layer. A leaf that takes a Song may still *read* the song
+store, but only when the caller passes `song_id` (or `prior_song_id`) instead
+of inline JSON — never implicitly. Persistence and optimistic locking for
+Song *writes* belong to the explicit orchestrator/store boundary.
 
 ## Deterministic orchestrators
 
@@ -116,7 +126,10 @@ object; a ranking or selection input is an array of those objects; MIR is one
 - Baselines copy lyric strings and chord placements in their existing order,
   including each `charIndex`. They clear line and placement timing and set
   display capo to zero.
-- Leaf tools never persist implicitly. The two deterministic orchestrators
-  always write bounded run traces and write Songs only with explicit
-  `persist=true` plus expected-version locking. Production policy lives at the
-  full orchestration entry points.
+- Leaf tools never persist implicitly, and never write. A leaf that accepts a
+  Song may read the song store, but only on the caller's explicit request via
+  `song_id`/`prior_song_id` in place of inline JSON — never as a side effect
+  of any other input. The two deterministic orchestrators always write
+  bounded run traces and write Songs only with explicit `persist=true` plus
+  expected-version locking. Production policy lives at the full orchestration
+  entry points.

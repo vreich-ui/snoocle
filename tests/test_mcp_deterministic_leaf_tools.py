@@ -10,6 +10,7 @@ from snoocle_server import mcp_server
 from snoocle_server.mir.base import Beat, MirAnalysis
 from snoocle_server.reconcile.patch_ops import AppliedOp
 from snoocle_server.schema import ProvenanceEntry, Song
+from snoocle_server.store.memory import InMemorySongRepository
 from snoocle_server.timing.carry_forward import CarryForwardStats
 from snoocle_server.timing.confidence import PlacementScore
 from snoocle_server.timing.lrc import LrcLine, LrcMatch
@@ -18,8 +19,8 @@ from snoocle_server.timing.offset import OffsetEstimate
 from test_schema import make_song
 
 
-def _song() -> Song:
-    return Song.model_validate(make_song())
+def _song(**overrides) -> Song:
+    return Song.model_validate(make_song(**overrides))
 
 
 def _json(value) -> str:
@@ -28,7 +29,9 @@ def _json(value) -> str:
     return json.dumps(value)
 
 
-def _assert_leaf(response: dict, *, network: str = "none", ok: bool = True) -> None:
+def _assert_leaf(
+    response: dict, *, network: str = "none", persistence: str = "none", ok: bool = True
+) -> None:
     assert response["ok"] is ok
     assert response["modelCalls"] == 0
     assert response["modelCostUSD"] == 0
@@ -36,7 +39,7 @@ def _assert_leaf(response: dict, *, network: str = "none", ok: bool = True) -> N
     assert response["access"] == {
         "network": network,
         "cache": "none",
-        "persistence": "none",
+        "persistence": persistence,
     }
     assert isinstance(response["elapsedMs"], int)
     assert isinstance(response["inputSummary"], dict)
@@ -231,3 +234,193 @@ def test_leaf_tools_never_touch_pipeline_model_cache_or_store(monkeypatch):
     ]
     for response in responses:
         _assert_leaf(response)
+
+
+# --- song_id / song_version store-backed input -----------------------------
+
+
+@pytest.fixture()
+def song_store(monkeypatch):
+    songs = InMemorySongRepository()
+    monkeypatch.setattr(mcp_server, "get_store", lambda: songs)
+    return songs
+
+
+def _saved(song_store, song: Song, message: str = "initial"):
+    return song_store.save(song, message)
+
+
+@pytest.mark.parametrize(
+    "call_by_json,call_by_id",
+    [
+        (
+            lambda song_json: mcp_server.validate_song_json(song_json),
+            lambda song_id: mcp_server.validate_song_json(song_id=song_id),
+        ),
+        (
+            lambda song_json: mcp_server.snap_song_to_mir(song_json),
+            lambda song_id: mcp_server.snap_song_to_mir(song_id=song_id),
+        ),
+        (
+            lambda song_json: mcp_server.validate_song_theory(song_json),
+            lambda song_id: mcp_server.validate_song_theory(song_id=song_id),
+        ),
+        (
+            lambda song_json: mcp_server.retime_song_sections(song_json),
+            lambda song_id: mcp_server.retime_song_sections(song_id=song_id),
+        ),
+    ],
+)
+def test_song_id_loads_the_same_song_as_equivalent_json(song_store, call_by_json, call_by_id):
+    song = _song()
+    saved = _saved(song_store, song)
+
+    by_json = call_by_json(_json(song))
+    by_id = call_by_id(song.id)
+
+    assert by_json["ok"] is True
+    assert by_id["ok"] is True
+    ignored = {"songSource", "songVersion"}
+    by_json_content = {k: v for k, v in by_json["result"].items() if k not in ignored}
+    by_id_content = {k: v for k, v in by_id["result"].items() if k not in ignored}
+    assert by_id_content == by_json_content
+    assert by_id["result"]["songSource"] == "store"
+    assert by_id["result"]["songVersion"] == saved.version
+    assert by_json["result"]["songSource"] == "caller"
+    assert by_json["result"]["songVersion"] is None
+    _assert_leaf(by_json)
+    _assert_leaf(by_id, network="store_backend", persistence="song_store_read")
+
+
+def test_song_id_with_explicit_version_loads_that_version(song_store):
+    song = _song()
+    first = _saved(song_store, song, "v1")
+    changed = song.model_copy(deep=True)
+    changed.metadata.key = "D major"
+    second = song_store.save(changed, "v2", expected_version=first.version)
+    assert second.version != first.version
+
+    at_first = mcp_server.validate_song_json(song_id=song.id, song_version=first.version)
+    at_latest = mcp_server.validate_song_json(song_id=song.id)
+
+    assert at_first["ok"] is True
+    assert at_first["result"]["songVersion"] == first.version
+    assert at_first["result"]["song"]["metadata"]["key"] != "D major"
+
+    assert at_latest["ok"] is True
+    assert at_latest["result"]["songVersion"] == second.version
+    assert at_latest["result"]["song"]["metadata"]["key"] == "D major"
+
+
+def test_song_json_and_song_id_together_is_invalid_song_source(song_store):
+    song = _song()
+    _saved(song_store, song)
+
+    response = mcp_server.validate_song_json(song_json=_json(song), song_id=song.id)
+
+    # song_id was present, so the store-read declaration fires even though
+    # resolution rejects the combination before touching the store — this
+    # mirrors align_song_deterministically's presence-based (not outcome-based)
+    # access declaration.
+    _assert_leaf(response, ok=False, network="store_backend", persistence="song_store_read")
+    assert response["error"]["code"] == "invalid_song_source"
+    assert "song_json" in response["error"]["message"]
+    assert "song_id" in response["error"]["message"]
+
+
+def test_neither_song_json_nor_song_id_is_invalid_song_source(song_store):
+    response = mcp_server.validate_song_json()
+
+    _assert_leaf(response, ok=False)
+    assert response["error"]["code"] == "invalid_song_source"
+
+
+def test_song_version_without_song_id_is_unexpected_song_version(song_store):
+    song = _song()
+
+    response = mcp_server.validate_song_json(song_json=_json(song), song_version="deadbeef")
+
+    _assert_leaf(response, ok=False)
+    assert response["error"]["code"] == "unexpected_song_version"
+    assert "song_version" in response["error"]["message"]
+    assert "song_id" in response["error"]["message"]
+
+
+def test_unknown_song_id_is_song_not_found(song_store):
+    response = mcp_server.validate_song_json(song_id="no-such-song")
+
+    _assert_leaf(response, ok=False, network="store_backend", persistence="song_store_read")
+    assert response["error"]["code"] == "song_not_found"
+
+
+def test_carry_forward_song_timing_resolves_both_song_and_prior_song_by_id(song_store, monkeypatch):
+    monkeypatch.setattr(
+        mcp_server,
+        "_carry_forward_timing",
+        lambda song, prior, **kwargs: (song, CarryForwardStats()),
+    )
+    song = _song()
+    prior = _song(id="prior--song", metadata={"title": "Prior", "artist": "Song"})
+    saved_song = _saved(song_store, song, "song")
+    saved_prior = _saved(song_store, prior, "prior")
+
+    by_json = mcp_server.carry_forward_song_timing(_json(song), _json(prior))
+    by_id = mcp_server.carry_forward_song_timing(
+        song_id=song.id, prior_song_id=prior.id
+    )
+
+    assert by_json["ok"] is True
+    assert by_id["ok"] is True
+    assert by_id["result"]["song"] == by_json["result"]["song"]
+    assert by_id["result"]["songSource"] == "store"
+    assert by_id["result"]["songVersion"] == saved_song.version
+    assert by_id["result"]["priorSongSource"] == "store"
+    assert by_id["result"]["priorSongVersion"] == saved_prior.version
+    assert by_json["result"]["songSource"] == "caller"
+    assert by_json["result"]["priorSongSource"] == "caller"
+    _assert_leaf(by_json)
+    _assert_leaf(by_id, network="store_backend", persistence="song_store_read")
+
+
+def test_carry_forward_song_timing_invalid_and_missing_prior_song_source(song_store, monkeypatch):
+    monkeypatch.setattr(
+        mcp_server,
+        "_carry_forward_timing",
+        lambda song, prior, **kwargs: (song, CarryForwardStats()),
+    )
+    song = _song()
+
+    both = mcp_server.carry_forward_song_timing(
+        _json(song), _json(song), prior_song_id="whatever"
+    )
+    _assert_leaf(both, ok=False, network="store_backend", persistence="song_store_read")
+    assert both["error"]["code"] == "invalid_song_source"
+    assert "prior_song_json" in both["error"]["message"]
+    assert "prior_song_id" in both["error"]["message"]
+
+    neither = mcp_server.carry_forward_song_timing(_json(song))
+    _assert_leaf(neither, ok=False)
+    assert neither["error"]["code"] == "invalid_song_source"
+    assert "prior_song_json" in neither["error"]["message"]
+
+
+def test_build_song_evidence_manifest_prior_song_by_id(song_store):
+    prior = _song()
+    saved = _saved(song_store, prior)
+
+    by_json = mcp_server.build_song_evidence_manifest(prior_song_json=_json(prior))
+    by_id = mcp_server.build_song_evidence_manifest(prior_song_id=prior.id)
+
+    assert by_json["ok"] is True
+    assert by_id["ok"] is True
+    assert by_id["result"]["manifest"]["priorSong"] == by_json["result"]["manifest"]["priorSong"]
+    assert by_id["result"]["priorSongSource"] == "store"
+    assert by_id["result"]["priorSongVersion"] == saved.version
+    assert by_json["result"]["priorSongSource"] == "caller"
+    _assert_leaf(by_json)
+    _assert_leaf(by_id, network="store_backend", persistence="song_store_read")
+
+    omitted = mcp_server.build_song_evidence_manifest()
+    assert omitted["ok"] is True
+    assert omitted["result"]["priorSongSource"] is None
+    _assert_leaf(omitted)

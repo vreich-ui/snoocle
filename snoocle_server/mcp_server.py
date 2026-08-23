@@ -697,35 +697,41 @@ def build_song_baseline(
 
 
 @mcp.tool()
-def validate_song_json(song_json: str) -> dict:
-    """Validate caller-supplied Song JSON against the existing Song schema.
+def validate_song_json(
+    song_json: str = "",
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+) -> dict:
+    """Validate caller-supplied or stored Song JSON against the Song schema.
 
-    Returns the normalized schema-valid document. No network, cache, model, or
-    persistence access occurs.
+    Returns the normalized schema-valid document. Provide exactly one of
+    song_json or song_id (optionally with song_version). Caller-supplied JSON
+    incurs no network, cache, model, or persistence access; loading by
+    song_id reads the song store.
     """
 
     def call() -> dict:
-        parsed = _json_payload(song_json, label="song_json", expected=dict)
-        lines = parsed.get("lines", [])
-        if isinstance(lines, list) and len(lines) > MAX_LINES:
-            raise _MCPDeterministicInputError(
-                "too_many_lines",
-                f"song has {len(lines)} lines; limit is {MAX_LINES}",
-                actualLines=len(lines),
-                maxLines=MAX_LINES,
-            )
-        song = Song.model_validate(parsed)
-        return {"valid": True, "song": song.model_dump(mode="json")}
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
+        return {
+            "valid": True,
+            "song": song.model_dump(mode="json"),
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "validate_song_json",
-        {"songBytes": len(song_json.encode("utf-8"))},
+        {"songBytes": len(song_json.encode("utf-8")), "songId": song_id},
         call,
         lambda result: {
             "valid": result["valid"],
             "songId": result["song"]["id"],
             "lines": len(result["song"]["lines"]),
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
@@ -855,37 +861,72 @@ def extend_mir_beat_grid(
 
 
 @mcp.tool()
-def snap_song_to_mir(song_json: str, mir_json: Optional[str] = None) -> dict:
-    """Snap a Song's lines and chord placements to optional MIR evidence."""
+def snap_song_to_mir(
+    song_json: str = "",
+    mir_json: Optional[str] = None,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+) -> dict:
+    """Snap a Song's lines and chord placements to optional MIR evidence.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
-        song = _snap_chords(_song_payload(song_json), _mir_payload(mir_json))
-        return {"song": song.model_dump(mode="json")}
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
+        snapped = _snap_chords(song, _mir_payload(mir_json))
+        return {
+            "song": snapped.model_dump(mode="json"),
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "snap_song_to_mir",
-        {"songBytes": len(song_json.encode()), "mirPresent": mir_json is not None},
+        {"songBytes": len(song_json.encode()), "mirPresent": mir_json is not None, "songId": song_id},
         call,
         lambda result: {
             "songId": result["song"]["id"],
             "timedLines": sum(line["timeSeconds"] is not None for line in result["song"]["lines"]),
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
 @mcp.tool()
 def carry_forward_song_timing(
-    song_json: str,
-    prior_song_json: str,
+    song_json: str = "",
+    prior_song_json: str = "",
     audio_fallback_json: Optional[str] = None,
     prior_version: Optional[str] = None,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+    prior_song_id: Optional[str] = None,
+    prior_song_version: Optional[str] = None,
 ) -> dict:
-    """Copy only confidently matched timing from a prior Song version."""
+    """Copy only confidently matched timing from a prior Song version.
+
+    Both the current and prior song accept either inline JSON or a
+    song_id/song_id-with-version reference into the song store (song_json/
+    song_id and prior_song_json/prior_song_id respectively); prior_version
+    remains the free-text provenance label it always was, unrelated to
+    prior_song_version's store lookup.
+    """
 
     def call() -> dict:
+        song, song_loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
+        prior_song, prior_loaded_version, prior_source = _resolve_song_input(
+            prior_song_json or None, prior_song_id, prior_song_version, label="prior_song"
+        )
         updated, stats = _carry_forward_timing(
-            _song_payload(song_json),
-            _song_payload(prior_song_json, label="prior_song_json"),
+            song,
+            prior_song,
             audio_fallback=(
                 _song_payload(audio_fallback_json, label="audio_fallback_json")
                 if audio_fallback_json is not None
@@ -893,13 +934,27 @@ def carry_forward_song_timing(
             ),
             prior_version=prior_version,
         )
-        return {"song": updated.model_dump(mode="json"), "stats": dataclasses.asdict(stats)}
+        return {
+            "song": updated.model_dump(mode="json"),
+            "stats": dataclasses.asdict(stats),
+            "songSource": song_source,
+            "songVersion": song_loaded_version,
+            "priorSongSource": prior_source,
+            "priorSongVersion": prior_loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "carry_forward_song_timing",
-        {"songBytes": len(song_json.encode()), "priorSongBytes": len(prior_song_json.encode())},
+        {
+            "songBytes": len(song_json.encode()),
+            "priorSongBytes": len(prior_song_json.encode()),
+            "songId": song_id,
+            "priorSongId": prior_song_id,
+        },
         call,
         lambda result: {"songId": result["song"]["id"], **result["stats"]},
+        network_access="store_backend" if song_id is not None or prior_song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None or prior_song_id is not None else "none",
     )
 
 
@@ -943,24 +998,39 @@ def lookup_lrc(title: str, artist: str, duration_seconds: Optional[float] = None
 
 
 @mcp.tool()
-def match_lrc_to_song(lrc_json: str, song_json: str) -> dict:
-    """Monotonically match caller-provided LRC lines to Song lines."""
+def match_lrc_to_song(
+    lrc_json: str,
+    song_json: str = "",
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+) -> dict:
+    """Monotonically match caller-provided LRC lines to Song lines.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
-        song = _song_payload(song_json)
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
         matches = _match_lrc_to_lines(_lrc_payload(lrc_json), song)
         return {
             "matches": [
                 {"lineIndex": idx, "timeSeconds": value[0], "similarity": value[1]}
                 for idx, value in sorted(matches.items())
-            ]
+            ],
+            "songSource": song_source,
+            "songVersion": loaded_version,
         }
 
     return _deterministic_mcp_response(
         "match_lrc_to_song",
-        {"lrcBytes": len(lrc_json.encode()), "songBytes": len(song_json.encode())},
+        {"lrcBytes": len(lrc_json.encode()), "songBytes": len(song_json.encode()), "songId": song_id},
         call,
         lambda result: {"matchedLines": len(result["matches"])},
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
@@ -991,104 +1061,176 @@ def _matches_payload(value: str) -> dict[int, tuple[float, float]]:
 
 @mcp.tool()
 def apply_lrc_to_song(
-    song_json: str, matches_json: str, mir_json: Optional[str] = None
+    song_json: str = "",
+    matches_json: str = "",
+    mir_json: Optional[str] = None,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
 ) -> dict:
-    """Apply matched LRC anchors and interpolate/re-snap remaining timing."""
+    """Apply matched LRC anchors and interpolate/re-snap remaining timing.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
-        song = _apply_lrc(
-            _song_payload(song_json), _mir_payload(mir_json), _matches_payload(matches_json)
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
         )
-        return {"song": song.model_dump(mode="json")}
+        applied = _apply_lrc(song, _mir_payload(mir_json), _matches_payload(matches_json))
+        return {
+            "song": applied.model_dump(mode="json"),
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "apply_lrc_to_song",
-        {"songBytes": len(song_json.encode()), "matchesBytes": len(matches_json.encode())},
+        {
+            "songBytes": len(song_json.encode()),
+            "matchesBytes": len(matches_json.encode()),
+            "songId": song_id,
+        },
         call,
         lambda result: {
             "songId": result["song"]["id"],
             "timedLines": sum(line["timeSeconds"] is not None for line in result["song"]["lines"]),
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
 @mcp.tool()
-def retime_song_sections(song_json: str, duration_seconds: Optional[float] = None) -> dict:
-    """Derive section boundaries from a Song's line timing."""
+def retime_song_sections(
+    song_json: str = "",
+    duration_seconds: Optional[float] = None,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+) -> dict:
+    """Derive section boundaries from a Song's line timing.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
         if duration_seconds is not None and duration_seconds <= 0:
             raise _MCPDeterministicInputError("invalid_duration", "duration_seconds must be positive")
-        song, changed = _retime_sections(_song_payload(song_json), duration_seconds)
-        return {"song": song.model_dump(mode="json"), "sectionsChanged": changed}
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
+        retimed, changed = _retime_sections(song, duration_seconds)
+        return {
+            "song": retimed.model_dump(mode="json"),
+            "sectionsChanged": changed,
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "retime_song_sections",
-        {"songBytes": len(song_json.encode()), "durationSeconds": duration_seconds},
+        {"songBytes": len(song_json.encode()), "durationSeconds": duration_seconds, "songId": song_id},
         call,
         lambda result: {"songId": result["song"]["id"], "sectionsChanged": result["sectionsChanged"]},
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
 @mcp.tool()
 def guard_song_timing_collapse(
-    song_json: str, duration_seconds: Optional[float] = None
+    song_json: str = "",
+    duration_seconds: Optional[float] = None,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
 ) -> dict:
-    """Spread repairable collapsed timing runs and report the intervention."""
+    """Spread repairable collapsed timing runs and report the intervention.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
         if duration_seconds is not None and duration_seconds <= 0:
             raise _MCPDeterministicInputError("invalid_duration", "duration_seconds must be positive")
-        song, entry = _guard_collapsed(_song_payload(song_json), duration_seconds)
-        return {"song": song.model_dump(mode="json"), "provenance": entry.model_dump(mode="json")}
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
+        guarded, entry = _guard_collapsed(song, duration_seconds)
+        return {
+            "song": guarded.model_dump(mode="json"),
+            "provenance": entry.model_dump(mode="json"),
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "guard_song_timing_collapse",
-        {"songBytes": len(song_json.encode()), "durationSeconds": duration_seconds},
+        {"songBytes": len(song_json.encode()), "durationSeconds": duration_seconds, "songId": song_id},
         call,
         lambda result: {
             "songId": result["song"]["id"],
             "confidence": result["provenance"]["confidence"],
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
 @mcp.tool()
 def score_song_confidence(
-    song_json: str,
+    song_json: str = "",
     candidates_json: str = "[]",
     mir_json: Optional[str] = None,
     review_threshold: float = 0.6,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
 ) -> dict:
-    """Score every placement and build an explicit low-confidence review queue."""
+    """Score every placement and build an explicit low-confidence review queue.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
         if not 0 <= review_threshold <= 1:
             raise _MCPDeterministicInputError(
                 "invalid_threshold", "review_threshold must be in [0, 1]"
             )
-        song, scores = _score_song_confidence(
-            _song_payload(song_json), _candidate_list_payload(candidates_json), _mir_payload(mir_json)
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
+        scored, scores = _score_song_confidence(
+            song, _candidate_list_payload(candidates_json), _mir_payload(mir_json)
         )
         return {
-            "song": song.model_dump(mode="json"),
+            "song": scored.model_dump(mode="json"),
             "scores": [dataclasses.asdict(score) for score in scores],
             "reviewQueue": _build_review_queue(scores, threshold=review_threshold),
+            "songSource": song_source,
+            "songVersion": loaded_version,
         }
 
     return _deterministic_mcp_response(
         "score_song_confidence",
-        {"songBytes": len(song_json.encode()), "candidatesBytes": len(candidates_json.encode())},
+        {
+            "songBytes": len(song_json.encode()),
+            "candidatesBytes": len(candidates_json.encode()),
+            "songId": song_id,
+        },
         call,
         lambda result: {
             "placements": len(result["scores"]), "reviewItems": len(result["reviewQueue"])
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
 @mcp.tool()
 def evaluate_song_quality(
-    song_json: str,
+    song_json: str = "",
     candidates_json: str = "[]",
     mir_json: Optional[str] = None,
     can_search: bool = True,
@@ -1096,16 +1238,25 @@ def evaluate_song_quality(
     retries_spent: int = 0,
     searches_spent: int = 0,
     sources_expected: bool = True,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
 ) -> dict:
-    """Grade, attribute faults, and decide escalation in the canonical order."""
+    """Grade, attribute faults, and decide escalation in the canonical order.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
         if retries_spent < 0 or searches_spent < 0:
             raise _MCPDeterministicInputError(
                 "invalid_budget", "spent retry and search counts must be non-negative"
             )
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
         decision = _evaluate_quality(
-            _song_payload(song_json),
+            song,
             _mir_payload(mir_json),
             _candidate_list_payload(candidates_json),
             can_search=can_search,
@@ -1114,11 +1265,20 @@ def evaluate_song_quality(
             searches_spent=searches_spent,
             sources_expected=sources_expected,
         )
-        return {"quality": decision.to_dict()}
+        return {
+            "quality": decision.to_dict(),
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "evaluate_song_quality",
-        {"songBytes": len(song_json.encode()), "retriesSpent": retries_spent, "searchesSpent": searches_spent},
+        {
+            "songBytes": len(song_json.encode()),
+            "retriesSpent": retries_spent,
+            "searchesSpent": searches_spent,
+            "songId": song_id,
+        },
         call,
         lambda result: {
             "verdict": result["quality"]["grade"]["verdict"],
@@ -1126,30 +1286,49 @@ def evaluate_song_quality(
             "retry": result["quality"]["escalation"]["retry"],
             "search": result["quality"]["escalation"]["search"],
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
 @mcp.tool()
-def validate_song_theory(song_json: str, key_name: Optional[str] = None) -> dict:
-    """Check whether stored chords are explainable in an explicit or stored key."""
+def validate_song_theory(
+    song_json: str = "",
+    key_name: Optional[str] = None,
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+) -> dict:
+    """Check whether stored chords are explainable in an explicit or stored key.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
-        song = _song_payload(song_json)
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
         chords = [
             (line.lineIndex, placement.charIndex, placement.chord)
             for line in song.lines
             for placement in line.chordPlacements
         ]
         report = _theory_validity(chords, key_name or song.metadata.key)
-        return {"theory": report.to_dict()}
+        return {
+            "theory": report.to_dict(),
+            "songSource": song_source,
+            "songVersion": loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "validate_song_theory",
-        {"songBytes": len(song_json.encode()), "keyOverride": key_name},
+        {"songBytes": len(song_json.encode()), "keyOverride": key_name, "songId": song_id},
         call,
         lambda result: {
             "share": result["theory"]["share"], "total": result["theory"]["total"]
         },
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
@@ -1202,26 +1381,42 @@ def calculate_recording_offset(
 
 
 @mcp.tool()
-def apply_deterministic_song_patch(song_json: str, patch_json: str) -> dict:
-    """Validate and apply the closed, at-most-20-operation Song patch protocol."""
+def apply_deterministic_song_patch(
+    song_json: str = "",
+    patch_json: str = "",
+    song_id: Optional[str] = None,
+    song_version: Optional[str] = None,
+) -> dict:
+    """Validate and apply the closed, at-most-20-operation Song patch protocol.
+
+    Provide exactly one of song_json or song_id (optionally with
+    song_version); loading by song_id reads the song store.
+    """
 
     def call() -> dict:
+        song, loaded_version, song_source = _resolve_song_input(
+            song_json or None, song_id, song_version
+        )
         document = _json_payload(patch_json, label="patch_json", expected=dict)
         try:
             ops = _parse_ops_response(document)
-            song, applied = _apply_patch(_song_payload(song_json), ops)
+            patched, applied = _apply_patch(song, ops)
         except ValueError as error:
             raise _MCPDeterministicInputError("invalid_patch", str(error)) from error
         return {
-            "song": song.model_dump(mode="json"),
+            "song": patched.model_dump(mode="json"),
             "applied": [dataclasses.asdict(item) for item in applied],
+            "songSource": song_source,
+            "songVersion": loaded_version,
         }
 
     return _deterministic_mcp_response(
         "apply_deterministic_song_patch",
-        {"songBytes": len(song_json.encode()), "patchBytes": len(patch_json.encode())},
+        {"songBytes": len(song_json.encode()), "patchBytes": len(patch_json.encode()), "songId": song_id},
         call,
         lambda result: {"songId": result["song"]["id"], "operations": len(result["applied"])},
+        network_access="store_backend" if song_id is not None else "none",
+        persistence="song_store_read" if song_id is not None else "none",
     )
 
 
@@ -1238,8 +1433,17 @@ def build_song_evidence_manifest(
     lrc_status: str = "pending",
     lrc_lines_matched: int = 0,
     lrc_lines_total: int = 0,
+    prior_song_id: Optional[str] = None,
+    prior_song_version: Optional[str] = None,
 ) -> dict:
-    """Build the canonical evidence-state manifest without fetching or storing."""
+    """Build the canonical evidence-state manifest without fetching or storing.
+
+    The prior song is optional: omit prior_song_json and prior_song_id
+    entirely for no prior song, or provide exactly one of them (optionally
+    with prior_song_version) to reference one. Loading by prior_song_id reads
+    the song store; otherwise no network, cache, model, or persistence
+    access occurs.
+    """
 
     def call() -> dict:
         if lrc_status not in {"pending", "hit", "miss", "disabled", "unavailable"}:
@@ -1251,11 +1455,10 @@ def build_song_evidence_manifest(
         if guidance is not None:
             _bounded_payload(guidance, label="guidance")
         candidates = _candidate_list_payload(candidates_json)
-        prior = (
-            _song_payload(prior_song_json, label="prior_song_json").model_dump(mode="json")
-            if prior_song_json is not None
-            else None
+        prior_song, prior_loaded_version, prior_source = _resolve_optional_song_input(
+            prior_song_json, prior_song_id, prior_song_version, label="prior_song"
         )
+        prior = prior_song.model_dump(mode="json") if prior_song is not None else None
         manifest = _build_evidence_manifest(
             mir=_mir_payload(mir_json),
             candidates=candidates,
@@ -1266,17 +1469,27 @@ def build_song_evidence_manifest(
             recording_variant=recording_variant,
             lrc=_lrc_block(lrc_status, lrc_lines_matched, lrc_lines_total),
         )
-        return {"manifest": manifest}
+        return {
+            "manifest": manifest,
+            "priorSongSource": prior_source,
+            "priorSongVersion": prior_loaded_version,
+        }
 
     return _deterministic_mcp_response(
         "build_song_evidence_manifest",
-        {"candidatesBytes": len(candidates_json.encode()), "mirPresent": mir_json is not None},
+        {
+            "candidatesBytes": len(candidates_json.encode()),
+            "mirPresent": mir_json is not None,
+            "priorSongId": prior_song_id,
+        },
         call,
         lambda result: {
             "mirStatus": result["manifest"].get("mir", {}).get("status"),
             "sourceCount": result["manifest"].get("sources", {}).get("count", 0),
             "lrcStatus": result["manifest"].get("lrcAlign", {}).get("status"),
         },
+        network_access="store_backend" if prior_song_id is not None else "none",
+        persistence="song_store_read" if prior_song_id is not None else "none",
     )
 
 
@@ -1382,19 +1595,34 @@ def _alignment_status(result) -> tuple[str, str | None]:
     return "completed", None
 
 
-def _resolve_alignment_song(
-    song_json: str | None, song_id: str | None, song_version: str | None
+def _resolve_song_input(
+    song_json: str | None,
+    song_id: str | None,
+    song_version: str | None,
+    *,
+    label: str = "song",
 ) -> tuple[Song, str | None, str]:
+    """Resolve one Song from caller-supplied JSON or a stored song_id/version.
+
+    Same opaque-reference-or-inline-payload duality as `_resolved_audio_input`:
+    exactly one of `<label>_json` or `<label>_id` must be given, `<label>_version`
+    is only meaningful alongside `<label>_id`, and a missing/unreadable stored
+    song surfaces as a structured `song_not_found` error rather than a raw
+    StoreError. Returns (song, loaded_version, "caller" | "store").
+    """
+    json_field = f"{label}_json"
+    id_field = f"{label}_id"
+    version_field = f"{label}_version"
     if (song_json is None) == (song_id is None):
         raise _MCPDeterministicInputError(
-            "invalid_song_source", "provide exactly one of song_json or song_id"
+            "invalid_song_source", f"provide exactly one of {json_field} or {id_field}"
         )
     if song_json is not None:
         if song_version is not None:
             raise _MCPDeterministicInputError(
-                "unexpected_song_version", "song_version requires song_id"
+                "unexpected_song_version", f"{version_field} requires {id_field}"
             )
-        song = _song_payload(song_json)
+        song = _song_payload(song_json, label=json_field)
         return song, None, "caller"
     try:
         song = get_store().get(song_id, song_version)
@@ -1402,6 +1630,29 @@ def _resolve_alignment_song(
         raise _MCPDeterministicInputError("song_not_found", str(error)) from error
     loaded_version = song_version or get_store().current_version(song.id)
     return song, loaded_version, "store"
+
+
+def _resolve_optional_song_input(
+    song_json: str | None,
+    song_id: str | None,
+    song_version: str | None,
+    *,
+    label: str = "song",
+) -> tuple[Song | None, str | None, str | None]:
+    """As `_resolve_song_input`, but the whole slot may be omitted entirely."""
+    if song_json is None and song_id is None:
+        if song_version is not None:
+            raise _MCPDeterministicInputError(
+                "unexpected_song_version", f"{label}_version requires {label}_id"
+            )
+        return None, None, None
+    return _resolve_song_input(song_json, song_id, song_version, label=label)
+
+
+def _resolve_alignment_song(
+    song_json: str | None, song_id: str | None, song_version: str | None
+) -> tuple[Song, str | None, str]:
+    return _resolve_song_input(song_json, song_id, song_version)
 
 
 def _resolve_alignment_mir(

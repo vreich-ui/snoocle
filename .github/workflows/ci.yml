@@ -18,7 +18,7 @@ jobs:
       # test_mcp_tools_over_stdio spawns the server as a subprocess and fails to
       # decode its first stdout frame outside a real terminal. Deselected so a
       # known-environmental failure cannot mask a real one; fix it and drop this.
-      - run: pytest -q --deselect tests/test_mcp_server.py::test_mcp_tools_over_stdio
+      - run: python -m pytest -q --deselect tests/test_mcp_server.py::test_mcp_tools_over_stdio
 
   studio:
     runs-on: ubuntu-latest

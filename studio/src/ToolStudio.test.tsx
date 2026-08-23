@@ -7,6 +7,7 @@ import type { ToolStudioClient } from "./mcp";
 import { contract, tool } from "./test-fixtures";
 import { ToolStudio } from "./ToolStudio";
 import type { StudioTool } from "./tooling";
+import { EMPTY_WORKBENCH, type Workbench } from "./workbench";
 
 function tools(): StudioTool[] {
   return [
@@ -19,6 +20,25 @@ function tools(): StudioTool[] {
       title: "Read Server Path",
       contract: contract({ title: "Read Server Path", category: "audio", browserSafety: "server_filesystem_restricted" }),
       inputSchema: { type: "object", properties: { audio_path: { type: "string" } }, required: ["audio_path"] },
+    }),
+  ];
+}
+
+/** A tool shaped like PR #80's deterministic tools: song_id + song_version, plus a plain field. */
+function benchTools(): StudioTool[] {
+  return [
+    tool("process_song_deterministically", {
+      title: "Process Song",
+      contract: contract({ title: "Process Song", category: "pipeline", browserSafety: "safe" }),
+      inputSchema: {
+        type: "object",
+        properties: {
+          song_id: { type: "string" },
+          song_version: { type: "string" },
+          message: { type: "string" },
+        },
+        required: ["song_id"],
+      },
     }),
   ];
 }
@@ -40,7 +60,7 @@ describe("ToolStudio", () => {
 
   it("renders every dynamically discovered tool and searches/filters the catalog", async () => {
     const client = mockClient();
-    render(<ToolStudio token="tab-token" clientFactory={() => client} />);
+    render(<ToolStudio token="tab-token" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     expect(await screen.findByText(/Connected · 3 tools · 2 browser-runnable/)).toBeVisible();
     expect(screen.getByRole("button", { name: /dynamic_echo/ })).toBeVisible();
     expect(screen.getByRole("button", { name: /save_dynamic/ })).toBeVisible();
@@ -57,7 +77,7 @@ describe("ToolStudio", () => {
 
   it("uses the discovered input schema and renders telemetry plus structured/raw results", async () => {
     const client = mockClient();
-    render(<ToolStudio token="tab-token" clientFactory={() => client} />);
+    render(<ToolStudio token="tab-token" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     await screen.findByText(/Connected · 3 tools/);
     await userEvent.type(screen.getByLabelText(/Message/), "hello");
     await userEvent.click(screen.getByRole("button", { name: "Invoke tool" }));
@@ -77,7 +97,7 @@ describe("ToolStudio", () => {
 
   it("requires confirmation and blocks server-filesystem tools", async () => {
     const client = mockClient();
-    render(<ToolStudio token="tab-token" clientFactory={() => client} />);
+    render(<ToolStudio token="tab-token" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     await screen.findByText(/Connected · 3 tools/);
     await userEvent.click(screen.getByRole("button", { name: /save_dynamic/ }));
     const confirmedInvoke = screen.getByRole("button", { name: "Confirm and invoke" });
@@ -97,7 +117,7 @@ describe("ToolStudio", () => {
       signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
     }));
     const client = mockClient(callTool);
-    render(<ToolStudio token="tab-token" clientFactory={() => client} />);
+    render(<ToolStudio token="tab-token" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     await screen.findByText(/Connected · 3 tools/);
     await userEvent.type(screen.getByLabelText(/Message/), "wait");
     await userEvent.click(screen.getByRole("button", { name: "Invoke tool" }));
@@ -110,7 +130,7 @@ describe("ToolStudio", () => {
     const client = mockClient(vi.fn().mockRejectedValueOnce(new Error("MCP connection lost")).mockResolvedValueOnce({
       content: [{ type: "text", text: "ok" }], structuredContent: { ok: true },
     } satisfies CallToolResult));
-    render(<ToolStudio token="tab-token" clientFactory={() => client} />);
+    render(<ToolStudio token="tab-token" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     await screen.findByText(/Connected · 3 tools/);
     await userEvent.type(screen.getByLabelText(/Message/), "restore me");
     await userEvent.click(screen.getByRole("button", { name: "Invoke tool" }));
@@ -121,7 +141,7 @@ describe("ToolStudio", () => {
 
   it("never connects with an empty token and shows the unauthenticated panel", async () => {
     const client = mockClient();
-    render(<ToolStudio token="" clientFactory={() => client} />);
+    render(<ToolStudio token="" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     expect(await screen.findByText("Enter a bearer token to connect.")).toBeVisible();
     expect(screen.getByText(/Paste the server's SNOOCLE_API_TOKEN/)).toBeVisible();
     expect(screen.getByText("No token")).toBeVisible();
@@ -133,10 +153,51 @@ describe("ToolStudio", () => {
     client.connectAndDiscover = vi.fn().mockRejectedValue(
       new Error('Streamable HTTP error: Error POSTing to endpoint: {"error":"invalid_token","error_description":"authorization required; see the WWW-Authenticate header"}'),
     );
-    render(<ToolStudio token="bad-token" clientFactory={() => client} />);
+    render(<ToolStudio token="bad-token" bench={EMPTY_WORKBENCH} onBenchChange={vi.fn()} clientFactory={() => client} />);
     expect(await screen.findByText("The bearer token was rejected.")).toBeVisible();
     expect(screen.getByRole("button", { name: "Retry connection" })).toBeVisible();
     expect(screen.queryByText(/Streamable HTTP error/)).not.toBeInTheDocument();
+  });
+
+  it("seeds a form from the workbench and shows the From workbench line", async () => {
+    const client = mockClient();
+    client.connectAndDiscover = vi.fn().mockResolvedValue(benchTools());
+    const bench: Workbench = { song: { id: "artist--song", title: "Song", artist: "Artist", version: "v2" } };
+    render(<ToolStudio token="tab-token" bench={bench} onBenchChange={vi.fn()} clientFactory={() => client} />);
+
+    await screen.findByText(/Connected · 1 tools/);
+    expect(screen.getByText("From workbench: song_id, song_version")).toBeVisible();
+    expect(screen.getByLabelText(/Song Id/i)).toHaveValue("artist--song");
+    expect(screen.getByLabelText(/Song Version/i)).toHaveValue("v2");
+    // Seeded fields stay fully editable, never disabled.
+    expect(screen.getByLabelText(/Song Id/i)).toBeEnabled();
+  });
+
+  it("keeps a restored history value winning over a seeded workbench value for the same key", async () => {
+    const callTool = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "ok" }],
+      structuredContent: { ok: true },
+    } satisfies CallToolResult);
+    const client = mockClient(callTool);
+    client.connectAndDiscover = vi.fn().mockResolvedValue(benchTools());
+    const bench: Workbench = { song: { id: "bench-seed-song", title: "Song", artist: "Artist" } };
+    render(<ToolStudio token="tab-token" bench={bench} onBenchChange={vi.fn()} clientFactory={() => client} />);
+    await screen.findByText(/Connected · 1 tools/);
+
+    const songIdField = screen.getByLabelText(/Song Id/i);
+    expect(songIdField).toHaveValue("bench-seed-song");
+    await userEvent.clear(songIdField);
+    await userEvent.type(songIdField, "explicit-song");
+    await userEvent.click(screen.getByRole("button", { name: "Invoke tool" }));
+    await waitFor(() => expect(callTool).toHaveBeenCalledTimes(1));
+
+    // Reselecting the same tool (by its catalog title) clears any restored args and re-seeds from the workbench.
+    await userEvent.click(screen.getByRole("button", { name: /Process Song/ }));
+    expect(await screen.findByLabelText(/Song Id/i)).toHaveValue("bench-seed-song");
+
+    // Restoring the history entry must win over the workbench seed for song_id.
+    await userEvent.click(screen.getByRole("button", { name: /process_song_deterministically.*success/ }));
+    expect(await screen.findByLabelText(/Song Id/i)).toHaveValue("explicit-song");
   });
 });
 

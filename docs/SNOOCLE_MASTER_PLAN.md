@@ -2,6 +2,12 @@
 
 **Version:** 1.2 · 2026-07-27 · author: Claude (planning session with Wolf)
 **v1.1:** added Phase H — singing input + sing/play-along analysis on iOS (voice pitch vs harmony, guitar chord verification, scoring, ambient sync); new building blocks; §12 updated.
+> **Status note (2026-08-22).** This document has not been revised since
+> 2026-07-27 and its §1 "current state" is stale: it predates the Mac worker
+> (30 July), the deterministic-first pipeline (2–3 August) and Snoocle Studio
+> (3 August). The Phase A–H task lists remain valid intent. Studio has its own
+> plan of record at [plans/studio.md](plans/studio.md), which amends D4 and §0.7.
+
 **v1.2:** added §3.5 binding design system & UX spec (+ task C0 admin restyle); added §13 Cowork execution guide — a recommended model tier for every task and mixed server+iOS session batches.
 **Repos:** server = `github.com/vreich-ui/snoocle` · iOS = local Xcode project `Snoocle`
 **Deployed:** Cloud Run `snoocle-99287560712.europe-west1.run.app` (FastAPI + embedded MCP at `/mcp`, Firestore store)
@@ -19,7 +25,7 @@ This plan is written to be executed **task by task by a less capable model**. Ev
 4. **Every new module gets tests** in the same style as the existing `tests/` directory. A task is not done until its acceptance criteria pass.
 5. **All new Song-schema fields are optional.** Old stored songs must keep loading. Never write a migration that rewrites Firestore documents in bulk.
 6. **Chord rule is sacred:** every stored chord is sounding harmony (never a shape/tab/capo'd name). Capo/tuning/transpose are display-only. This is already enforced in `snoocle_server/chords.py` + `schema/song.py` — do not weaken it.
-7. **No build step for the web UI.** Vanilla JS, vendored libraries under `snoocle_server/ui/vendor/` (committed to the repo). No npm, no bundler, no CDN at runtime.
+7. **No build step for the web UI.** Vanilla JS, vendored libraries under `snoocle_server/ui/vendor/` (committed to the repo). No npm, no bundler, no CDN at runtime. (Amended 2026-08-22: this governs `/ui/` and `/ui/play/`. The operator console at `/studio/` compiles — see [plans/studio.md](plans/studio.md).)
 8. **Heavy/optional Python deps** (alignment, stems) go in optional extras in `pyproject.toml` and the code must degrade gracefully (clear "engine unavailable" status, never a crash) when they're absent — same pattern the MIR fallbacks already use.
 9. **Personal-use project.** Scrapers/downloaders (YouTube, Ultimate Guitar, lyrics) are acceptable; still keep each behind its own module boundary so any source can be disabled with one config flag.
 10. When a task says "record in provenance", append a `ProvenanceEntry` — never mutate or delete existing entries.
@@ -51,7 +57,7 @@ This plan is written to be executed **task by task by a less capable model**. Ev
 | D1 | **Agent-centric syncing.** No tap-to-sync UI. Timing corrections come from deterministic engines + the reconciliation agent; the human corrects by *editing data or telling the agent*, not by performing timing rituals. A single per-song "nudge offset" slider is the only manual timing control. |
 | D2 | **Schema v2 = v1 + optional fields only** (§4). `SCHEMA_VERSION` becomes 2; v1 docs remain valid. |
 | D3 | **Timing is layered, deterministic-first:** LRCLIB synced lyrics → forced alignment (vocals) → MIR beat/chord inference → agent judgment. Each layer records per-line/per-chord confidence + provenance. LLM never invents timestamps that a deterministic layer already supplies. |
-| D4 | **Web UI stays no-build vanilla JS**; the play-along player is a new page sharing `app.js` helpers; small MIT libs are vendored (chords-db JSON, chord-diagram renderer). |
+| D4 | **Web UI stays no-build vanilla JS**; the play-along player is a new page sharing `app.js` helpers; small MIT libs are vendored (chords-db JSON, chord-diagram renderer). **Amended 2026-08-22 ([plans/studio.md](plans/studio.md) §7):** narrowed to `/ui/` and `/ui/play/`. The operator console at `/studio/` is a compiled Vite app, because it drives `/mcp` with the official MCP SDK and generates its forms from live tool schemas. |
 | D5 | **Learning lives in CMS Agent for v1** via the existing `agent` provider. `// MARKER(agentic-home):` comments at every integration point so v2 can move to a dedicated "personal projects" agent workspace by changing config only. LibreChat talks to Snoocle through CMS Agent, which registers Snoocle's `/mcp` as a project. No embedded chat in Snoocle. |
 | D6 | **Word-level lyric timing lives outside the Song** as a per-song artifact (`alignments/{songId}`), fetched on demand (karaoke mode). The Song schema stays lean: line times + chord times + optional beat refs. |
 | D7 | **Stems are cached artifacts**, not schema. Demucs output stored under the song, served by streaming endpoints. |

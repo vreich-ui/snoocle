@@ -94,12 +94,14 @@ export interface SongAudio {
 export interface ChordPlacement {
   charIndex: number;
   chord: string;
+  timeSeconds?: number | null;
 }
 
 export interface SongLine {
   lineIndex: number;
   lyrics: string;
   chordPlacements: ChordPlacement[];
+  timeSeconds?: number | null;
 }
 
 export interface SongSection {

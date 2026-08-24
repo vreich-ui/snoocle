@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StudioApp } from "./App";
-import { routeFromPath, runDetailPath, sectionPlan, songDetailPath } from "./navigation";
+import { routeFromPath, runDetailPath, sectionPlan, songDetailPath, songStudioPath } from "./navigation";
 
 function jsonResponse(status: number, body: unknown) {
   return {
@@ -26,7 +26,7 @@ describe("StudioApp", () => {
 
   it("provides every Studio section", () => {
     render(<StudioApp />);
-    for (const label of ["Repair", "Build", "Automatic Pipeline", "Tool Studio", "Library", "Runs", "Evaluation", "Configuration"]) {
+    for (const label of ["Song Studio", "Repair", "Build", "Automatic Pipeline", "Tool Studio", "Library", "Runs", "Evaluation", "Configuration"]) {
       expect(screen.getByRole("button", { name: label })).toBeVisible();
     }
   });
@@ -48,15 +48,19 @@ describe("StudioApp", () => {
     expect(window.localStorage.getItem("snoocle.studio.bearer-token")).toBeNull();
   });
 
-  it("lands an unknown path and a bare /studio/ on Tool Studio", async () => {
+  it("lands an unknown path and a bare /studio/ on Song Studio", async () => {
+    // The lazy Song Studio chunk may be cold on its first import in this test
+    // file, which under a loaded full-suite run can outrun the default
+    // findByRole timeout — hence the generous timeout rather than an
+    // arbitrary retry.
     window.history.replaceState({}, "", "/studio/nope");
     render(<StudioApp />);
-    expect(await screen.findByRole("heading", { name: "Tool Studio" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Song Studio" }, { timeout: 5000 })).toBeVisible();
     cleanup();
 
     window.history.replaceState({}, "", "/studio/");
     render(<StudioApp />);
-    expect(await screen.findByRole("heading", { name: "Tool Studio" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Song Studio" }, { timeout: 5000 })).toBeVisible();
   });
 
   it("shows the Not built yet pill, its plan sentence and a link to /ui/ for a placeholder section", () => {
@@ -68,18 +72,19 @@ describe("StudioApp", () => {
     expect(link).toHaveAttribute("href", "/ui/");
   });
 
-  it("parses both detail routes, round-trips an id with a slash and spaces, and falls back to Tool Studio", () => {
+  it("parses both detail routes, round-trips an id with a slash and spaces, and falls back to Song Studio", () => {
     expect(routeFromPath("/studio/library/radiohead--karma-police")).toEqual({
       section: "Library",
       detailId: "radiohead--karma-police",
     });
     expect(routeFromPath("/studio/runs/run-123")).toEqual({ section: "Runs", detailId: "run-123" });
-    expect(routeFromPath("/studio/nope")).toEqual({ section: "Tool Studio" });
-    expect(routeFromPath("/studio/")).toEqual({ section: "Tool Studio" });
+    expect(routeFromPath("/studio/nope")).toEqual({ section: "Song Studio" });
+    expect(routeFromPath("/studio/")).toEqual({ section: "Song Studio" });
 
     const trickyId = "weird/id with spaces";
     expect(routeFromPath(songDetailPath(trickyId))).toEqual({ section: "Library", detailId: trickyId });
     expect(routeFromPath(runDetailPath(trickyId))).toEqual({ section: "Runs", detailId: trickyId });
+    expect(routeFromPath(songStudioPath(trickyId))).toEqual({ section: "Song Studio", detailId: trickyId });
   });
 
   it("navigates to Library and renders a song row fetched from the REST API", async () => {

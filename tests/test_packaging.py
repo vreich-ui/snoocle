@@ -2,7 +2,7 @@
 
 This exists because of a defect that all 389 other tests were blind to. The
 Docker image runs the INSTALLED package, not the source tree, so a static file
-that isn't declared as package data simply isn't there in production -- while
+that isn't declared as package data simply isn't there in production — while
 every server-side test, which imports from the source tree, keeps passing.
 
 The original `package-data = ["ui/*"]` did exactly that: `*` does not cross a
@@ -11,7 +11,7 @@ player (`ui/play/`, its icons, and `ui/vendor/`). A Cloud Run deploy would have
 served `/ui/` fine and 404'd `/ui/play/`.
 
 Rather than assert a hardcoded file list (which rots), this walks the real ui/
-tree and checks each file against the declared glob patterns -- so a new asset
+tree and checks each file against the declared glob patterns — so a new asset
 directory added later is covered the day it appears.
 """
 
@@ -112,7 +112,7 @@ def test_built_studio_assets_are_declared_as_package_data():
 # deploy without a single line of our code changing, and the whole test suite
 # stays green on the stale venv that can no longer reproduce it.
 #
-# That is not hypothetical -- it is what happened: `mcp` was declared `>=1.10.0`
+# That is not hypothetical — it is what happened: `mcp` was declared `>=1.10.0`
 # with no ceiling, a rebuild resolved to 2.0.0, and 2.0.0 removed
 # `mcp.server.fastmcp`, which `mcp_server.py` imports at module scope. Every
 # Cloud Run instance exited(1) at import before it could bind $PORT.
@@ -129,7 +129,7 @@ def _dependency_specs() -> dict[str, str]:
 
 
 def test_mcp_is_capped_below_the_release_that_dropped_fastmcp():
-    """A floor alone is not a version constraint -- it is an open invitation."""
+    """A floor alone is not a version constraint — it is an open invitation."""
     spec = _dependency_specs().get("mcp")
     assert spec is not None, "mcp is no longer a declared dependency"
     assert "<" in spec, (

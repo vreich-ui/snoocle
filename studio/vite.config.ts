@@ -14,7 +14,11 @@ export default defineConfig({
   ],
   build: {
     outDir: "../snoocle_server/studio",
-    emptyOutDir: true,
+    // The output directory is tracked (a lone .gitkeep) because api.py mounts
+    // StaticFiles on it at import, and emptying it would delete that marker on
+    // every build. The bundle itself is gitignored, and the Docker builder
+    // stage starts from a clean tree, so nothing stale can ship.
+    emptyOutDir: false,
   },
   test: {
     environment: "jsdom",

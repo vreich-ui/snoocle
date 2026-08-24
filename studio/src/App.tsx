@@ -8,6 +8,7 @@ import { loadWorkbench, saveWorkbench, type Workbench } from "./workbench";
 import "./studio.css";
 
 const ToolStudio = lazy(() => import("./ToolStudio").then((module) => ({ default: module.ToolStudio })));
+const SongStudio = lazy(() => import("./SongStudio").then((module) => ({ default: module.SongStudio })));
 const Library = lazy(() => import("./Library").then((module) => ({ default: module.Library })));
 const SongDetail = lazy(() => import("./SongDetail").then((module) => ({ default: module.SongDetail })));
 const Runs = lazy(() => import("./Runs").then((module) => ({ default: module.Runs })));
@@ -80,7 +81,11 @@ export function StudioApp() {
         ))}
       </nav>
       <ErrorBoundary resetKey={`${section}:${detailId ?? ""}`}>
-      {section === "Tool Studio" ? (
+      {section === "Song Studio" ? (
+        <Suspense fallback={<section className="workspace" role="status">Loading Song Studio…</section>}>
+          <SongStudio songId={detailId} token={token} bench={bench} onBenchChange={onBenchChange} onNavigate={navigate} />
+        </Suspense>
+      ) : section === "Tool Studio" ? (
         <div className="tool-studio-page">
           <div className="workspace audio-workspace-shell">
             <AudioWorkspace

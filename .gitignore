@@ -1,5 +1,11 @@
 .venv/
 studio/node_modules/
+# The compiled Studio bundle is a build artifact, not source: CI and the Docker
+# image both build it from studio/. Committing it meant every UI change needed a
+# local build before CI could pass. The directory itself stays tracked (.gitkeep)
+# because api.py mounts StaticFiles on it at import.
+snoocle_server/studio/*
+!snoocle_server/studio/.gitkeep
 __pycache__/
 *.pyc
 *.egg-info/

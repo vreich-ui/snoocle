@@ -1,4 +1,5 @@
 export const studioSections = [
+  "Song Studio",
   "Repair",
   "Build",
   "Automatic Pipeline",
@@ -11,8 +12,8 @@ export const studioSections = [
 
 export type StudioSection = (typeof studioSections)[number];
 
-/** A bare /studio/ or an unknown path lands on the one section that is actually built. */
-export const defaultSection: StudioSection = "Tool Studio";
+/** A bare /studio/ or an unknown path lands on the section built for working on a song. */
+export const defaultSection: StudioSection = "Song Studio";
 
 export function sectionPath(section: StudioSection): string {
   return `/studio/${section.toLowerCase().replaceAll(" ", "-")}`;
@@ -25,6 +26,7 @@ export interface StudioRoute {
 
 const LIBRARY_DETAIL_PREFIX = "/studio/library/";
 const RUNS_DETAIL_PREFIX = "/studio/runs/";
+const SONG_STUDIO_DETAIL_PREFIX = "/studio/song-studio/";
 
 /** A detail path (song or run) is not itself a section path, so it is matched separately, after the exact section match fails. */
 export function routeFromPath(pathname: string): StudioRoute {
@@ -35,6 +37,9 @@ export function routeFromPath(pathname: string): StudioRoute {
   }
   if (pathname.startsWith(RUNS_DETAIL_PREFIX) && pathname.length > RUNS_DETAIL_PREFIX.length) {
     return { section: "Runs", detailId: decodeURIComponent(pathname.slice(RUNS_DETAIL_PREFIX.length)) };
+  }
+  if (pathname.startsWith(SONG_STUDIO_DETAIL_PREFIX) && pathname.length > SONG_STUDIO_DETAIL_PREFIX.length) {
+    return { section: "Song Studio", detailId: decodeURIComponent(pathname.slice(SONG_STUDIO_DETAIL_PREFIX.length)) };
   }
   return { section: defaultSection };
 }
@@ -51,13 +56,18 @@ export function runDetailPath(runId: string): string {
   return `/studio/runs/${encodeURIComponent(runId)}`;
 }
 
-export const implementedSections = ["Tool Studio", "Library", "Runs"] as const satisfies readonly StudioSection[];
+export function songStudioPath(songId: string): string {
+  return `/studio/song-studio/${encodeURIComponent(songId)}`;
+}
+
+export const implementedSections = ["Song Studio", "Tool Studio", "Library", "Runs"] as const satisfies readonly StudioSection[];
 
 export function isImplemented(section: StudioSection): boolean {
   return (implementedSections as readonly StudioSection[]).includes(section);
 }
 
 export const sectionPlan: Record<StudioSection, string> = {
+  "Song Studio": "Work on one song at a time: run pipeline steps, review each result, save the ones you keep.",
   Repair: "Low-confidence review queue, confidence heat, identity repair and the chord-over-lyric editor.",
   Build: "Stepwise manual build — candidates, MIR, baseline, alignment, save — plus pasted-sheet import.",
   "Automatic Pipeline": "One-shot analyze runs plus the batch job queue with retry and cancel.",

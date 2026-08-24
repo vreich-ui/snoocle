@@ -433,3 +433,57 @@ tr.row-button:hover { background: #141f35; }
 @media (max-width: 850px) {
   .library, .song-detail, .runs, .run-detail { max-width: 100%; }
 }
+
+/* --- Song Studio -------------------------------------------------------- */
+
+.song-studio { max-width: 74rem; }
+
+.song-studio-subject {
+  border: 1px solid #28354c;
+  border-radius: .65rem;
+  margin: 1.25rem 0 1.5rem;
+  padding: 1.1rem 1.25rem;
+}
+.song-studio-subject-head { align-items: start; display: flex; gap: 1rem; justify-content: space-between; }
+.song-studio-subject-head code { color: #9fb4d1; font-size: .8rem; }
+.song-studio-subject label { margin: .9rem 0; max-width: 20rem; }
+.song-studio-subject .sheet { margin-top: 1rem; }
+
+.song-studio-body {
+  align-items: start;
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: minmax(18rem, 1fr) minmax(20rem, 1.3fr);
+}
+
+.step-list, .step-log-list {
+  display: grid;
+  gap: .6rem;
+  max-height: 34rem;
+  overflow-y: auto;
+  padding-right: .25rem;
+}
+
+.step-card { gap: .5rem; }
+
+.step-log-entry { margin-top: 0; }
+.step-log-heading { align-items: center; display: flex; flex-wrap: wrap; gap: .6rem; }
+.step-log-heading strong { flex: 1; }
+.step-log-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.candidate-panel {
+  border-top: 1px solid #283751;
+  margin-top: .9rem;
+  padding-top: .9rem;
+}
+.candidate-panel h4 { margin-bottom: .5rem; }
+.candidate-diff { display: grid; gap: .3rem; font-size: .82rem; margin: 0 0 .8rem; padding-left: 1.1rem; }
+
+@media (max-width: 1100px) {
+  .song-studio-body { grid-template-columns: 1fr; }
+  .step-list, .step-log-list { max-height: 26rem; }
+}
+
+@media (max-width: 850px) {
+  .song-studio { max-width: 100%; }
+}

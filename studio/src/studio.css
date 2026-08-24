@@ -42,7 +42,7 @@ h3 { font-size: 1.2rem; margin-bottom: .35rem; }
 
 .muted { color: #9cabc2; }
 
-.token-field, .catalog label, .schema-field {
+.token-field, .catalog label, .schema-field, .workbench-picker label, .workbench-slot label {
   display: grid;
   gap: .4rem;
   font-size: .82rem;
@@ -326,8 +326,19 @@ dd { font-size: .8rem; margin: .2rem 0 0; overflow-wrap: anywhere; }
 .audio-preview span { color: #aab8cc; }
 .audio-actions { display: flex; gap: .65rem; }
 
+.workbench-bar { border: 1px solid #28354c; border-radius: .65rem; margin-bottom: 2rem; padding: 1.1rem; }
+.workbench-bar .eyebrow:first-child { margin-bottom: .8rem; }
+.workbench-slots { display: grid; gap: .75rem; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.workbench-slot { min-width: 0; }
+.workbench-slot .eyebrow { margin-bottom: .3rem; }
+.workbench-slot strong { overflow-wrap: anywhere; }
+.workbench-slot code { color: #aabbd3; font-size: .72rem; overflow-wrap: anywhere; }
+.workbench-picker { border-top: 1px solid #28354c; display: grid; gap: .7rem; margin-top: 1rem; padding-top: 1rem; }
+.workbench-picker .song-list { max-height: 16rem; overflow: auto; }
+
 @media (max-width: 850px) {
   .tool-studio-page { grid-column: auto; }
+  .workbench-slots { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 600px) {

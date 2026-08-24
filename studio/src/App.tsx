@@ -3,6 +3,8 @@ import { getBearerToken, saveBearerToken } from "./api";
 import { AudioWorkspace } from "./AudioWorkspace";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { isImplemented, routeFromPath, sectionPath, sectionPlan, studioSections, type StudioRoute, type StudioSection } from "./navigation";
+import { WorkbenchBar } from "./Workbench";
+import { loadWorkbench, saveWorkbench, type Workbench } from "./workbench";
 import "./studio.css";
 
 const ToolStudio = lazy(() => import("./ToolStudio").then((module) => ({ default: module.ToolStudio })));
@@ -35,10 +37,16 @@ export function StudioApp() {
   const { route, navigate, navigateSection } = useCurrentRoute();
   const { section, detailId } = route;
   const [token, setToken] = useState(getBearerToken);
+  const [bench, setBench] = useState<Workbench>(loadWorkbench);
 
   const onTokenChange = (value: string) => {
     setToken(value);
     saveBearerToken(value);
+  };
+
+  const onBenchChange = (next: Workbench) => {
+    setBench(next);
+    saveWorkbench(next);
   };
 
   return (
@@ -75,16 +83,29 @@ export function StudioApp() {
       {section === "Tool Studio" ? (
         <div className="tool-studio-page">
           <div className="workspace audio-workspace-shell">
-            <AudioWorkspace />
+            <AudioWorkspace
+              onArtifact={(artifact) => onBenchChange({
+                ...bench,
+                audio: { audioRef: artifact.audioRef, filename: artifact.filename, durationSeconds: artifact.durationSeconds },
+              })}
+            />
           </div>
+          <WorkbenchBar bench={bench} token={token} onChange={onBenchChange} />
           <Suspense fallback={<section className="workspace" role="status">Loading Tool Studio…</section>}>
-            <ToolStudio token={token} />
+            <ToolStudio token={token} bench={bench} onBenchChange={onBenchChange} />
           </Suspense>
         </div>
       ) : section === "Library" ? (
         <Suspense fallback={<section className="workspace" role="status">Loading Library…</section>}>
           {detailId
-            ? <SongDetail songId={detailId} token={token} onNavigate={navigate} />
+            ? (
+              <SongDetail
+                songId={detailId}
+                token={token}
+                onNavigate={navigate}
+                onSendToToolStudio={(song) => onBenchChange({ ...bench, song })}
+              />
+            )
             : <Library token={token} onNavigate={navigate} />}
         </Suspense>
       ) : section === "Runs" ? (

@@ -9,16 +9,33 @@ import {
   formatJson,
   invocationView,
   isBrowserRunnable,
+  isRecord,
   type InvocationView,
   type ResultTelemetry,
   type StudioTool,
 } from "./tooling";
+import { seedFromWorkbench, type Workbench } from "./workbench";
 
 type ClientFactory = (token: string) => ToolStudioClient;
 
 interface ToolStudioProps {
   token: string;
+  bench: Workbench;
+  onBenchChange(next: Workbench): void;
   clientFactory?: ClientFactory;
+}
+
+/**
+ * MIR-shaped output is detected from the tool's own contract first — any
+ * outputArtifactKind mentioning "mir" — and only falls back to guessing from
+ * the payload's shape (a chords or beats key) when the contract doesn't say.
+ * This stays intentionally narrow to MIR; other artifact kinds are not worth
+ * generalising to in this pass.
+ */
+function looksLikeMir(tool: StudioTool | undefined, structured: unknown): boolean {
+  const declaresMir = tool?.contract?.outputArtifactKinds.some((kind) => kind.toLowerCase().includes("mir")) ?? false;
+  if (declaresMir) return true;
+  return isRecord(structured) && ("chords" in structured || "beats" in structured);
 }
 
 type ConnectionState = "unauthenticated" | "connecting" | "connected" | "error" | "rejected";
@@ -44,7 +61,7 @@ function isAbort(error: unknown): boolean {
     error instanceof Error && error.name === "AbortError";
 }
 
-export function ToolStudio({ token, clientFactory = createToolStudioClient }: ToolStudioProps) {
+export function ToolStudio({ token, bench, onBenchChange, clientFactory = createToolStudioClient }: ToolStudioProps) {
   const clientRef = useRef<ToolStudioClient | undefined>(undefined);
   const abortRef = useRef<AbortController | undefined>(undefined);
   const [connection, setConnection] = useState<ConnectionState>(() => (token ? "connecting" : "unauthenticated"));
@@ -96,6 +113,13 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
     };
   }, [clientFactory, retry, token]);
 
+  // Switching the workbench selection (a different song, fresh audio, newly
+  // captured MIR) should re-seed the open form, so remount it the same way
+  // selecting a tool or restoring history already does.
+  useEffect(() => {
+    setFormVersion((value) => value + 1);
+  }, [bench]);
+
   const categories = useMemo(
     () => [...new Set(tools.map((tool) => tool.contract?.category).filter((item): item is string => Boolean(item)))].sort(),
     [tools],
@@ -103,6 +127,10 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
   const visibleTools = useMemo(() => filterTools(tools, search, category, safety), [tools, search, category, safety]);
   const selected = tools.find((tool) => tool.name === selectedName);
   const runnableCount = tools.filter(isBrowserRunnable).length;
+  const seed = useMemo(
+    () => (selected ? seedFromWorkbench(selected.inputSchema, bench) : {}),
+    [selected, bench],
+  );
 
   const recordHistory = (
     tool: StudioTool,
@@ -287,10 +315,13 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
               {selected.contract?.modelUse !== "none" && (
                 <p className="warning" role="note">This tool may use a model and incur cost according to server policy.</p>
               )}
+              {Object.keys(seed).length > 0 && (
+                <p className="muted">From workbench: {Object.keys(seed).join(", ")}</p>
+              )}
               <SchemaForm
                 key={`${selected.name}-${formVersion}`}
                 schema={selected.inputSchema as JsonSchema}
-                initialValue={restoredArgs}
+                initialValue={{ ...seed, ...restoredArgs }}
                 busy={busy}
                 blockedReason={blockedReason}
                 requiresConfirmation={selected.contract?.browserSafety === "confirmation_required"}
@@ -308,6 +339,14 @@ export function ToolStudio({ token, clientFactory = createToolStudioClient }: To
                     <div><dt>Cost</dt><dd>{result.telemetry.costUSD === null ? "not reported" : `$${result.telemetry.costUSD.toFixed(6)}`}</dd></div>
                   </dl>
                   {result.telemetry.usage !== null && <details><summary>Usage</summary><pre>{formatJson(result.telemetry.usage)}</pre></details>}
+                  {!result.failed && looksLikeMir(selected, result.structured) && (
+                    <div className="form-actions">
+                      <button
+                        type="button"
+                        onClick={() => onBenchChange({ ...bench, mirJson: JSON.stringify(result.structured) })}
+                      >Use as MIR</button>
+                    </div>
+                  )}
                   <div className="mode-switch" role="group" aria-label="Result view">
                     <button className={resultTab === "structured" ? "selected" : ""} type="button" onClick={() => setResultTab("structured")}>Structured</button>
                     <button className={resultTab === "raw" ? "selected" : ""} type="button" onClick={() => setResultTab("raw")}>Raw MCP result</button>

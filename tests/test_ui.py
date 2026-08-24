@@ -9,6 +9,7 @@ produces schema-valid Song lines.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +19,15 @@ from snoocle_server.config import settings
 from snoocle_server.schema import Song
 
 client = TestClient(app)
+
+# The Studio bundle is built, not committed. These assertions are about the
+# compiled shell, so they only mean anything once it exists; CI builds it
+# before pytest runs.
+STUDIO_INDEX = Path(__file__).resolve().parent.parent / "snoocle_server" / "studio" / "index.html"
+needs_studio_build = pytest.mark.skipif(
+    not STUDIO_INDEX.exists(),
+    reason="Studio bundle not built - run 'cd studio && npm run build'",
+)
 TOKEN = "s3cr3t-personal-token"
 
 
@@ -42,6 +52,7 @@ def test_ui_static_assets_served():
     assert client.get("/ui/style.css").status_code == 200
 
 
+@needs_studio_build
 def test_studio_shell_and_compiled_assets_are_served():
     r = client.get("/studio/")
     assert r.status_code == 200
@@ -51,6 +62,7 @@ def test_studio_shell_and_compiled_assets_are_served():
     assert client.get(asset).status_code == 200
 
 
+@needs_studio_build
 def test_studio_direct_route_refresh_uses_the_spa_shell():
     r = client.get("/studio/runs")
     assert r.status_code == 200
@@ -58,6 +70,7 @@ def test_studio_direct_route_refresh_uses_the_spa_shell():
     assert client.get("/studio/assets/not-a-real-file.js").status_code == 404
 
 
+@needs_studio_build
 def test_studio_shell_is_exempt_but_api_stays_gated(token_enabled):
     assert client.get("/studio/configuration").status_code == 200
     assert client.get("/v1/songs").status_code == 401

@@ -89,8 +89,13 @@ def test_admin_assets_still_covered(rel):
 
 
 def test_built_studio_assets_are_declared_as_package_data():
-    """The installed wheel, not the source checkout, serves /studio/."""
-    assert (STUDIO / "index.html").exists()
+    """The installed wheel, not the source checkout, serves /studio/.
+
+    The bundle is a build artifact and is no longer committed, so this can only
+    be checked once it has been built; CI builds it before pytest runs.
+    """
+    if not (STUDIO / "index.html").exists():
+        pytest.skip("Studio bundle not built - run 'cd studio && npm run build'")
     missing = [
         str(p.relative_to(PKG)).replace("\\", "/")
         for p in sorted(STUDIO.rglob("*"))

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiFetch, getBearerToken } from "./api";
 import { createWaveform, type WaveformController } from "./waveform";
 
-type AudioArtifact = {
+export type AudioArtifact = {
   audioRef: string;
   filename: string;
   contentType: string;
@@ -12,6 +12,10 @@ type AudioArtifact = {
   playbackUrl: string;
 };
 
+interface AudioWorkspaceProps {
+  onArtifact?(artifact: AudioArtifact): void;
+}
+
 async function artifactResponse(response: Response): Promise<AudioArtifact> {
   const body = await response.json();
   if (!response.ok) {
@@ -20,7 +24,7 @@ async function artifactResponse(response: Response): Promise<AudioArtifact> {
   return body.artifact as AudioArtifact;
 }
 
-export function AudioWorkspace() {
+export function AudioWorkspace({ onArtifact }: AudioWorkspaceProps = {}) {
   const [file, setFile] = useState<File | null>(null);
   const [youtube, setYoutube] = useState("");
   const [artifact, setArtifact] = useState<AudioArtifact | null>(null);
@@ -46,6 +50,7 @@ export function AudioWorkspace() {
   const preview = (next: AudioArtifact) => {
     setArtifact(next);
     setMessage("");
+    onArtifact?.(next);
   };
 
   const upload = async () => {

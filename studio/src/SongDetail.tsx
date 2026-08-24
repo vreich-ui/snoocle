@@ -13,11 +13,13 @@ import { runDetailPath, songDetailPath } from "./navigation";
 import { Sheet } from "./Sheet";
 import { formatCost, formatDateTime, orDash, pairOrDash } from "./format";
 import { useApi } from "./useApi";
+import { type WorkbenchSong } from "./workbench";
 
 interface SongDetailProps {
   songId: string;
   token: string;
   onNavigate(path: string): void;
+  onSendToToolStudio?(song: WorkbenchSong): void;
 }
 
 const EXPORT_EXTENSIONS = { chordpro: "cho", txt: "txt", json: "json" } as const;
@@ -62,7 +64,7 @@ async function submitIdentityRename(
   return { ok: true, data: body as IdentityRenameResponse };
 }
 
-export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
+export function SongDetail({ songId, token, onNavigate, onSendToToolStudio }: SongDetailProps) {
   const song = useApi<Song>(`/v1/songs/${encodeURIComponent(songId)}`, token);
   const versions = useApi<VersionsResponse>(`/v1/songs/${encodeURIComponent(songId)}/versions`, token);
   const runs = useApi<SongRunsResponse>(`/v1/songs/${encodeURIComponent(songId)}/runs`, token);
@@ -87,6 +89,10 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
     setTitleInput(song.data.metadata.title);
   }, [song.data, songId]);
 
+  // Distinct from versionA/versionB below: this is the one version (if any)
+  // the user has deliberately pinned to send along to Tool Studio, not one of
+  // the two diff comparators.
+  const [pinnedVersion, setPinnedVersion] = useState("");
   const [versionA, setVersionA] = useState("");
   const [versionB, setVersionB] = useState("");
   const [diffText, setDiffText] = useState("");
@@ -199,6 +205,22 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
       <p className="eyebrow">Song</p>
       <h2 id="song-detail-heading">{data.metadata.title} — {data.metadata.artist}</h2>
       <code>{data.id}</code>
+      {onSendToToolStudio && (
+        <div className="form-actions">
+          <button
+            type="button"
+            onClick={() => {
+              onSendToToolStudio({
+                id: data.id,
+                title: data.metadata.title,
+                artist: data.metadata.artist,
+                version: pinnedVersion || undefined,
+              });
+              onNavigate("/studio/tool-studio");
+            }}
+          >Send to Tool Studio</button>
+        </div>
+      )}
       <dl className="classification-grid song-meta">
         <div><dt>Key</dt><dd>{data.metadata.key ?? "unknown"}</dd></div>
         <div><dt>BPM</dt><dd>{data.metadata.bpm ?? "unknown"}</dd></div>
@@ -257,6 +279,17 @@ export function SongDetail({ songId, token, onNavigate }: SongDetailProps) {
                 </tbody>
               </table>
             </div>
+            {onSendToToolStudio && (
+              <label>
+                <span>Version to send</span>
+                <select value={pinnedVersion} onChange={(event) => setPinnedVersion(event.target.value)}>
+                  <option value="">Latest</option>
+                  {versionList.map((version) => (
+                    <option key={version.version} value={version.version}>{version.version.slice(0, 10)}</option>
+                  ))}
+                </select>
+              </label>
+            )}
             <div className="diff-controls">
               <label>
                 <span>A</span>

@@ -9,7 +9,7 @@ import { argsForStep, extractCandidateSong, SONG_STEPS, summariseSongChange, typ
 import { formatDateTime } from "./format";
 import { formatJson, invocationView, isRecord, type StudioTool } from "./tooling";
 import { useApi } from "./useApi";
-import { type Workbench } from "./workbench";
+import { benchMismatches, type Workbench } from "./workbench";
 
 type ClientFactory = (token: string) => ToolStudioClient;
 
@@ -73,6 +73,24 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
     ? `/v1/songs/${encodeURIComponent(songId)}${pinnedVersion ? `?version=${encodeURIComponent(pinnedVersion)}` : ""}`
     : null;
   const songApi = useApi<Song>(songPath, token);
+
+  // Song Studio's subject is the route, not the workbench: arriving by
+  // bookmark, back button or a Library link changes the song on screen without
+  // touching the workbench. Left alone, the audio slot and the align step
+  // would keep serving the previously selected song. Follow the route.
+  const benchSongId = bench.song?.id;
+  useEffect(() => {
+    if (!songId || benchSongId === songId) return;
+    const loaded = songApi.data;
+    if (!loaded || loaded.id !== songId) return;
+    onBenchChange({
+      ...bench,
+      song: { id: loaded.id, title: loaded.metadata.title, artist: loaded.metadata.artist },
+    });
+    // `bench` and `onBenchChange` are recreated by the parent on every change;
+    // depending on them here would loop. The song id is the real trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [songId, benchSongId, songApi.data]);
 
   const clientRef = useRef<ToolStudioClient | undefined>(undefined);
   const [connection, setConnection] = useState<ConnectionState>(() => (token ? "connecting" : "unauthenticated"));
@@ -175,8 +193,13 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
   const noVersions = versionsApi.state === "error" && versionsApi.error?.status === 404;
   const versionList = noVersions ? [] : versionsApi.data?.versions ?? [];
 
+  // The optimistic lock is only a lock if we actually know the version we are
+  // basing the save on. While /versions is still loading, versionList is empty
+  // and expectedVersion would come out undefined — a save with no lock at all.
+  const versionsKnown = versionsApi.state === "ready" || noVersions;
+
   const saveCandidate = async (entry: StepLogEntry) => {
-    if (!entry.candidate || !songId) return;
+    if (!entry.candidate || !songId || !versionsKnown) return;
     setSavingId(entry.id);
     setSaveErrors((current) => ({ ...current, [entry.id]: "" }));
     const expectedVersion = pinnedVersion || versionList[0]?.version;
@@ -292,6 +315,12 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
 
   const data = songApi.data;
 
+  // A recording acquired for another song silently produces a plausible-looking
+  // but wrong alignment, so the audio-consuming steps are held until it is
+  // resolved rather than merely annotated.
+  const mismatches = benchMismatches(bench);
+  const audioMismatch = Boolean(bench.audio?.songId && bench.audio.songId !== data.id);
+
   return (
     <section className="workspace song-studio" aria-labelledby="song-studio-heading">
       <p className="eyebrow">Song Studio</p>
@@ -325,6 +354,24 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
         <Sheet song={data} />
       </section>
 
+      {mismatches.length > 0 && (
+        <div className="workbench-mismatch" role="alert">
+          <strong>The workbench holds material from a different song.</strong>
+          <ul>{mismatches.map((problem) => <li key={problem}>{problem}</li>)}</ul>
+          <p>Steps that need audio stay disabled until the audio slot matches this song.</p>
+          <div className="form-actions">
+            <button
+              type="button"
+              onClick={() => onBenchChange({
+                ...bench,
+                audio: audioMismatch ? undefined : bench.audio,
+                mir: undefined,
+              })}
+            >Clear the mismatched slots</button>
+          </div>
+        </div>
+      )}
+
       {connection === "rejected" && (
         <div className="connection-error" role="alert">
           <strong>The bearer token was rejected.</strong>
@@ -353,10 +400,16 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
                   <p className="muted">{step.description}</p>
                   <span className="status-pill">{step.produces === "song" ? "Changes the song" : "Report only"}</span>
                   {audioBlocked && <p className="field-help">Needs audio in the workbench.</p>}
+                  {step.needsAudio && bench.audio && (
+                    <p className="field-help">
+                      Uses {bench.audio.videoTitle ?? bench.audio.filename}
+                      {bench.audio.youtubeVideoId ? ` (YouTube ${bench.audio.youtubeVideoId})` : ""}.
+                    </p>
+                  )}
                   <div className="form-actions">
                     <button
                       type="button"
-                      disabled={audioBlocked || Boolean(busyStepId) || connection !== "connected"}
+                      disabled={audioBlocked || audioMismatch || Boolean(busyStepId) || connection !== "connected"}
                       onClick={() => runStep(step)}
                     >{running ? "Running…" : "Run"}</button>
                   </div>
@@ -397,8 +450,12 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
                     </ul>
                     {saveErrors[entry.id] && <p className="error" role="alert">{saveErrors[entry.id]}</p>}
                     <div className="form-actions">
-                      <button type="button" disabled={savingId === entry.id} onClick={() => saveCandidate(entry)}>
-                        {savingId === entry.id ? "Saving…" : "Save as new version"}
+                      <button
+                        type="button"
+                        disabled={savingId === entry.id || !versionsKnown}
+                        onClick={() => saveCandidate(entry)}
+                      >
+                        {savingId === entry.id ? "Saving…" : versionsKnown ? "Save as new version" : "Loading versions…"}
                       </button>
                       <button type="button" disabled={savingId === entry.id} onClick={() => discardCandidate(entry)}>Discard</button>
                     </div>

@@ -10,21 +10,39 @@ export type AudioArtifact = {
   sizeBytes: number;
   expiresAt: string;
   playbackUrl: string;
+  /** Present for acquisitions: what the server actually fetched, as opposed to what was asked for. */
+  youtubeVideoId?: string;
+  videoTitle?: string;
+  fromCache?: boolean;
 };
 
 interface AudioWorkspaceProps {
   onArtifact?(artifact: AudioArtifact): void;
+  onArtifactRemoved?(audioRef: string): void;
 }
 
+/**
+ * The acquire response reports what was fetched as siblings of `artifact`
+ * (`youtubeVideoId`, `videoTitle`, `fromCache`). Dropping them left the UI
+ * with only a filename to go on, so a recording that did not match the song
+ * on screen looked no different from one that did. They are folded onto the
+ * artifact here and travel with it into the workbench.
+ */
 async function artifactResponse(response: Response): Promise<AudioArtifact> {
   const body = await response.json();
   if (!response.ok) {
     throw new Error(body.detail ?? body.reason ?? `Request failed (${response.status})`);
   }
-  return body.artifact as AudioArtifact;
+  const artifact = body.artifact as AudioArtifact;
+  return {
+    ...artifact,
+    youtubeVideoId: typeof body.youtubeVideoId === "string" ? body.youtubeVideoId : undefined,
+    videoTitle: typeof body.videoTitle === "string" ? body.videoTitle : undefined,
+    fromCache: typeof body.fromCache === "boolean" ? body.fromCache : undefined,
+  };
 }
 
-export function AudioWorkspace({ onArtifact }: AudioWorkspaceProps = {}) {
+export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspaceProps = {}) {
   const [file, setFile] = useState<File | null>(null);
   const [youtube, setYoutube] = useState("");
   const [artifact, setArtifact] = useState<AudioArtifact | null>(null);
@@ -94,6 +112,7 @@ export function AudioWorkspace({ onArtifact }: AudioWorkspaceProps = {}) {
       if (!response.ok) throw new Error(`Delete failed (${response.status})`);
       waveform.current?.destroy();
       waveform.current = null;
+      onArtifactRemoved?.(artifact.audioRef);
       setArtifact(null);
       setMessage("Temporary audio deleted.");
     } catch (error) {
@@ -131,9 +150,17 @@ export function AudioWorkspace({ onArtifact }: AudioWorkspaceProps = {}) {
       {message && <p role="status">{message}</p>}
       {artifact && (
         <div className="audio-preview">
-          <div>
-            <strong>{artifact.filename}</strong>
-            <span>{artifact.durationSeconds.toFixed(1)}s · {(artifact.sizeBytes / 1_000_000).toFixed(1)} MB</span>
+          <div className="audio-identity">
+            <strong>{artifact.videoTitle ?? artifact.filename}</strong>
+            {artifact.videoTitle && <span className="muted">{artifact.filename}</span>}
+            <span className="muted">
+              {artifact.durationSeconds.toFixed(1)}s · {(artifact.sizeBytes / 1_000_000).toFixed(1)} MB
+              {artifact.youtubeVideoId ? ` · YouTube ${artifact.youtubeVideoId}` : ""}
+              {artifact.fromCache ? " · from cache" : ""}
+            </span>
+            <p className="field-help">
+              This is the recording the server fetched. Check it is the song you meant before running analysis on it.
+            </p>
           </div>
           <div ref={waveformElement} role="img" aria-label={`Waveform for ${artifact.filename}`} />
           <div className="audio-actions">

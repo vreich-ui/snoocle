@@ -323,6 +323,8 @@ dd { font-size: .8rem; margin: .2rem 0 0; overflow-wrap: anywhere; }
 }
 .audio-preview { background: #0f172a; border: 1px solid #42526d; border-radius: .65rem; display: grid; gap: 1rem; margin-top: 1.25rem; padding: 1rem; }
 .audio-preview > div:first-child { display: flex; gap: .75rem; justify-content: space-between; }
+.audio-preview > .audio-identity { display: grid; gap: .2rem; justify-content: stretch; }
+.audio-identity strong { overflow-wrap: anywhere; }
 .audio-preview span { color: #aab8cc; }
 .audio-actions { display: flex; gap: .65rem; }
 
@@ -333,6 +335,18 @@ dd { font-size: .8rem; margin: .2rem 0 0; overflow-wrap: anywhere; }
 .workbench-slot .eyebrow { margin-bottom: .3rem; }
 .workbench-slot strong { overflow-wrap: anywhere; }
 .workbench-slot code { color: #aabbd3; font-size: .72rem; overflow-wrap: anywhere; }
+.workbench-mismatch {
+  background: #351c25;
+  border-left: 3px solid #c45f70;
+  border-radius: .35rem;
+  color: #ffb8c0;
+  margin-bottom: 1rem;
+  padding: .7rem .85rem;
+}
+.workbench-mismatch ul { margin: .4rem 0 .2rem; padding-left: 1.1rem; }
+.workbench-mismatch li { font-size: .82rem; }
+.workbench-mismatch p { font-size: .82rem; margin: .4rem 0 0; }
+.workbench-slot .muted { font-size: .74rem; overflow-wrap: anywhere; }
 .workbench-picker { border-top: 1px solid #28354c; display: grid; gap: .7rem; margin-top: 1rem; padding-top: 1rem; }
 .workbench-picker .song-list { max-height: 16rem; overflow: auto; }
 

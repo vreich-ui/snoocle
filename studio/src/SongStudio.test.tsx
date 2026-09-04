@@ -285,4 +285,100 @@ describe("SongStudio", () => {
     expect(within(alignCard).getByRole("button", { name: "Run" })).toBeDisabled();
     expect(within(alignCard).getByText("Needs audio in the workbench.")).toBeVisible();
   });
+
+  // Arriving by route (bookmark, back button, a Library link) changes the song
+  // on screen. Leaving the workbench on the previous song is how one song's
+  // audio ends up aligned against another's transcription.
+  it("adopts the routed song into the workbench when they disagree", async () => {
+    setupFetch();
+    const onBenchChange = vi.fn();
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={{ song: { id: "someone-else--other", title: "Other", artist: "Someone Else" } }}
+        onBenchChange={onBenchChange}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient()}
+      />,
+    );
+
+    await waitFor(() => expect(onBenchChange).toHaveBeenCalled());
+    expect(onBenchChange.mock.calls[0][0].song).toEqual({
+      id: "artist--song", title: "Song", artist: "Artist",
+    });
+  });
+
+  it("leaves the workbench alone when it already holds the routed song", async () => {
+    setupFetch();
+    const onBenchChange = vi.fn();
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={{ song: { id: "artist--song", title: "Song", artist: "Artist" } }}
+        onBenchChange={onBenchChange}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient()}
+      />,
+    );
+
+    await screen.findByRole("heading", { name: "Song — Artist" });
+    expect(onBenchChange).not.toHaveBeenCalled();
+  });
+
+  it("refuses to run audio steps against a recording acquired for another song", async () => {
+    setupFetch();
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={{
+          song: { id: "artist--song", title: "Song", artist: "Artist" },
+          audio: {
+            audioRef: "aud_123",
+            filename: "other.webm",
+            songId: "nirvana--smells-like-teen-spirit",
+            videoTitle: "Nirvana - Smells Like Teen Spirit",
+          },
+        }}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient()}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(/acquired for a different song/)).toBeVisible();
+
+    const align = SONG_STEPS.find((step) => step.needsAudio)!;
+    await waitFor(() => expect(within(stepCard(align.label)).getByRole("button")).toBeDisabled());
+  });
+
+  it("names the recording an audio step will use", async () => {
+    setupFetch();
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={{
+          song: { id: "artist--song", title: "Song", artist: "Artist" },
+          audio: {
+            audioRef: "aud_123",
+            filename: "song.webm",
+            songId: "artist--song",
+            videoTitle: "Artist - Song",
+            youtubeVideoId: "vid123",
+          },
+        }}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient()}
+      />,
+    );
+
+    const align = SONG_STEPS.find((step) => step.needsAudio)!;
+    const card = await waitFor(() => stepCard(align.label));
+    expect(within(card).getByText("Uses Artist - Song (YouTube vid123).")).toBeVisible();
+  });
 });

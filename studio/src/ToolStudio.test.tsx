@@ -43,6 +43,24 @@ function benchTools(): StudioTool[] {
   ];
 }
 
+/** A tool shaped like acquire_audio: identity strings alongside a recording source that overrides them. */
+function acquireTools(): StudioTool[] {
+  return [
+    tool("acquire_audio", {
+      title: "Acquire Audio",
+      contract: contract({ title: "Acquire Audio", category: "audio", browserSafety: "safe" }),
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          artist: { type: "string" },
+          youtube_url_or_id: { type: "string" },
+        },
+      },
+    }),
+  ];
+}
+
 function mockClient(callTool?: ToolStudioClient["callTool"]): ToolStudioClient {
   return {
     connectAndDiscover: vi.fn().mockResolvedValue(tools()),
@@ -206,5 +224,22 @@ describe("looksUnauthorized", () => {
     expect(looksUnauthorized("Request failed with status code 401")).toBe(true);
     expect(looksUnauthorized('{"error":"invalid_token","error_description":"..."}')).toBe(true);
     expect(looksUnauthorized("MCP connection lost")).toBe(false);
+  });
+
+  // The reported bug: the form said "From workbench: title, artist" for
+  // "Back to Black — Amy Winehouse" while a pasted URL fetched a Nirvana
+  // cover. The URL wins server-side, so the identity was a claim the call
+  // could not keep.
+  it("does not seed title or artist into a tool that acquires a recording", async () => {
+    const client = mockClient();
+    client.connectAndDiscover = vi.fn().mockResolvedValue(acquireTools());
+    const bench: Workbench = { song: { id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse" } };
+    render(<ToolStudio token="tab-token" bench={bench} onBenchChange={vi.fn()} clientFactory={() => client} />);
+
+    expect(await screen.findByLabelText(/Youtube Url Or Id/i)).toHaveValue("");
+    expect(screen.getByLabelText(/^Title/i)).toHaveValue("");
+    expect(screen.getByLabelText(/^Artist/i)).toHaveValue("");
+    expect(screen.queryByText(/From workbench/)).toBeNull();
+    expect(screen.getByText(/A URL, id or reference here decides the/)).toBeVisible();
   });
 });

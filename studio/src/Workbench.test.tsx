@@ -118,4 +118,54 @@ describe("WorkbenchBar", () => {
       song: { ...bench.song, version: "v2sha1234567890" },
     });
   });
+
+  it("warns when the audio slot was acquired for a different song, and clears it on request", async () => {
+    const onChange = vi.fn();
+    const bench: Workbench = {
+      song: { id: "artist--song", title: "Song Title", artist: "The Artist" },
+      audio: {
+        audioRef: "aud_123",
+        filename: "other.webm",
+        songId: "nirvana--smells-like-teen-spirit",
+        videoTitle: "Nirvana - Smells Like Teen Spirit",
+        youtubeVideoId: "RNCH0xA-hNY",
+      },
+    };
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/v1/songs/artist--song/versions") return jsonResponse(404, { detail: "no versions" });
+      throw new Error(`unexpected path ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<WorkbenchBar bench={bench} token="tab-token" onChange={onChange} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(/Nirvana - Smells Like Teen Spirit/)).toBeVisible();
+
+    await user.click(within(alert).getByRole("button", { name: "Clear the mismatched slots" }));
+    expect(onChange.mock.calls[0][0].audio).toBeUndefined();
+    expect(onChange.mock.calls[0][0].song).toEqual(bench.song);
+  });
+
+  it("shows what the audio slot actually is, and stays quiet when it matches", async () => {
+    const bench: Workbench = {
+      song: { id: "artist--song", title: "Song Title", artist: "The Artist" },
+      audio: {
+        audioRef: "aud_123",
+        filename: "song.webm",
+        durationSeconds: 185,
+        songId: "artist--song",
+        videoTitle: "The Artist - Song Title",
+        youtubeVideoId: "vid123",
+      },
+    };
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/v1/songs/artist--song/versions") return jsonResponse(404, { detail: "no versions" });
+      throw new Error(`unexpected path ${path}`);
+    });
+    render(<WorkbenchBar bench={bench} token="tab-token" onChange={vi.fn()} />);
+
+    expect(await screen.findByText("The Artist - Song Title")).toBeVisible();
+    expect(screen.getByText(/YouTube vid123/)).toBeVisible();
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
 });

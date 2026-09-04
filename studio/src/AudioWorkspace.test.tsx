@@ -84,4 +84,46 @@ describe("AudioWorkspace", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Temporary audio deleted.");
     expect(destroy).toHaveBeenCalled();
   });
+
+  // The acquire response reports what was actually fetched as siblings of
+  // `artifact`. Dropping them left a form that claimed one song and a result
+  // that was another, with nothing on screen to tell them apart.
+  it("shows the video the server actually acquired, not just the workbench song", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      artifact: { ...artifact, filename: "Nirvana - Smells Like Teen Spirit [RNCH0xA-hNY].webm" },
+      youtubeVideoId: "RNCH0xA-hNY",
+      videoTitle: "Nirvana - Smells Like Teen Spirit",
+      fromCache: false,
+    }), { status: 201, headers: { "Content-Type": "application/json" } }));
+
+    const onArtifact = vi.fn();
+    const user = userEvent.setup();
+    render(<AudioWorkspace onArtifact={onArtifact} />);
+    await user.type(screen.getByLabelText("YouTube URL or video ID"), "RNCH0xA-hNY");
+    await user.click(screen.getByRole("button", { name: "Acquire and preview" }));
+
+    expect(await screen.findByText("Nirvana - Smells Like Teen Spirit")).toBeVisible();
+    expect(screen.getByText(/YouTube RNCH0xA-hNY/)).toBeVisible();
+    expect(onArtifact).toHaveBeenCalledWith(expect.objectContaining({
+      youtubeVideoId: "RNCH0xA-hNY",
+      videoTitle: "Nirvana - Smells Like Teen Spirit",
+    }));
+  });
+
+  it("tells its parent when the artifact is deleted, so nothing keeps referencing it", async () => {
+    const onArtifactRemoved = vi.fn();
+    const user = userEvent.setup();
+    render(<AudioWorkspace onArtifactRemoved={onArtifactRemoved} />);
+    await user.upload(
+      screen.getByLabelText("Local audio"),
+      new File([new Uint8Array([1, 2, 3])], "tone.wav", { type: "audio/wav" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Upload and preview" }));
+    await waitFor(() => expect(createWaveform).toHaveBeenCalled());
+
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }));
+    await user.click(screen.getByRole("button", { name: "Delete temporary audio" }));
+
+    await waitFor(() => expect(onArtifactRemoved).toHaveBeenCalledWith(artifact.audioRef));
+  });
 });

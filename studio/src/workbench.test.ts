@@ -3,14 +3,18 @@ import {
   benchMismatches,
   derivesIdentityFromRecording,
   EMPTY_WORKBENCH,
+  identityConflict,
+  knownVideoId,
   loadWorkbench,
+  parseVideoId,
   saveWorkbench,
   seedFromWorkbench,
+  splitVideoTitle,
   type Workbench,
 } from "./workbench";
 
 const fullBench: Workbench = {
-  song: { id: "artist--song", title: "Song Title", artist: "The Artist", version: "abc123" },
+  song: { id: "artist--song", title: "Song Title", artist: "The Artist", version: "abc123", youtubeVideoId: "stored99" },
   audio: {
     audioRef: "aud_123",
     filename: "tone.wav",
@@ -83,7 +87,9 @@ describe("seedFromWorkbench", () => {
   // The reported bug: acquire_audio declares title, artist and youtube_url_or_id,
   // and the URL wins server-side. Seeding identity there produced a form that
   // claimed one song while fetching another.
-  it("does not seed title or artist for a tool that takes a recording", () => {
+  // An acquisition tool gets the recording as well as the names, so the two
+  // agree from the start and nothing has to be retyped.
+  it("seeds the recording and the identity together for an acquisition tool", () => {
     const schema = {
       type: "object",
       properties: {
@@ -92,10 +98,33 @@ describe("seedFromWorkbench", () => {
         youtube_url_or_id: { type: "string" },
       },
     };
-    expect(seedFromWorkbench(schema, fullBench)).toEqual({});
+    expect(seedFromWorkbench(schema, fullBench)).toEqual({
+      youtube_url_or_id: "vid123",
+      title: "Song Title",
+      artist: "The Artist",
+    });
   });
 
-  it("does not seed title or artist alongside audio_ref either", () => {
+  // The reported bug, in the one case that still admits it: with no recording
+  // to hand over, a seeded title and artist are a claim about whatever URL is
+  // pasted next.
+  it("withholds identity from an acquisition tool when it cannot supply the recording", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        artist: { type: "string" },
+        youtube_url_or_id: { type: "string" },
+      },
+    };
+    const bench: Workbench = { song: { id: "artist--song", title: "Song Title", artist: "The Artist" } };
+    expect(seedFromWorkbench(schema, bench)).toEqual({});
+  });
+
+  // reconcile_song and build_song_baseline both require title and artist while
+  // accepting an audio_ref. Treating "takes a recording" as the test left those
+  // required fields blank on the tools that most need them.
+  it("seeds identity alongside audio_ref, which is evidence rather than a search term", () => {
     const schema = {
       type: "object",
       properties: {
@@ -104,7 +133,42 @@ describe("seedFromWorkbench", () => {
         audio_ref: { type: "string" },
       },
     };
-    expect(seedFromWorkbench(schema, fullBench)).toEqual({ audio_ref: "aud_123" });
+    expect(seedFromWorkbench(schema, fullBench)).toEqual({
+      audio_ref: "aud_123",
+      title: "Song Title",
+      artist: "The Artist",
+    });
+  });
+
+  it("seeds the song's own recording when nothing is loaded in the audio slot", () => {
+    const schema = { type: "object", properties: { youtube_url_or_id: {}, youtube_video_id: {} } };
+    const bench: Workbench = {
+      song: { id: "artist--song", title: "Song Title", artist: "The Artist", youtubeVideoId: "stored99" },
+    };
+    expect(seedFromWorkbench(schema, bench)).toEqual({
+      youtube_url_or_id: "stored99",
+      youtube_video_id: "stored99",
+    });
+  });
+
+  it("prefers the loaded recording over the song's stored one", () => {
+    const schema = { type: "object", properties: { youtube_url_or_id: {} } };
+    const bench: Workbench = {
+      song: { id: "artist--song", title: "Song Title", artist: "The Artist", youtubeVideoId: "stored99" },
+      audio: { audioRef: "aud_1", filename: "a.webm", songId: "artist--song", youtubeVideoId: "loaded11" },
+    };
+    expect(seedFromWorkbench(schema, bench)).toEqual({ youtube_url_or_id: "loaded11" });
+  });
+
+  it("offers an identity read off the video title when no song is selected", () => {
+    const schema = { type: "object", properties: { title: {}, artist: {} } };
+    const bench: Workbench = {
+      audio: { audioRef: "aud_1", filename: "a.webm", videoTitle: "Nirvana - Smells Like Teen Spirit" },
+    };
+    expect(seedFromWorkbench(schema, bench)).toEqual({
+      artist: "Nirvana",
+      title: "Smells Like Teen Spirit",
+    });
   });
 
   it("returns {} for a schema with no properties, and for an empty workbench", () => {
@@ -115,13 +179,98 @@ describe("seedFromWorkbench", () => {
 });
 
 describe("derivesIdentityFromRecording", () => {
-  it("is true for any recording-source field and false otherwise", () => {
-    for (const name of ["youtube_url_or_id", "audio_ref", "audio_path", "input_ref", "input_base64"]) {
-      expect(derivesIdentityFromRecording({ type: "object", properties: { [name]: {} } })).toBe(true);
+  // Only youtube_url_or_id makes title/artist into search terms the server
+  // will ignore. audio_ref does not: reconcile_song requires the names.
+  it("is true only for the acquisition search field", () => {
+    expect(derivesIdentityFromRecording({ type: "object", properties: { youtube_url_or_id: {} } })).toBe(true);
+    for (const name of ["audio_ref", "audio_path", "input_ref", "input_base64", "title"]) {
+      expect(derivesIdentityFromRecording({ type: "object", properties: { [name]: {} } })).toBe(false);
     }
-    expect(derivesIdentityFromRecording({ type: "object", properties: { title: {}, artist: {} } })).toBe(false);
     expect(derivesIdentityFromRecording({ type: "object" })).toBe(false);
     expect(derivesIdentityFromRecording(null)).toBe(false);
+  });
+});
+
+describe("knownVideoId", () => {
+  it("prefers the loaded recording, falls back to the song's, else nothing", () => {
+    expect(knownVideoId(fullBench)).toBe("vid123");
+    expect(knownVideoId({ song: fullBench.song })).toBe("stored99");
+    expect(knownVideoId({})).toBeUndefined();
+  });
+});
+
+describe("parseVideoId", () => {
+  it("reads an id out of the URL shapes YouTube actually hands out", () => {
+    expect(parseVideoId("RNCH0xA-hNY")).toBe("RNCH0xA-hNY");
+    expect(parseVideoId("https://www.youtube.com/watch?v=RNCH0xA-hNY&list=RDRNCH0xA-hNY&start_radio=1"))
+      .toBe("RNCH0xA-hNY");
+    expect(parseVideoId("https://youtu.be/RNCH0xA-hNY?t=30")).toBe("RNCH0xA-hNY");
+    expect(parseVideoId("https://www.youtube.com/shorts/RNCH0xA-hNY")).toBe("RNCH0xA-hNY");
+  });
+
+  it("returns undefined rather than guessing at anything it does not recognise", () => {
+    expect(parseVideoId("")).toBeUndefined();
+    expect(parseVideoId("   ")).toBeUndefined();
+    expect(parseVideoId("Smells Like Teen Spirit")).toBeUndefined();
+    expect(parseVideoId("https://example.com/song")).toBeUndefined();
+  });
+});
+
+describe("splitVideoTitle", () => {
+  it("splits on the first separator only", () => {
+    expect(splitVideoTitle("Nirvana - Smells Like Teen Spirit"))
+      .toEqual({ artist: "Nirvana", title: "Smells Like Teen Spirit" });
+    expect(splitVideoTitle("Amy Winehouse – Back to Black"))
+      .toEqual({ artist: "Amy Winehouse", title: "Back to Black" });
+    expect(splitVideoTitle("A - B - C")).toEqual({ artist: "A", title: "B - C" });
+  });
+
+  it("gives up on a title with no separator", () => {
+    expect(splitVideoTitle("SmellsLikeTeenSpirit")).toBeUndefined();
+    expect(splitVideoTitle("")).toBeUndefined();
+  });
+});
+
+describe("identityConflict", () => {
+  const acquireSchema = {
+    type: "object",
+    properties: { title: {}, artist: {}, youtube_url_or_id: {} },
+  };
+
+  it("names the video that will actually be fetched when it is not the song's own", () => {
+    const message = identityConflict(acquireSchema, {
+      title: "Back to Black",
+      artist: "Amy Winehouse",
+      youtube_url_or_id: "https://www.youtube.com/watch?v=RNCH0xA-hNY&list=RDRNCH0xA-hNY",
+    }, { song: { id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse", youtubeVideoId: "abcdefghijk" } });
+    expect(message).toContain("RNCH0xA-hNY");
+    expect(message).toContain("Back to Black");
+  });
+
+  it("stays quiet when the URL is the song's own recording", () => {
+    expect(identityConflict(acquireSchema, {
+      title: "Back to Black",
+      artist: "Amy Winehouse",
+      youtube_url_or_id: "https://www.youtube.com/watch?v=abcdefghijk",
+    }, { song: { id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse", youtubeVideoId: "abcdefghijk" } }))
+      .toBeUndefined();
+  });
+
+  it("stays quiet once the identity fields no longer claim the workbench song", () => {
+    expect(identityConflict(acquireSchema, {
+      title: "Something Else",
+      artist: "Someone Else",
+      youtube_url_or_id: "RNCH0xA-hNY",
+    }, { song: { id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse" } }))
+      .toBeUndefined();
+  });
+
+  it("stays quiet for a tool that does not acquire, an empty field, and no selected song", () => {
+    const values = { title: "Back to Black", artist: "Amy Winehouse", youtube_url_or_id: "RNCH0xA-hNY" };
+    const song = { id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse" };
+    expect(identityConflict({ type: "object", properties: { title: {}, artist: {} } }, values, { song })).toBeUndefined();
+    expect(identityConflict(acquireSchema, { ...values, youtube_url_or_id: "" }, { song })).toBeUndefined();
+    expect(identityConflict(acquireSchema, values, {})).toBeUndefined();
   });
 });
 

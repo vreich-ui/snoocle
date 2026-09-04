@@ -1,45 +1,13 @@
 import { useEffect, useRef, useState } from "react";
+import { acquireArtifact, artifactResponse, type AudioArtifact } from "./audio";
 import { apiFetch, getBearerToken } from "./api";
 import { createWaveform, type WaveformController } from "./waveform";
 
-export type AudioArtifact = {
-  audioRef: string;
-  filename: string;
-  contentType: string;
-  durationSeconds: number;
-  sizeBytes: number;
-  expiresAt: string;
-  playbackUrl: string;
-  /** Present for acquisitions: what the server actually fetched, as opposed to what was asked for. */
-  youtubeVideoId?: string;
-  videoTitle?: string;
-  fromCache?: boolean;
-};
+export type { AudioArtifact };
 
 interface AudioWorkspaceProps {
   onArtifact?(artifact: AudioArtifact): void;
   onArtifactRemoved?(audioRef: string): void;
-}
-
-/**
- * The acquire response reports what was fetched as siblings of `artifact`
- * (`youtubeVideoId`, `videoTitle`, `fromCache`). Dropping them left the UI
- * with only a filename to go on, so a recording that did not match the song
- * on screen looked no different from one that did. They are folded onto the
- * artifact here and travel with it into the workbench.
- */
-async function artifactResponse(response: Response): Promise<AudioArtifact> {
-  const body = await response.json();
-  if (!response.ok) {
-    throw new Error(body.detail ?? body.reason ?? `Request failed (${response.status})`);
-  }
-  const artifact = body.artifact as AudioArtifact;
-  return {
-    ...artifact,
-    youtubeVideoId: typeof body.youtubeVideoId === "string" ? body.youtubeVideoId : undefined,
-    videoTitle: typeof body.videoTitle === "string" ? body.videoTitle : undefined,
-    fromCache: typeof body.fromCache === "boolean" ? body.fromCache : undefined,
-  };
 }
 
 export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspaceProps = {}) {
@@ -91,11 +59,7 @@ export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspace
     setBusy(true);
     setMessage("");
     try {
-      preview(await artifactResponse(await apiFetch("/v1/audio/artifacts/acquire", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ youtubeUrlOrId: youtube.trim() }),
-      })));
+      preview(await acquireArtifact(youtube.trim()));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Acquisition failed");
     } finally {

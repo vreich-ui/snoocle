@@ -381,4 +381,44 @@ describe("SongStudio", () => {
     const card = await waitFor(() => stepCard(align.label));
     expect(within(card).getByText("Uses Artist - Song (YouTube vid123).")).toBeVisible();
   });
+
+  // Song Studio used to say "Needs audio in the workbench" and stop there,
+  // with no audio UI anywhere in the section — the recording the store already
+  // knows about had to be found and pasted in by hand from another section.
+  it("offers to load the song's own recording when an audio step is blocked", async () => {
+    setupFetch();
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={{ song: { id: "artist--song", title: "Song", artist: "Artist", youtubeVideoId: "abcdefghijk" } }}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient()}
+      />,
+    );
+
+    const align = SONG_STEPS.find((step) => step.needsAudio)!;
+    const card = await waitFor(() => stepCard(align.label));
+    expect(within(card).getByRole("button", { name: "Load this song's audio" })).toBeEnabled();
+  });
+
+  it("says why there is nothing to load when the song has no recording on file", async () => {
+    setupFetch();
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={{ song: { id: "artist--song", title: "Song", artist: "Artist" } }}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient()}
+      />,
+    );
+
+    const align = SONG_STEPS.find((step) => step.needsAudio)!;
+    const card = await waitFor(() => stepCard(align.label));
+    expect(within(card).queryByRole("button", { name: "Load this song's audio" })).toBeNull();
+    expect(within(card).getByText(/no recording on file/)).toBeVisible();
+  });
 });

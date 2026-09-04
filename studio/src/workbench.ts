@@ -5,6 +5,8 @@ export interface WorkbenchSong {
   title: string;
   artist: string;
   version?: string;
+  /** The recording this song was built from, when the store knows one. It is what makes the song's audio reachable without retyping a URL. */
+  youtubeVideoId?: string;
 }
 
 export interface WorkbenchAudio {
@@ -56,7 +58,7 @@ function parseSong(value: unknown): WorkbenchSong | undefined {
   if (typeof value.id !== "string" || typeof value.title !== "string" || typeof value.artist !== "string") return undefined;
   return withDefined<WorkbenchSong>(
     { id: value.id, title: value.title, artist: value.artist },
-    { version: optionalString(value.version) },
+    { version: optionalString(value.version), youtubeVideoId: optionalString(value.youtubeVideoId) },
   );
 }
 
@@ -115,11 +117,53 @@ export function saveWorkbench(next: Workbench): void {
 }
 
 /**
- * Property names that mean "here is the recording to work on". When a tool
- * declares one of these, the recording — not the workbench — decides which
- * song the call is about.
+ * The one property name whose presence means title/artist are merely
+ * acquisition *search terms*: a tool that declares `youtube_url_or_id` will
+ * prefer the URL and ignore the names. Exactly three server tools do —
+ * acquire_audio, analyze_audio, analyze_and_store_song.
+ *
+ * This is deliberately narrower than "takes a recording". reconcile_song and
+ * build_song_baseline both accept an audio_ref while *requiring* title and
+ * artist as the song's real identity; withholding those left required fields
+ * blank on the tools that most need them.
  */
-const RECORDING_SOURCE_FIELDS = ["youtube_url_or_id", "audio_ref", "audio_path", "input_ref", "input_base64"];
+const ACQUISITION_SEARCH_FIELD = "youtube_url_or_id";
+
+/** Everything that names a recording, for provenance and conflict checks. */
+const RECORDING_ID_FIELDS = ["youtube_url_or_id", "youtube_video_id"];
+
+/**
+ * The eleven-character YouTube video id inside a URL, or the id itself.
+ * Returns undefined for anything that is not recognisably one, so a conflict
+ * check never fires on a string it does not understand.
+ */
+export function parseVideoId(urlOrId: string): string | undefined {
+  const trimmed = urlOrId.trim();
+  if (!trimmed) return undefined;
+  if (/^[\w-]{11}$/.test(trimmed)) return trimmed;
+  const match = trimmed.match(/(?:v=|\/shorts\/|\/embed\/|youtu\.be\/)([\w-]{11})/);
+  return match?.[1];
+}
+
+/** The recording the workbench knows about: what is loaded, else what the song was built from. */
+export function knownVideoId(bench: Workbench): string | undefined {
+  return bench.audio?.youtubeVideoId ?? bench.song?.youtubeVideoId;
+}
+
+/**
+ * A best-effort "Artist - Title" split of a YouTube video title, used only
+ * when no stored song is selected — a starting point for discover_song or
+ * reconcile_song that the operator can correct, never a claim of verified
+ * identity. Only the first separator counts, so "A - B - C" reads as
+ * artist "A", title "B - C".
+ */
+export function splitVideoTitle(videoTitle: string): { artist: string; title: string } | undefined {
+  const match = videoTitle.match(/^(.{1,80}?)\s+[-–—|]\s+(.+)$/);
+  if (!match) return undefined;
+  const artist = match[1].trim();
+  const title = match[2].trim();
+  return artist && title ? { artist, title } : undefined;
+}
 
 /**
  * Slots whose provenance disagrees with the selected song, in words fit for
@@ -143,20 +187,20 @@ export function benchMismatches(bench: Workbench): string[] {
 }
 
 /**
- * Seeds a tool's form from the workbench, but only for property names the
- * tool's own JSON Schema declares — an unrelated tool never receives fields
- * it never asked for.
+ * Seeds a tool's form from the workbench, for every property name the tool's
+ * own JSON Schema declares — an unrelated tool never receives fields it never
+ * asked for.
  *
- * Only *references* are seeded freely: song_id, song_version, audio_ref and
- * the captured MIR each name one exact object.
+ * The aim is that selecting a song leaves nothing to retype: the references
+ * (song_id, song_version, audio_ref, the captured MIR), the recording the
+ * song was built from (youtube_url_or_id, youtube_video_id) and its identity
+ * (title, artist) are all filled in.
  *
- * title/artist are different. They are descriptive strings, and for the
- * acquisition tools (acquire_audio, analyze_audio, analyze_and_store_song)
- * they are merely search terms that a supplied youtube_url_or_id overrides
- * server-side. Seeding them there produced a form that claimed one song while
- * fetching another, so they are seeded only for tools that take no recording
- * at all — discover_song and friends, where title/artist really are the
- * subject.
+ * The one case that stays empty is identity for an acquisition tool whose
+ * recording we cannot supply: with no URL to agree with, a seeded title and
+ * artist are a claim about whatever the operator pastes next. Whenever a
+ * recording *is* seeded the names go in beside it, and `identityConflict`
+ * watches for the operator replacing one without the other.
  *
  * song_json/prior_song_json and every *_path property are deliberately never
  * seeded, even though a tool may declare them: song_json is mutually exclusive
@@ -179,18 +223,62 @@ export function seedFromWorkbench(schema: unknown, bench: Workbench): Record<str
   if (declares("mir_json") && bench.mir) seed.mir_json = bench.mir.json;
   if (declares("cached_mir_json") && bench.mir) seed.cached_mir_json = bench.mir.json;
 
-  const takesRecording = RECORDING_SOURCE_FIELDS.some(declares);
-  if (!takesRecording) {
-    if (declares("title") && bench.song?.title) seed.title = bench.song.title;
-    if (declares("artist") && bench.song?.artist) seed.artist = bench.song.artist;
+  const videoId = knownVideoId(bench);
+  if (videoId) {
+    for (const name of RECORDING_ID_FIELDS) if (declares(name)) seed[name] = videoId;
+  }
+
+  // With a stored song, its identity is the answer — except on an acquisition
+  // tool we cannot also hand a recording, where the names would be a claim
+  // about whatever URL the operator pastes next. Without a stored song, an
+  // acquired video title is the only identity there is, and a split of it is
+  // offered as a starting point since nothing can contradict it.
+  const identity = bench.song
+    ? { title: bench.song.title, artist: bench.song.artist }
+    : bench.audio?.videoTitle
+      ? splitVideoTitle(bench.audio.videoTitle)
+      : undefined;
+  const withheld = Boolean(bench.song) && declares(ACQUISITION_SEARCH_FIELD) && !videoId;
+  if (identity && !withheld) {
+    if (declares("title")) seed.title = identity.title;
+    if (declares("artist")) seed.artist = identity.artist;
   }
 
   return seed;
 }
 
-/** True when the tool takes a recording, so its subject is the recording rather than the workbench song. */
+/** True when the tool treats title/artist as search terms a URL overrides. */
 export function derivesIdentityFromRecording(schema: unknown): boolean {
   const properties = isRecord(schema) && isRecord(schema.properties) ? schema.properties : undefined;
   if (!properties) return false;
-  return RECORDING_SOURCE_FIELDS.some((name) => Object.prototype.hasOwnProperty.call(properties, name));
+  return Object.prototype.hasOwnProperty.call(properties, ACQUISITION_SEARCH_FIELD);
+}
+
+/**
+ * The live check that replaces withholding identity: once a form is filled in,
+ * watch for the operator pointing an acquisition tool at one recording while
+ * the title and artist beside it still name another. The server resolves the
+ * URL and ignores the names, so this is the moment the two can silently part
+ * company — the failure that made a Nirvana cover arrive under Amy
+ * Winehouse's name.
+ */
+export function identityConflict(
+  schema: unknown,
+  values: Record<string, unknown>,
+  bench: Workbench,
+): string | undefined {
+  if (!derivesIdentityFromRecording(schema)) return undefined;
+  const song = bench.song;
+  if (!song) return undefined;
+  const typed = typeof values[ACQUISITION_SEARCH_FIELD] === "string"
+    ? values[ACQUISITION_SEARCH_FIELD] as string
+    : "";
+  const typedId = parseVideoId(typed);
+  if (!typedId) return undefined;
+  const known = knownVideoId(bench);
+  if (known && typedId === known) return undefined;
+  const claimsSong = values.title === song.title || values.artist === song.artist;
+  if (!claimsSong) return undefined;
+  return `This will fetch ${typedId}, which is not the recording on file for ${song.title} — ${song.artist}. `
+    + "The recording wins: the title and artist below are ignored, and the result will be whatever that video is.";
 }

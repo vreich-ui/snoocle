@@ -2,6 +2,7 @@ import { useState } from "react";
 import { type SongsResponse, type SongSummary, type VersionsResponse } from "./client";
 import { formatDateTime } from "./format";
 import { useApi } from "./useApi";
+import { LoadSongAudio } from "./LoadSongAudio";
 import { benchMismatches, type Workbench as WorkbenchState } from "./workbench";
 
 interface WorkbenchProps {
@@ -44,7 +45,15 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
   const versionList = noVersions ? [] : versions.data?.versions ?? [];
 
   const pickSong = (item: SongSummary) => {
-    onChange({ ...bench, song: { id: item.id, title: item.title, artist: item.artist } });
+    onChange({
+      ...bench,
+      song: {
+        id: item.id,
+        title: item.title,
+        artist: item.artist,
+        youtubeVideoId: item.youtubeVideoId ?? undefined,
+      },
+    });
     setPickerOpen(false);
     setSearch("");
   };
@@ -100,6 +109,9 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
                   ))}
                 </select>
               </label>
+              {bench.song.youtubeVideoId && (
+                <span className="muted">recording YouTube {bench.song.youtubeVideoId}</span>
+              )}
               <div className="form-actions">
                 <button type="button" onClick={clearSong}>Clear</button>
               </div>
@@ -125,7 +137,12 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
                 <button type="button" onClick={clearAudio}>Clear</button>
               </div>
             </>
-          ) : <span className="muted">none</span>}
+          ) : (
+            <>
+              <span className="muted">none</span>
+              <LoadSongAudio bench={bench} onChange={onChange} />
+            </>
+          )}
         </div>
 
         <div className="tool-card workbench-slot">

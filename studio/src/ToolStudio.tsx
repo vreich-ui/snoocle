@@ -14,7 +14,7 @@ import {
   type ResultTelemetry,
   type StudioTool,
 } from "./tooling";
-import { benchMismatches, derivesIdentityFromRecording, seedFromWorkbench, type Workbench } from "./workbench";
+import { benchMismatches, derivesIdentityFromRecording, identityConflict, seedFromWorkbench, type Workbench } from "./workbench";
 
 type ClientFactory = (token: string) => ToolStudioClient;
 
@@ -79,6 +79,7 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
   const [history, setHistory] = useState<InvocationHistoryEntry[]>(loadHistory);
   const [restoredArgs, setRestoredArgs] = useState<Record<string, unknown>>();
   const [formVersion, setFormVersion] = useState(0);
+  const [liveValues, setLiveValues] = useState<Record<string, unknown>>({});
 
   useEffect(() => {
     let active = true;
@@ -118,6 +119,7 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
   // selecting a tool or restoring history already does.
   useEffect(() => {
     setFormVersion((value) => value + 1);
+    setLiveValues({});
   }, [bench]);
 
   const categories = useMemo(
@@ -133,6 +135,10 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
   );
   const takesRecording = Boolean(selected && derivesIdentityFromRecording(selected.inputSchema));
   const mismatches = useMemo(() => benchMismatches(bench), [bench]);
+  const conflict = useMemo(
+    () => (selected ? identityConflict(selected.inputSchema, liveValues, bench) : undefined),
+    [selected, liveValues, bench],
+  );
 
   const recordHistory = (
     tool: StudioTool,
@@ -185,6 +191,7 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
     setSelectedName(entry.toolName);
     setRestoredArgs(entry.arguments);
     setFormVersion((value) => value + 1);
+    setLiveValues({});
   };
 
   const blockedReason = !selected?.contract
@@ -274,6 +281,7 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
                   setSelectedName(tool.name);
                   setRestoredArgs(undefined);
                   setFormVersion((value) => value + 1);
+                  setLiveValues({});
                   setResult(undefined);
                   setInvocationError("");
                 }}
@@ -320,13 +328,13 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
               {Object.keys(seed).length > 0 && (
                 <p className="muted">From workbench: {Object.keys(seed).join(", ")}</p>
               )}
-              {takesRecording && bench.song && (
-                <p className="warning" role="note">
-                  This tool works on whichever recording you give it. A URL, id or reference here decides the
-                  song — the workbench selection ({bench.song.title} — {bench.song.artist}) does not, and its
-                  title and artist are deliberately not filled in.
+              {takesRecording && bench.song && !conflict && (
+                <p className="muted">
+                  The recording decides what this fetches. It is filled in from {bench.song.title} — {bench.song.artist};
+                  replace it and the title and artist below stop describing the result.
                 </p>
               )}
+              {conflict && <p className="warning" role="alert">{conflict}</p>}
               {mismatches.length > 0 && (
                 <div className="warning" role="alert">
                   {mismatches.map((problem) => <p key={problem}>{problem}</p>)}
@@ -341,6 +349,7 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
                 requiresConfirmation={selected.contract?.browserSafety === "confirmation_required"}
                 onSubmit={invoke}
                 onCancel={() => abortRef.current?.abort()}
+                onValuesChange={setLiveValues}
               />
               {invocationError && <p className="error invocation-error" role="alert">{invocationError}</p>}
               {result && (

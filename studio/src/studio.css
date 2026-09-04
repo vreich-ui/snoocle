@@ -501,3 +501,6 @@ tr.row-button:hover { background: #141f35; }
 @media (max-width: 850px) {
   .song-studio { max-width: 100%; }
 }
+
+.load-song-audio { display: grid; gap: .35rem; margin-top: .5rem; }
+.load-song-audio .field-help { overflow-wrap: anywhere; }

@@ -91,8 +91,23 @@ export function StudioApp() {
             <AudioWorkspace
               onArtifact={(artifact) => onBenchChange({
                 ...bench,
-                audio: { audioRef: artifact.audioRef, filename: artifact.filename, durationSeconds: artifact.durationSeconds },
+                audio: {
+                  audioRef: artifact.audioRef,
+                  filename: artifact.filename,
+                  durationSeconds: artifact.durationSeconds,
+                  // Stamped with the song that was selected at the time, and
+                  // with what the server says it fetched, so a later step can
+                  // tell whether this recording belongs to the song on screen.
+                  songId: bench.song?.id,
+                  youtubeVideoId: artifact.youtubeVideoId,
+                  videoTitle: artifact.videoTitle,
+                },
               })}
+              onArtifactRemoved={(audioRef) => {
+                // The workbench must not keep pointing at a reference the
+                // server no longer has.
+                if (bench.audio?.audioRef === audioRef) onBenchChange({ ...bench, audio: undefined });
+              }}
             />
           </div>
           <WorkbenchBar bench={bench} token={token} onChange={onBenchChange} />

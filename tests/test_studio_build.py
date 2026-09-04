@@ -17,8 +17,11 @@ def test_studio_build_is_local_vite_react_with_no_cdn():
     assert "vite" in package["devDependencies"]
     assert package["devDependencies"]["@playwright/test"] == "1.62.1"
     assert package["scripts"]["test:browser"] == "playwright test"
+    # The guard is that nothing the browser loads comes from a CDN, so it
+    # covers the sources that get bundled. Test files are not shipped, and the
+    # URL-parsing tests need real pasted YouTube URLs to be worth anything.
     for source in (REPO / "studio" / "src").rglob("*"):
-        if source.is_file():
+        if source.is_file() and ".test." not in source.name:
             assert "https://" not in source.read_text(), source
 
 

@@ -7,6 +7,7 @@ import { sectionPath, songStudioPath } from "./navigation";
 import { Sheet } from "./Sheet";
 import { argsForStep, extractCandidateSong, SONG_STEPS, summariseSongChange, type SongStep } from "./steps";
 import { formatDateTime } from "./format";
+import { LoadSongAudio } from "./LoadSongAudio";
 import { formatJson, invocationView, isRecord, type StudioTool } from "./tooling";
 import { useApi } from "./useApi";
 import { benchMismatches, type Workbench } from "./workbench";
@@ -85,7 +86,12 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
     if (!loaded || loaded.id !== songId) return;
     onBenchChange({
       ...bench,
-      song: { id: loaded.id, title: loaded.metadata.title, artist: loaded.metadata.artist },
+      song: {
+        id: loaded.id,
+        title: loaded.metadata.title,
+        artist: loaded.metadata.artist,
+        youtubeVideoId: loaded.audio.youtubeVideoId ?? loaded.audio.analyzedVideoId ?? undefined,
+      },
     });
     // `bench` and `onBenchChange` are recreated by the parent on every change;
     // depending on them here would loop. The song id is the real trigger.
@@ -266,7 +272,15 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
                     key={item.id}
                     type="button"
                     onClick={() => {
-                      onBenchChange({ ...bench, song: { id: item.id, title: item.title, artist: item.artist } });
+                      onBenchChange({
+                        ...bench,
+                        song: {
+                          id: item.id,
+                          title: item.title,
+                          artist: item.artist,
+                          youtubeVideoId: item.youtubeVideoId ?? undefined,
+                        },
+                      });
                       onNavigate(songStudioPath(item.id));
                     }}
                   >
@@ -399,7 +413,18 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
                   <strong>{step.label}</strong>
                   <p className="muted">{step.description}</p>
                   <span className="status-pill">{step.produces === "song" ? "Changes the song" : "Report only"}</span>
-                  {audioBlocked && <p className="field-help">Needs audio in the workbench.</p>}
+                  {audioBlocked && (
+                    <>
+                      <p className="field-help">Needs audio in the workbench.</p>
+                      <LoadSongAudio bench={bench} onChange={onBenchChange} />
+                      {!bench.song?.youtubeVideoId && (
+                        <p className="field-help">
+                          This song has no recording on file. Acquire one in Tool Studio, or use
+                          suggest_better_recordings to find a candidate.
+                        </p>
+                      )}
+                    </>
+                  )}
                   {step.needsAudio && bench.audio && (
                     <p className="field-help">
                       Uses {bench.audio.videoTitle ?? bench.audio.filename}

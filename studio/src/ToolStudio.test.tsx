@@ -217,15 +217,6 @@ describe("ToolStudio", () => {
     await userEvent.click(screen.getByRole("button", { name: /process_song_deterministically.*success/ }));
     expect(await screen.findByLabelText(/Song Id/i)).toHaveValue("explicit-song");
   });
-});
-
-describe("looksUnauthorized", () => {
-  it("matches a 401 status, invalid_token, and not a plain network error", () => {
-    expect(looksUnauthorized("Request failed with status code 401")).toBe(true);
-    expect(looksUnauthorized('{"error":"invalid_token","error_description":"..."}')).toBe(true);
-    expect(looksUnauthorized("MCP connection lost")).toBe(false);
-  });
-
   // The reported bug: the form said "From workbench: title, artist" for
   // "Back to Black — Amy Winehouse" while a pasted URL fetched a Nirvana
   // cover. The URL wins server-side, so the identity was a claim the call
@@ -240,6 +231,54 @@ describe("looksUnauthorized", () => {
     expect(screen.getByLabelText(/^Title/i)).toHaveValue("");
     expect(screen.getByLabelText(/^Artist/i)).toHaveValue("");
     expect(screen.queryByText(/From workbench/)).toBeNull();
-    expect(screen.getByText(/A URL, id or reference here decides the/)).toBeVisible();
+  });
+
+  // With the song's own recording available there is nothing left to type, and
+  // the names can go in beside it because they describe that same video.
+  it("seeds the recording and the identity together when the song has a known video", async () => {
+    const client = mockClient();
+    client.connectAndDiscover = vi.fn().mockResolvedValue(acquireTools());
+    const bench: Workbench = {
+      song: {
+        id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse", youtubeVideoId: "abcdefghijk",
+      },
+    };
+    render(<ToolStudio token="tab-token" bench={bench} onBenchChange={vi.fn()} clientFactory={() => client} />);
+
+    expect(await screen.findByLabelText(/Youtube Url Or Id/i)).toHaveValue("abcdefghijk");
+    expect(screen.getByLabelText(/^Title/i)).toHaveValue("Back to Black");
+    expect(screen.getByLabelText(/^Artist/i)).toHaveValue("Amy Winehouse");
+    expect(screen.getByText(/From workbench: youtube_url_or_id, title, artist/)).toBeVisible();
+  });
+
+  // The live guard that lets the fields be filled in at all: pasting another
+  // video while the names still say the workbench song is the exact shape of
+  // the reported bug.
+  it("warns when the pasted recording is not the one the workbench song names", async () => {
+    const client = mockClient();
+    client.connectAndDiscover = vi.fn().mockResolvedValue(acquireTools());
+    const bench: Workbench = {
+      song: {
+        id: "amy--back-to-black", title: "Back to Black", artist: "Amy Winehouse", youtubeVideoId: "abcdefghijk",
+      },
+    };
+    const user = userEvent.setup();
+    render(<ToolStudio token="tab-token" bench={bench} onBenchChange={vi.fn()} clientFactory={() => client} />);
+
+    const field = await screen.findByLabelText(/Youtube Url Or Id/i);
+    await user.clear(field);
+    await user.type(field, "https://www.youtube.com/watch?v=RNCH0xA-hNY&list=RDRNCH0xA-hNY");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("RNCH0xA-hNY");
+    expect(alert).toHaveTextContent("Back to Black");
+  });
+});
+
+describe("looksUnauthorized", () => {
+  it("matches a 401 status, invalid_token, and not a plain network error", () => {
+    expect(looksUnauthorized("Request failed with status code 401")).toBe(true);
+    expect(looksUnauthorized('{"error":"invalid_token","error_description":"..."}')).toBe(true);
+    expect(looksUnauthorized("MCP connection lost")).toBe(false);
   });
 });

@@ -220,7 +220,7 @@ describe("splitVideoTitle", () => {
   it("splits on the first separator only", () => {
     expect(splitVideoTitle("Nirvana - Smells Like Teen Spirit"))
       .toEqual({ artist: "Nirvana", title: "Smells Like Teen Spirit" });
-    expect(splitVideoTitle("Amy Winehouse – Back to Black"))
+    expect(splitVideoTitle("Amy Winehouse \\u2013 Back to Black"))
       .toEqual({ artist: "Amy Winehouse", title: "Back to Black" });
     expect(splitVideoTitle("A - B - C")).toEqual({ artist: "A", title: "B - C" });
   });

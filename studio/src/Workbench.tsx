@@ -2,7 +2,7 @@ import { useState } from "react";
 import { type SongsResponse, type SongSummary, type VersionsResponse } from "./client";
 import { formatDateTime } from "./format";
 import { useApi } from "./useApi";
-import { type Workbench as WorkbenchState } from "./workbench";
+import { benchMismatches, type Workbench as WorkbenchState } from "./workbench";
 
 interface WorkbenchProps {
   bench: WorkbenchState;
@@ -51,11 +51,30 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
 
   const clearSong = () => onChange({ ...bench, song: undefined });
   const clearAudio = () => onChange({ ...bench, audio: undefined });
-  const clearMir = () => onChange({ ...bench, mirJson: undefined });
+  const clearMir = () => onChange({ ...bench, mir: undefined });
+
+  // Slots left over from a previous song are the quiet failure mode: nothing
+  // errors, the wrong recording is simply used. Name them, and offer the one
+  // action that fixes it.
+  const mismatches = benchMismatches(bench);
+  const dropStaleSlots = () => onChange({
+    ...bench,
+    audio: bench.audio?.songId && bench.audio.songId !== bench.song?.id ? undefined : bench.audio,
+    mir: undefined,
+  });
 
   return (
     <section className="workbench-bar" aria-label="Workbench">
       <p className="eyebrow">Workbench</p>
+      {mismatches.length > 0 && (
+        <div className="workbench-mismatch" role="alert">
+          <strong>These slots do not belong to the selected song.</strong>
+          <ul>{mismatches.map((problem) => <li key={problem}>{problem}</li>)}</ul>
+          <div className="form-actions">
+            <button type="button" onClick={dropStaleSlots}>Clear the mismatched slots</button>
+          </div>
+        </div>
+      )}
       <div className="workbench-slots">
         <div className="tool-card workbench-slot">
           <p className="eyebrow">Song</p>
@@ -96,8 +115,12 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
           <p className="eyebrow">Audio</p>
           {bench.audio ? (
             <>
-              <strong>{bench.audio.filename}</strong>
-              <span className="muted">{formatDuration(bench.audio.durationSeconds)}</span>
+              <strong>{bench.audio.videoTitle ?? bench.audio.filename}</strong>
+              <span className="muted">
+                {formatDuration(bench.audio.durationSeconds)}
+                {bench.audio.youtubeVideoId ? ` · YouTube ${bench.audio.youtubeVideoId}` : ""}
+              </span>
+              {bench.audio.videoTitle && <span className="muted">{bench.audio.filename}</span>}
               <div className="form-actions">
                 <button type="button" onClick={clearAudio}>Clear</button>
               </div>
@@ -107,10 +130,11 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
 
         <div className="tool-card workbench-slot">
           <p className="eyebrow">MIR</p>
-          {bench.mirJson ? (
+          {bench.mir ? (
             <>
               <strong>Captured</strong>
-              <span className="muted">{mirByteLength(bench.mirJson)} bytes</span>
+              <span className="muted">{mirByteLength(bench.mir.json)} bytes</span>
+              {bench.mir.audioRef && <span className="muted">from {bench.mir.audioRef}</span>}
               <div className="form-actions">
                 <button type="button" onClick={clearMir}>Clear</button>
               </div>

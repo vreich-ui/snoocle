@@ -82,8 +82,12 @@ describe("WorkbenchBar", () => {
     expect(screen.queryByText("Mystery Track — Unknown")).not.toBeInTheDocument();
 
     await user.click(screen.getByText("Karma Police — Radiohead"));
+    // The picker carries the recording the song was built from, so the audio
+    // tools need nothing typed after a selection.
     expect(onChange).toHaveBeenCalledWith({
-      song: { id: "radiohead--karma-police", title: "Karma Police", artist: "Radiohead" },
+      song: {
+        id: "radiohead--karma-police", title: "Karma Police", artist: "Radiohead", youtubeVideoId: "abc123",
+      },
     });
     // Selecting a song closes the inline panel.
     expect(screen.queryByLabelText("Search songs")).not.toBeInTheDocument();

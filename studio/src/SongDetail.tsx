@@ -215,6 +215,10 @@ export function SongDetail({ songId, token, onNavigate, onSendToToolStudio }: So
                 title: data.metadata.title,
                 artist: data.metadata.artist,
                 version: pinnedVersion || undefined,
+                // Without this the workbench knows the song but not the
+                // recording it came from, and every audio tool has to be told
+                // by hand what the store already knows.
+                youtubeVideoId: data.audio.youtubeVideoId ?? data.audio.analyzedVideoId ?? undefined,
               });
               onNavigate("/studio/tool-studio");
             }}

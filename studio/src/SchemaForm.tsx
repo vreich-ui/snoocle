@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { formatJson, isRecord } from "./tooling";
 
 export interface JsonSchema {
@@ -33,6 +33,8 @@ interface SchemaFormProps {
   requiresConfirmation: boolean;
   onSubmit: (args: Record<string, unknown>) => void;
   onCancel: () => void;
+  /** Reports the live field values so a caller can warn about a combination the schema cannot express. */
+  onValuesChange?: (values: Record<string, unknown>) => void;
 }
 
 function humanize(name: string): string {
@@ -246,7 +248,7 @@ function JsonField({ id, label, description, initialText, required, disabled, on
   );
 }
 
-export function SchemaForm({ schema, initialValue, busy, blockedReason, requiresConfirmation, onSubmit, onCancel }: SchemaFormProps) {
+export function SchemaForm({ schema, initialValue, busy, blockedReason, requiresConfirmation, onSubmit, onCancel, onValuesChange }: SchemaFormProps) {
   const initial = useMemo(() => {
     const defaults = defaultsFor(schema, schema);
     return { ...(isRecord(defaults) ? defaults : {}), ...(initialValue ?? {}) };
@@ -259,9 +261,21 @@ export function SchemaForm({ schema, initialValue, busy, blockedReason, requires
   const [confirmed, setConfirmed] = useState(false);
   const properties = schema.properties ?? {};
 
+  // Held in a ref so a caller that passes a fresh closure each render does not
+  // turn the report into a render loop.
+  const onValuesChangeRef = useRef(onValuesChange);
+  onValuesChangeRef.current = onValuesChange;
+
   const updateValue = (path: string[], value: unknown) => {
     setValues((current) => setAtPath(current, path, value));
   };
+
+  // Reported from an effect rather than from inside the state updater, which
+  // React is free to run more than once. Fires for the seeded values too, so a
+  // caller sees the form as it opens, not only after the first keystroke.
+  useEffect(() => {
+    onValuesChangeRef.current?.(values);
+  }, [values]);
 
   const updateJsonError = (path: string, message: string) => {
     setJsonErrors((current) => ({ ...current, [path]: message }));

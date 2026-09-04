@@ -158,7 +158,7 @@ export function knownVideoId(bench: Workbench): string | undefined {
  * artist "A", title "B - C".
  */
 export function splitVideoTitle(videoTitle: string): { artist: string; title: string } | undefined {
-  const match = videoTitle.match(/^(.{1,80}?)\s+[-\\u2013\\u2014|]\s+(.+)$/);
+  const match = videoTitle.match(/^(.{1,80}?)\s+[-–—|]\s+(.+)$/);
   if (!match) return undefined;
   const artist = match[1].trim();
   const title = match[2].trim();

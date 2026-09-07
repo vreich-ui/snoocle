@@ -34,6 +34,13 @@ interface StepLogEntry {
   result: unknown;
   errorCode?: string;
   errorMessage?: string;
+  /**
+   * The version this candidate was computed from, captured when the step ran.
+   * `null` means the store held no versions yet (a first save needs no lock);
+   * `undefined` means the version list had not loaded, so there is no honest
+   * basis to save against.
+   */
+  basedOnVersion?: string | null;
   candidate?: { song: Song; diff: string[] };
 }
 
@@ -138,10 +145,29 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
   const [savingId, setSavingId] = useState<string | undefined>(undefined);
   const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
 
+  // A step can outlive the song it was started for: align_song_deterministically
+  // has a 15-minute timeout, and "Change song" is one click away. The ref is the
+  // authority on what the section is showing now, read after every await.
+  const songIdRef = useRef(songId);
+  songIdRef.current = songId;
+  const stepAbortRef = useRef<AbortController | undefined>(undefined);
+
   useEffect(() => {
+    stepAbortRef.current?.abort();
+    stepAbortRef.current = undefined;
     setLog([]);
     setSaveErrors({});
+    setBusyStepId(undefined);
+    setSavingId(undefined);
   }, [songId]);
+
+  const noVersions = versionsApi.state === "error" && versionsApi.error?.status === 404;
+  const versionList = noVersions ? [] : versionsApi.data?.versions ?? [];
+
+  // The optimistic lock is only a lock if we actually know the version we are
+  // basing the save on. While /versions is still loading, versionList is empty
+  // and the basis would come out undefined — a save with no lock at all.
+  const versionsKnown = versionsApi.state === "ready" || noVersions;
 
   const toolFor = (name: string): StudioTool => discovered.find((tool) => tool.name === name) ?? ({ name } as StudioTool);
 
@@ -149,10 +175,20 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
     const client = clientRef.current;
     if (!client || !songId) return;
     const args = argsForStep(step, songId, pinnedVersion || undefined, bench.audio?.audioRef);
+    // The basis for the optimistic lock is the version the candidate is
+    // computed FROM, fixed here. Reading it back at save time meant a second
+    // save silently adopted whatever the first one had just written.
+    const basedOnVersion = versionsKnown ? (pinnedVersion || versionList[0]?.version || null) : undefined;
+    const subject = songId;
+    const controller = new AbortController();
+    stepAbortRef.current = controller;
     setBusyStepId(step.id);
     const started = performance.now();
     try {
-      const raw = await client.callTool(toolFor(step.tool), args, new AbortController().signal) as CallToolResult;
+      const raw = await client.callTool(toolFor(step.tool), args, controller.signal) as CallToolResult;
+      // A step outliving its song would otherwise post its result into the new
+      // song's log, with a diff computed against the old song's document.
+      if (songIdRef.current !== subject) return;
       const view = invocationView(raw, performance.now() - started);
       const structured = view.structured;
       const envelopeResult = isRecord(structured) ? structured.result : undefined;
@@ -177,9 +213,12 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
         result: envelopeResult ?? structured,
         errorCode,
         errorMessage: view.failed ? view.errorMessage : undefined,
+        basedOnVersion,
         candidate,
       }, ...current]);
     } catch (error) {
+      if (songIdRef.current !== subject) return;
+      if (error instanceof DOMException && error.name === "AbortError") return;
       const message = error instanceof Error ? error.message : String(error);
       setLog((current) => [{
         id: newLogId(),
@@ -192,23 +231,16 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
         errorMessage: message,
       }, ...current]);
     } finally {
-      setBusyStepId(undefined);
+      if (stepAbortRef.current === controller) stepAbortRef.current = undefined;
+      if (songIdRef.current === subject) setBusyStepId(undefined);
     }
   };
 
-  const noVersions = versionsApi.state === "error" && versionsApi.error?.status === 404;
-  const versionList = noVersions ? [] : versionsApi.data?.versions ?? [];
-
-  // The optimistic lock is only a lock if we actually know the version we are
-  // basing the save on. While /versions is still loading, versionList is empty
-  // and expectedVersion would come out undefined — a save with no lock at all.
-  const versionsKnown = versionsApi.state === "ready" || noVersions;
-
   const saveCandidate = async (entry: StepLogEntry) => {
-    if (!entry.candidate || !songId || !versionsKnown) return;
+    if (!entry.candidate || !songId || entry.basedOnVersion === undefined) return;
     setSavingId(entry.id);
     setSaveErrors((current) => ({ ...current, [entry.id]: "" }));
-    const expectedVersion = pinnedVersion || versionList[0]?.version;
+    const expectedVersion = entry.basedOnVersion ?? undefined;
     try {
       await apiJson(`/v1/songs/${encodeURIComponent(songId)}`, {
         method: "POST",
@@ -223,8 +255,10 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
       songApi.reload();
       versionsApi.reload();
     } catch (error) {
+      // Now a true statement: the basis is the version this candidate was
+      // computed from, so a 409 means the song really has moved on under it.
       const message = error instanceof ApiError && error.status === 409
-        ? "Someone saved first — reload."
+        ? "The song changed after this step ran, so saving would discard that change. Re-run the step against the current version."
         : error instanceof Error ? error.message : String(error);
       setSaveErrors((current) => ({ ...current, [entry.id]: message }));
     } finally {
@@ -477,10 +511,14 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
                     <div className="form-actions">
                       <button
                         type="button"
-                        disabled={savingId === entry.id || !versionsKnown}
+                        disabled={savingId === entry.id || entry.basedOnVersion === undefined}
                         onClick={() => saveCandidate(entry)}
                       >
-                        {savingId === entry.id ? "Saving…" : versionsKnown ? "Save as new version" : "Loading versions…"}
+                        {savingId === entry.id
+                          ? "Saving…"
+                          : entry.basedOnVersion === undefined
+                            ? "No version to save against"
+                            : "Save as new version"}
                       </button>
                       <button type="button" disabled={savingId === entry.id} onClick={() => discardCandidate(entry)}>Discard</button>
                     </div>

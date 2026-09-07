@@ -231,7 +231,7 @@ describe("SongStudio", () => {
     await waitFor(() => expect(screen.queryByText("Candidate")).not.toBeInTheDocument());
   });
 
-  it("renders 'someone saved first' on a 409 from save, not a generic error", async () => {
+  it("explains a 409 as the song having moved on under the candidate", async () => {
     setupFetch({ postStatus: 409, postBody: { detail: "version conflict" } });
     const alteredSong = songFixture({
       lines: [
@@ -261,7 +261,7 @@ describe("SongStudio", () => {
     await screen.findByText("Candidate");
 
     await userEvent.click(screen.getByRole("button", { name: "Save as new version" }));
-    expect(await screen.findByText(/someone saved first/i)).toBeVisible();
+    expect(await screen.findByText(/The song changed after this step ran/i)).toBeVisible();
   });
 
   it("disables a step that needs audio when the workbench has none", async () => {
@@ -420,5 +420,124 @@ describe("SongStudio", () => {
     const card = await waitFor(() => stepCard(align.label));
     expect(within(card).queryByRole("button", { name: "Load this song's audio" })).toBeNull();
     expect(within(card).getByText(/no recording on file/)).toBeVisible();
+  });
+
+  // The lost update: expectedVersion used to be read when Save was clicked, so
+  // a second save silently adopted whatever the first had just written and the
+  // server's optimistic lock could never fire.
+  it("saves each candidate against the version it was computed from, not the latest", async () => {
+    const posted: unknown[] = [];
+    let currentVersion = "v1";
+    fetchMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (path === "/v1/songs/artist--song/versions" && method === "GET") {
+        return jsonResponse(200, {
+          songId: "artist--song",
+          versions: [{ version: currentVersion, timestamp: "2026-08-01T00:00:00Z", message: "saved" }],
+        });
+      }
+      if (path === "/v1/songs/artist--song" && method === "GET") return jsonResponse(200, songFixture());
+      if (path === "/v1/songs/artist--song" && method === "POST") {
+        const body = JSON.parse(init!.body as string);
+        posted.push(body.expectedVersion);
+        if (body.expectedVersion !== currentVersion) return jsonResponse(409, { detail: "version conflict" });
+        currentVersion = "v2";
+        return jsonResponse(200, { version: "v2" });
+      }
+      throw new Error(`unexpected request ${method} ${path}`);
+    });
+
+    const altered = songFixture({
+      lines: [
+        { lineIndex: 0, lyrics: "hello", chordPlacements: [{ charIndex: 0, chord: "C" }], timeSeconds: 9 },
+        { lineIndex: 1, lyrics: "world", chordPlacements: [], timeSeconds: 2 },
+      ],
+    });
+    const callTool: ToolStudioClient["callTool"] = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "ok" }],
+      structuredContent: { ok: true, result: { song: altered }, elapsedMs: 5, outputSummary: {} },
+    } satisfies CallToolResult);
+
+    render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={EMPTY_WORKBENCH}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient(callTool)}
+      />,
+    );
+    await screen.findByRole("heading", { name: "Song — Artist" });
+
+    // Two candidates, both computed from v1.
+    for (const label of ["Snap timing to the audio", "Re-time the sections"]) {
+      const run = within(stepCard(label)).getByRole("button", { name: "Run" });
+      await waitFor(() => expect(run).toBeEnabled());
+      await userEvent.click(run);
+    }
+    await waitFor(() => expect(screen.getAllByText("Candidate")).toHaveLength(2));
+
+    const saveButtons = () => screen.getAllByRole("button", { name: "Save as new version" });
+    await userEvent.click(saveButtons()[0]);
+    await waitFor(() => expect(screen.getAllByText("Candidate")).toHaveLength(1));
+
+    // The second candidate is still based on v1, which is no longer current.
+    await userEvent.click(saveButtons()[0]);
+    expect(await screen.findByText(/The song changed after this step ran/)).toBeVisible();
+    expect(posted).toEqual(["v1", "v1"]);
+  });
+
+  // A step outliving its song used to post its result into the new song's log,
+  // with a diff computed against the old song's document.
+  it("discards a step result that lands after the song has changed", async () => {
+    fetchMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (path.endsWith("/versions") && method === "GET") return jsonResponse(200, versionsBody);
+      if (path === "/v1/songs/artist--song" && method === "GET") return jsonResponse(200, songFixture());
+      if (path === "/v1/songs/other--song" && method === "GET") {
+        return jsonResponse(200, songFixture({ id: "other--song", metadata: { title: "Other", artist: "Someone" } }));
+      }
+      throw new Error(`unexpected request ${method} ${path}`);
+    });
+    let release: (value: CallToolResult) => void = () => undefined;
+    const callTool: ToolStudioClient["callTool"] = vi.fn().mockImplementation(
+      () => new Promise<CallToolResult>((resolve) => { release = resolve; }),
+    );
+
+    const view = render(
+      <SongStudio
+        songId="artist--song"
+        token="tab-token"
+        bench={EMPTY_WORKBENCH}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient(callTool)}
+      />,
+    );
+    await screen.findByRole("heading", { name: "Song — Artist" });
+    const run = within(stepCard("Validate against the schema")).getByRole("button", { name: "Run" });
+    await waitFor(() => expect(run).toBeEnabled());
+    await userEvent.click(run);
+
+    // The operator moves to another song while the call is still in flight.
+    view.rerender(
+      <SongStudio
+        songId="other--song"
+        token="tab-token"
+        bench={EMPTY_WORKBENCH}
+        onBenchChange={vi.fn()}
+        onNavigate={vi.fn()}
+        clientFactory={() => mockClient(callTool)}
+      />,
+    );
+
+    release({
+      content: [{ type: "text", text: "ok" }],
+      structuredContent: { ok: true, result: {}, elapsedMs: 5, outputSummary: {} },
+    } satisfies CallToolResult);
+
+    await waitFor(() => expect(screen.getByText("No steps run yet.")).toBeVisible());
+    expect(screen.queryByText("Validate against the schema", { selector: ".step-log-entry strong" })).toBeNull();
   });
 });

@@ -116,14 +116,6 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
     };
   }, [clientFactory, retry, token]);
 
-  // Switching the workbench selection (a different song, fresh audio, newly
-  // captured MIR) should re-seed the open form, so remount it the same way
-  // selecting a tool or restoring history already does.
-  useEffect(() => {
-    setFormVersion((value) => value + 1);
-    setLiveValues({});
-  }, [bench]);
-
   const categories = useMemo(
     () => [...new Set(tools.map((tool) => tool.contract?.category).filter((item): item is string => Boolean(item)))].sort(),
     [tools],
@@ -140,6 +132,13 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
   const conflict = useMemo(
     () => (selected ? identityConflict(selected.inputSchema, liveValues, bench) : undefined),
     [selected, liveValues, bench],
+  );
+  // Only the seeded keys the form is actually carrying. Listing the seed
+  // itself made the line lie whenever a restored history value, or a typed
+  // one, had won for that key.
+  const appliedFromWorkbench = useMemo(
+    () => Object.keys(seed).filter((key) => liveValues[key] === seed[key]),
+    [seed, liveValues],
   );
 
   const recordHistory = (
@@ -327,8 +326,8 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
               {selected.contract?.modelUse !== "none" && (
                 <p className="warning" role="note">This tool may use a model and incur cost according to server policy.</p>
               )}
-              {Object.keys(seed).length > 0 && (
-                <p className="muted">From workbench: {Object.keys(seed).join(", ")}</p>
+              {appliedFromWorkbench.length > 0 && (
+                <p className="muted">From workbench: {appliedFromWorkbench.join(", ")}</p>
               )}
               {takesRecording && bench.song && !conflict && (
                 <p className="muted">
@@ -345,7 +344,8 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
               <SchemaForm
                 key={`${selected.name}-${formVersion}`}
                 schema={selected.inputSchema as JsonSchema}
-                initialValue={{ ...seed, ...restoredArgs }}
+                seed={seed}
+                initialValue={restoredArgs}
                 busy={busy}
                 blockedReason={blockedReason}
                 requiresConfirmation={selected.contract?.browserSafety === "confirmation_required"}

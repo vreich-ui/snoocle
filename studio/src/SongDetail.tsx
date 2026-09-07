@@ -109,6 +109,20 @@ export function SongDetail({ songId, token, onNavigate, onSendToToolStudio }: So
 
   const [exportError, setExportError] = useState("");
 
+  // Everything above is about one song. A rename navigates to the new id
+  // without unmounting this component (App has no key on it), and a rename
+  // rewrites every version hash — so the comparators kept values matching no
+  // option, and the previous song's diff stayed on screen under the new
+  // song's heading.
+  useEffect(() => {
+    setPinnedVersion("");
+    setVersionA("");
+    setVersionB("");
+    setDiffText("");
+    setDiffError("");
+    setExportError("");
+  }, [songId]);
+
   const noVersions = versions.state === "error" && versions.error?.status === 404;
   const versionList = noVersions ? [] : versions.data?.versions ?? [];
 
@@ -337,8 +351,16 @@ export function SongDetail({ songId, token, onNavigate, onSendToToolStudio }: So
               </thead>
               <tbody>
                 {runs.data?.runs.map((run) => (
-                  <tr key={run.runId} className="row-button" onClick={() => onNavigate(runDetailPath(run.runId))}>
-                    <td><code>{run.runId.slice(0, 10)}</code></td>
+                  <tr key={run.runId}>
+                    <td>
+                      <button
+                        type="button"
+                        className="row-open"
+                        onClick={() => onNavigate(runDetailPath(run.runId))}
+                      >
+                        <code>{run.runId.slice(0, 10)}</code>
+                      </button>
+                    </td>
                     <td>{run.status}</td>
                     <td>{pairOrDash(run.provider, run.model)}</td>
                     <td>{formatDateTime(run.startedAt)}</td>

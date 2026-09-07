@@ -234,7 +234,8 @@ export interface SongRunsResponse {
   runs: RunSummary[];
 }
 
-export interface RunStep {
+/** A step of an agent reconciliation trace (`reconcile/trace.py:TraceStep`). */
+export interface AgentRunStep {
   index: number;
   kind: string;
   label: string;
@@ -244,8 +245,82 @@ export interface RunStep {
   durationSeconds: number | null;
 }
 
+/**
+ * A stage of a deterministic run (`deterministic.py:StageObservation`), which
+ * every Song Studio step and every `*_deterministically` tool writes. It shares
+ * not one field name with the agent shape, so a reader that knows only
+ * `AgentRunStep` renders these as blank rows.
+ */
+export interface DeterministicRunStage {
+  name: string;
+  elapsedMs?: number;
+  cacheStatus?: string;
+  modelCalls?: number;
+  modelCostUSD?: number;
+  inputSummary?: Record<string, unknown>;
+  outputSummary?: Record<string, unknown>;
+  warnings?: string[];
+}
+
+export type RunStep = AgentRunStep | DeterministicRunStage;
+
 export interface RunDetail extends RunSummary {
   steps: RunStep[];
+  /** Deterministic runs record why they stopped here; agent runs use `error`. */
+  reason?: string | null;
+  runType?: string;
+  totals?: Record<string, unknown>;
+}
+
+/** One step as the UI needs it, whichever writer produced it. */
+export interface RunStepView {
+  key: string;
+  label: string;
+  summary: string;
+  detail: Record<string, unknown>;
+  warnings: string[];
+}
+
+function isDeterministic(step: RunStep): step is DeterministicRunStage {
+  return typeof (step as DeterministicRunStage).name === "string";
+}
+
+function summariseStage(stage: DeterministicRunStage): string {
+  const parts: string[] = [];
+  if (typeof stage.elapsedMs === "number") parts.push(`${stage.elapsedMs} ms`);
+  if (stage.cacheStatus && stage.cacheStatus !== "not_applicable") parts.push(`cache ${stage.cacheStatus}`);
+  if (stage.modelCalls) parts.push(`${stage.modelCalls} model call${stage.modelCalls === 1 ? "" : "s"}`);
+  if (stage.warnings?.length) parts.push(`${stage.warnings.length} warning${stage.warnings.length === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
+/** Normalises either trace shape into one view, so a run reads the same however it was produced. */
+export function runStepView(step: RunStep, index: number): RunStepView {
+  if (isDeterministic(step)) {
+    return {
+      key: `${index}-${step.name}`,
+      label: step.name,
+      summary: summariseStage(step),
+      detail: {
+        ...(step.inputSummary && Object.keys(step.inputSummary).length ? { inputSummary: step.inputSummary } : {}),
+        ...(step.outputSummary && Object.keys(step.outputSummary).length ? { outputSummary: step.outputSummary } : {}),
+        ...(typeof step.modelCostUSD === "number" ? { modelCostUSD: step.modelCostUSD } : {}),
+      },
+      warnings: step.warnings ?? [],
+    };
+  }
+  return {
+    key: `${index}-${step.label}`,
+    label: step.label,
+    summary: step.summary,
+    detail: step.detail ?? {},
+    warnings: [],
+  };
+}
+
+/** Every status the server uses to mean the run did not succeed. */
+export function runFailed(status: string): boolean {
+  return status === "error" || status === "failed";
 }
 
 // --- queue --------------------------------------------------------------

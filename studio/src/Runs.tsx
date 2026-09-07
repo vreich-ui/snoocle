@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fetchRecentRuns, type QueueResponse, type RunDetail, type RunSummary } from "./client";
+import { ApiError, fetchRecentRuns, runFailed, runStepView, type QueueResponse, type RunDetail, type RunSummary } from "./client";
 import { runDetailPath } from "./navigation";
 import { formatCost, formatDateTime, orDash, pairOrDash } from "./format";
 import { useApi } from "./useApi";
@@ -18,6 +18,7 @@ type RecentRunsState = "idle" | "loading" | "ready" | "error";
 function useRecentRuns(token: string) {
   const [state, setState] = useState<RecentRunsState>(token ? "loading" : "idle");
   const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [error, setError] = useState<ApiError | Error>();
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
@@ -30,12 +31,17 @@ function useRecentRuns(token: string) {
       };
     }
     setState("loading");
+    setError(undefined);
     fetchRecentRuns(RECENT_RUNS_LIMIT).then((result) => {
       if (!active) return;
       setRuns(result);
       setState("ready");
-    }).catch(() => {
+    }).catch((caught: unknown) => {
       if (!active) return;
+      // Discarding this left "Could not load recent runs." as the whole
+      // message, with a Retry that could only fail identically — while the
+      // Queue panel beside it correctly said the token was rejected.
+      setError(caught instanceof Error ? caught : new Error(String(caught)));
       setState("error");
     });
     return () => {
@@ -43,7 +49,7 @@ function useRecentRuns(token: string) {
     };
   }, [token, attempt]);
 
-  return { state, runs, reload: () => setAttempt((value) => value + 1) };
+  return { state, runs, error, reload: () => setAttempt((value) => value + 1) };
 }
 
 interface RunDetailViewProps {
@@ -91,7 +97,9 @@ function RunDetailView({ runId, token, onNavigate }: RunDetailViewProps) {
       <button type="button" className="back-link" onClick={() => onNavigate("/studio/runs")}>← Back to Runs</button>
       <p className="eyebrow">Run</p>
       <h2 id="run-detail-heading"><code>{data.runId}</code></h2>
-      {data.status === "error" && data.error && <p className="error" role="alert">{data.error}</p>}
+      {runFailed(data.status) && (data.error || data.reason) && (
+        <p className="error" role="alert">{data.error ?? data.reason}</p>
+      )}
       <dl className="classification-grid">
         <div><dt>Status</dt><dd>{data.status}</dd></div>
         <div><dt>Provider / model</dt><dd>{pairOrDash(data.provider, data.model)}</dd></div>
@@ -102,12 +110,21 @@ function RunDetailView({ runId, token, onNavigate }: RunDetailViewProps) {
         <div><dt>Cost</dt><dd>{formatCost(data.costUSD)}</dd></div>
       </dl>
       <div className="run-steps">
-        {data.steps.map((step) => (
-          <details key={step.index}>
-            <summary>{step.label} — {step.summary}</summary>
-            <pre>{JSON.stringify(step.detail, null, 2)}</pre>
-          </details>
-        ))}
+        {data.steps.map((step, index) => {
+          const view = runStepView(step, index);
+          return (
+            <details key={view.key}>
+              <summary>{view.summary ? `${view.label} — ${view.summary}` : view.label}</summary>
+              {view.warnings.length > 0 && (
+                <ul className="run-step-warnings">
+                  {view.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+                </ul>
+              )}
+              <pre>{JSON.stringify(view.detail, null, 2)}</pre>
+            </details>
+          );
+        })}
+        {!data.steps.length && <p className="muted">This run recorded no steps.</p>}
       </div>
     </section>
   );
@@ -176,10 +193,17 @@ export function Runs({ token, detailId, onNavigate }: RunsProps) {
       <section aria-labelledby="recent-runs-heading">
         <h3 id="recent-runs-heading">Recent runs</h3>
         <p className="muted">Aggregated in the browser from every song's run list, capped at {RECENT_RUNS_LIMIT}.</p>
+        {recent.state === "idle" && (
+          <p className="muted">Paste the server's SNOOCLE_API_TOKEN into the sidebar to load recent runs.</p>
+        )}
         {recent.state === "loading" && <p className="muted" role="status">Loading recent runs…</p>}
         {recent.state === "error" && (
           <div className="error" role="alert">
-            <p>Could not load recent runs.</p>
+            <p>
+              {recent.error instanceof ApiError && recent.error.unauthorized
+                ? "The bearer token was rejected. Check it matches SNOOCLE_API_TOKEN on the server."
+                : recent.error?.message ?? "Could not load recent runs."}
+            </p>
             <button type="button" onClick={recent.reload}>Retry</button>
           </div>
         )}
@@ -190,8 +214,16 @@ export function Runs({ token, detailId, onNavigate }: RunsProps) {
                 <thead><tr><th>Run</th><th>Song</th><th>Status</th><th>Provider / model</th><th>Started</th><th>Cost</th></tr></thead>
                 <tbody>
                   {recent.runs.map((run) => (
-                    <tr key={run.runId} className="row-button" onClick={() => onNavigate(runDetailPath(run.runId))}>
-                      <td><code>{run.runId.slice(0, 10)}</code></td>
+                    <tr key={run.runId}>
+                      <td>
+                        <button
+                          type="button"
+                          className="row-open"
+                          onClick={() => onNavigate(runDetailPath(run.runId))}
+                        >
+                          <code>{run.runId.slice(0, 10)}</code>
+                        </button>
+                      </td>
                       <td><code>{run.songId}</code></td>
                       <td>{run.status}</td>
                       <td>{pairOrDash(run.provider, run.model)}</td>

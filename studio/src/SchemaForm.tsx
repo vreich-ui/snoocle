@@ -35,6 +35,15 @@ interface SchemaFormProps {
   onCancel: () => void;
   /** Reports the live field values so a caller can warn about a combination the schema cannot express. */
   onValuesChange?: (values: Record<string, unknown>) => void;
+  /**
+   * Values the caller can supply and re-supply as its own state changes — the
+   * workbench selection, for Tool Studio. A seeded key is written into a field
+   * the operator has not edited, and left alone once they have: acquiring
+   * audio mid-form fills in the new audio_ref without discarding what has
+   * already been typed. Remounting the form was the previous answer, and it
+   * threw the typing away every time.
+   */
+  seed?: Record<string, unknown>;
 }
 
 function humanize(name: string): string {
@@ -248,11 +257,11 @@ function JsonField({ id, label, description, initialText, required, disabled, on
   );
 }
 
-export function SchemaForm({ schema, initialValue, busy, blockedReason, requiresConfirmation, onSubmit, onCancel, onValuesChange }: SchemaFormProps) {
+export function SchemaForm({ schema, initialValue, busy, blockedReason, requiresConfirmation, onSubmit, onCancel, onValuesChange, seed }: SchemaFormProps) {
   const initial = useMemo(() => {
     const defaults = defaultsFor(schema, schema);
-    return { ...(isRecord(defaults) ? defaults : {}), ...(initialValue ?? {}) };
-  }, [schema, initialValue]);
+    return { ...(isRecord(defaults) ? defaults : {}), ...(seed ?? {}), ...(initialValue ?? {}) };
+  }, [schema, initialValue, seed]);
   const [values, setValues] = useState<Record<string, unknown>>(initial);
   const [advanced, setAdvanced] = useState(false);
   const [rawText, setRawText] = useState(() => formatJson(initial));
@@ -266,9 +275,27 @@ export function SchemaForm({ schema, initialValue, busy, blockedReason, requires
   const onValuesChangeRef = useRef(onValuesChange);
   onValuesChangeRef.current = onValuesChange;
 
+  // Top-level keys the operator has edited. Only these are protected from a
+  // later seed; everything else is still the caller's to fill in.
+  const touched = useRef(new Set<string>(Object.keys(initialValue ?? {})));
+
   const updateValue = (path: string[], value: unknown) => {
+    if (path[0]) touched.current.add(path[0]);
     setValues((current) => setAtPath(current, path, value));
   };
+
+  useEffect(() => {
+    if (!seed) return;
+    setValues((current) => {
+      let next = current;
+      for (const [key, value] of Object.entries(seed)) {
+        if (touched.current.has(key) || current[key] === value) continue;
+        if (next === current) next = { ...current };
+        next[key] = value;
+      }
+      return next;
+    });
+  }, [seed]);
 
   // Reported from an effect rather than from inside the state updater, which
   // React is free to run more than once. Fires for the seeded values too, so a
@@ -299,6 +326,10 @@ export function SchemaForm({ schema, initialValue, busy, blockedReason, requires
       }
     }
     setError("");
+    // "Confirmation before each run" has to mean each run. The box used to
+    // stay ticked, so a second click re-ran a persistent or costly tool with
+    // no confirmation step at all.
+    if (requiresConfirmation) setConfirmed(false);
     onSubmit(args);
   };
 

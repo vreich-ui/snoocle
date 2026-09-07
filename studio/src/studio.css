@@ -397,8 +397,20 @@ dd { font-size: .8rem; margin: .2rem 0 0; overflow-wrap: anywhere; }
 table { border-collapse: collapse; font-size: .82rem; width: 100%; }
 th, td { border-bottom: 1px solid #28354c; padding: .5rem .65rem; text-align: left; white-space: nowrap; }
 th { color: #8fa4c3; font-size: .68rem; letter-spacing: .05em; text-transform: uppercase; }
-tr.row-button { cursor: pointer; }
-tr.row-button:hover { background: #141f35; }
+/* The run id is a real button so the row is reachable by keyboard and named to
+   a screen reader; the whole row was previously a bare onClick handler. */
+.row-open {
+  background: none;
+  border: 0;
+  color: #8ab4f8;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+}
+.row-open code { color: inherit; }
+.row-open:hover { color: #b6d0fb; }
 
 .stat-row {
   display: flex;
@@ -518,3 +530,5 @@ tr.row-button:hover { background: #141f35; }
 .youtube-auth-notice pre { white-space: pre-wrap; }
 .youtube-session { display: grid; gap: .7rem; margin-top: .6rem; }
 .youtube-session textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; }
+
+.run-step-warnings { color: #ffe1a5; font-size: .8rem; margin: .3rem 0 .5rem; padding-left: 1.1rem; }

@@ -1,31 +1,56 @@
 import { apiFetch } from "./api";
 
-/** A REST call that reached the server but was answered with a non-OK status. */
+/**
+ * A REST call that reached the server but was answered with a non-OK status.
+ *
+ * `errorCode` and `reason` matter as much as `detail`. The server classifies
+ * the failures it knows how to talk about — `youtube_auth_required`,
+ * `identity_unresolved`, `budget_exceeded` and the rest — and pairs each with
+ * a sentence saying what to do. Studio used to keep only `detail`, so a
+ * recoverable state arrived as an unreadable stack of yt-dlp output with no
+ * hint that there was a fix at all.
+ */
 export class ApiError extends Error {
   readonly status: number;
   readonly detail: string;
   readonly unauthorized: boolean;
+  readonly errorCode?: string;
+  readonly reason?: string;
 
-  constructor(status: number, detail: string) {
+  constructor(status: number, detail: string, errorCode?: string, reason?: string) {
     super(detail);
     this.name = "ApiError";
     this.status = status;
     this.detail = detail;
     this.unauthorized = status === 401;
+    this.errorCode = errorCode;
+    this.reason = reason;
   }
 }
 
+function stringField(body: unknown, key: string): string | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const value = (body as Record<string, unknown>)[key];
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+export function apiErrorFromBody(status: number, body: unknown, fallbackDetail: string): ApiError {
+  return new ApiError(
+    status,
+    stringField(body, "detail") ?? stringField(body, "reason") ?? fallbackDetail,
+    stringField(body, "errorCode"),
+    stringField(body, "reason"),
+  );
+}
+
 async function errorFromResponse(response: Response): Promise<ApiError> {
-  let detail = response.statusText || `Request failed (${response.status})`;
+  const fallback = response.statusText || `Request failed (${response.status})`;
   try {
-    const body: unknown = await response.json();
-    if (body && typeof body === "object" && typeof (body as { detail?: unknown }).detail === "string") {
-      detail = (body as { detail: string }).detail;
-    }
+    return apiErrorFromBody(response.status, await response.json(), fallback);
   } catch {
     // Body wasn't JSON (or was empty) — fall back to status text.
+    return new ApiError(response.status, fallback);
   }
-  return new ApiError(response.status, detail);
 }
 
 export async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {

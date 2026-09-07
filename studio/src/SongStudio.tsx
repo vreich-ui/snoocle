@@ -416,7 +416,7 @@ export function SongStudio({ songId, token, bench, onBenchChange, onNavigate, cl
                   {audioBlocked && (
                     <>
                       <p className="field-help">Needs audio in the workbench.</p>
-                      <LoadSongAudio bench={bench} onChange={onBenchChange} />
+                      <LoadSongAudio bench={bench} token={token} onChange={onBenchChange} />
                       {!bench.song?.youtubeVideoId && (
                         <p className="field-help">
                           This song has no recording on file. Acquire one in Tool Studio, or use

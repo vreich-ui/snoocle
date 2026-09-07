@@ -1,9 +1,12 @@
 import { useState } from "react";
 import { acquireArtifact } from "./audio";
+import { isYouTubeAuthFailure } from "./youtube";
+import { YouTubeAuthNotice } from "./YouTubeAuthNotice";
 import { type Workbench } from "./workbench";
 
 interface LoadSongAudioProps {
   bench: Workbench;
+  token: string;
   onChange(next: Workbench): void;
 }
 
@@ -16,9 +19,10 @@ interface LoadSongAudioProps {
  * one. Nothing appears when the song has no known recording; there is nothing
  * honest to offer in that case.
  */
-export function LoadSongAudio({ bench, onChange }: LoadSongAudioProps) {
+export function LoadSongAudio({ bench, token, onChange }: LoadSongAudioProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [authBlocked, setAuthBlocked] = useState(false);
   const song = bench.song;
   const videoId = song?.youtubeVideoId;
   if (!song || !videoId) return null;
@@ -28,6 +32,7 @@ export function LoadSongAudio({ bench, onChange }: LoadSongAudioProps) {
   const load = async () => {
     setBusy(true);
     setError("");
+    setAuthBlocked(false);
     try {
       const artifact = await acquireArtifact(videoId);
       onChange({
@@ -42,6 +47,7 @@ export function LoadSongAudio({ bench, onChange }: LoadSongAudioProps) {
         },
       });
     } catch (caught) {
+      setAuthBlocked(isYouTubeAuthFailure(caught));
       setError(caught instanceof Error ? caught.message : "Could not load this song's audio");
     } finally {
       setBusy(false);
@@ -60,7 +66,9 @@ export function LoadSongAudio({ bench, onChange }: LoadSongAudioProps) {
           ? `Using the song's own recording (YouTube ${videoId}).`
           : `Fetches YouTube ${videoId}, the recording on file for this song.`}
       </p>
-      {error && <p className="error" role="alert">{error}</p>}
+      {authBlocked
+        ? <YouTubeAuthNotice token={token} detail={error} onReconnected={() => setAuthBlocked(false)} />
+        : error && <p className="error" role="alert">{error}</p>}
     </div>
   );
 }

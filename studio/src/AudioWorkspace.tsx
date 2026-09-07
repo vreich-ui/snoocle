@@ -2,20 +2,24 @@ import { useEffect, useRef, useState } from "react";
 import { acquireArtifact, artifactResponse, type AudioArtifact } from "./audio";
 import { apiFetch, getBearerToken } from "./api";
 import { createWaveform, type WaveformController } from "./waveform";
+import { isYouTubeAuthFailure } from "./youtube";
+import { YouTubeAuthNotice } from "./YouTubeAuthNotice";
 
 export type { AudioArtifact };
 
 interface AudioWorkspaceProps {
+  token?: string;
   onArtifact?(artifact: AudioArtifact): void;
   onArtifactRemoved?(audioRef: string): void;
 }
 
-export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspaceProps = {}) {
+export function AudioWorkspace({ token = "", onArtifact, onArtifactRemoved }: AudioWorkspaceProps = {}) {
   const [file, setFile] = useState<File | null>(null);
   const [youtube, setYoutube] = useState("");
   const [artifact, setArtifact] = useState<AudioArtifact | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [authBlocked, setAuthBlocked] = useState(false);
   const waveformElement = useRef<HTMLDivElement | null>(null);
   const waveform = useRef<WaveformController | null>(null);
 
@@ -36,6 +40,7 @@ export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspace
   const preview = (next: AudioArtifact) => {
     setArtifact(next);
     setMessage("");
+    setAuthBlocked(false);
     onArtifact?.(next);
   };
 
@@ -58,9 +63,11 @@ export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspace
     if (!youtube.trim()) return;
     setBusy(true);
     setMessage("");
+    setAuthBlocked(false);
     try {
       preview(await acquireArtifact(youtube.trim()));
     } catch (error) {
+      setAuthBlocked(isYouTubeAuthFailure(error));
       setMessage(error instanceof Error ? error.message : "Acquisition failed");
     } finally {
       setBusy(false);
@@ -111,7 +118,9 @@ export function AudioWorkspace({ onArtifact, onArtifactRemoved }: AudioWorkspace
         </label>
         <button type="button" disabled={!youtube.trim() || busy} onClick={acquire}>Acquire and preview</button>
       </div>
-      {message && <p role="status">{message}</p>}
+      {authBlocked
+        ? <YouTubeAuthNotice token={token} detail={message} onReconnected={() => setAuthBlocked(false)} />
+        : message && <p role="status">{message}</p>}
       {artifact && (
         <div className="audio-preview">
           <div className="audio-identity">

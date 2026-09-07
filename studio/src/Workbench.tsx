@@ -140,7 +140,7 @@ export function WorkbenchBar({ bench, token, onChange }: WorkbenchProps) {
           ) : (
             <>
               <span className="muted">none</span>
-              <LoadSongAudio bench={bench} onChange={onChange} />
+              <LoadSongAudio bench={bench} token={token} onChange={onChange} />
             </>
           )}
         </div>

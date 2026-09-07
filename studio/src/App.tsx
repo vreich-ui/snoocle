@@ -12,6 +12,7 @@ const SongStudio = lazy(() => import("./SongStudio").then((module) => ({ default
 const Library = lazy(() => import("./Library").then((module) => ({ default: module.Library })));
 const SongDetail = lazy(() => import("./SongDetail").then((module) => ({ default: module.SongDetail })));
 const Runs = lazy(() => import("./Runs").then((module) => ({ default: module.Runs })));
+const YouTubeSession = lazy(() => import("./YouTubeSession").then((module) => ({ default: module.YouTubeSession })));
 
 function useCurrentRoute() {
   const [route, setRoute] = useState<StudioRoute>(() => routeFromPath(window.location.pathname));
@@ -89,6 +90,7 @@ export function StudioApp() {
         <div className="tool-studio-page">
           <div className="workspace audio-workspace-shell">
             <AudioWorkspace
+              token={token}
               onArtifact={(artifact) => onBenchChange({
                 ...bench,
                 audio: {
@@ -128,6 +130,18 @@ export function StudioApp() {
             )
             : <Library token={token} onNavigate={navigate} />}
         </Suspense>
+      ) : section === "Configuration" ? (
+        <section aria-labelledby="section-heading" className="workspace" tabIndex={-1}>
+          <p className="eyebrow">Workspace</p>
+          <h2 id="section-heading">Configuration</h2>
+          <p className="muted">
+            Only the YouTube session is managed here so far. The agent workbench, providers and OAuth
+            clients remain in the existing admin at <a href="/ui/">/ui/</a>.
+          </p>
+          <Suspense fallback={<p className="muted" role="status">Loading…</p>}>
+            <YouTubeSession token={token} />
+          </Suspense>
+        </section>
       ) : section === "Runs" ? (
         <Suspense fallback={<section className="workspace" role="status">Loading Runs…</section>}>
           <Runs token={token} detailId={detailId} onNavigate={navigate} />

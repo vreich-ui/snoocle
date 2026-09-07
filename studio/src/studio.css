@@ -504,3 +504,17 @@ tr.row-button:hover { background: #141f35; }
 
 .load-song-audio { display: grid; gap: .35rem; margin-top: .5rem; }
 .load-song-audio .field-help { overflow-wrap: anywhere; }
+
+.youtube-auth-notice {
+  background: #351c25;
+  border-left: 3px solid #c45f70;
+  border-radius: .35rem;
+  color: #ffb8c0;
+  display: grid;
+  gap: .5rem;
+  padding: .8rem .95rem;
+}
+.youtube-auth-notice p { font-size: .84rem; margin: 0; }
+.youtube-auth-notice pre { white-space: pre-wrap; }
+.youtube-session { display: grid; gap: .7rem; margin-top: .6rem; }
+.youtube-session textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; }

@@ -126,4 +126,11 @@ describe("StudioApp", () => {
     expect(await screen.findByRole("heading", { name: "Runs" })).toBeVisible();
     expect(await screen.findByText("No recent worker heartbeat")).toBeVisible();
   });
+
+  it("gives Configuration a real page for the YouTube session", async () => {
+    window.history.replaceState({}, "", "/studio/configuration");
+    render(<StudioApp />);
+    expect(await screen.findByRole("heading", { name: "YouTube session" })).toBeVisible();
+    expect(screen.queryByText("Not built yet")).toBeNull();
+  });
 });

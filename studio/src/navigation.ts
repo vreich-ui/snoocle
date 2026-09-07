@@ -60,7 +60,12 @@ export function songStudioPath(songId: string): string {
   return `/studio/song-studio/${encodeURIComponent(songId)}`;
 }
 
-export const implementedSections = ["Song Studio", "Tool Studio", "Library", "Runs"] as const satisfies readonly StudioSection[];
+/**
+ * Configuration is listed as built because its one implemented capability —
+ * the YouTube session — is the difference between the pipeline working and
+ * not working at all. Its page says plainly which parts are still absent.
+ */
+export const implementedSections = ["Song Studio", "Tool Studio", "Library", "Runs", "Configuration"] as const satisfies readonly StudioSection[];
 
 export function isImplemented(section: StudioSection): boolean {
   return (implementedSections as readonly StudioSection[]).includes(section);
@@ -75,5 +80,5 @@ export const sectionPlan: Record<StudioSection, string> = {
   Library: "Song browser with versions, diff, export and gold marking.",
   Runs: "Run traces with per-step timing and the MIR chord timeline.",
   Evaluation: "Scorecard against gold versions, plus token and cost rollups.",
-  Configuration: "Agent workbench, provider status, YouTube session cookies and OAuth clients.",
+  Configuration: "YouTube session management; the agent workbench, provider status and OAuth clients are still in /ui/.",
 };

@@ -1,4 +1,5 @@
 import { apiFetch } from "./api";
+import { apiErrorFromBody } from "./client";
 
 export type AudioArtifact = {
   audioRef: string;
@@ -24,7 +25,9 @@ export type AudioArtifact = {
 export async function artifactResponse(response: Response): Promise<AudioArtifact> {
   const body = await response.json();
   if (!response.ok) {
-    throw new Error(body.detail ?? body.reason ?? `Request failed (${response.status})`);
+    // Thrown as an ApiError so the classified errorCode survives to the UI —
+    // a bot-checked YouTube download is a recoverable state, not a stack of text.
+    throw apiErrorFromBody(response.status, body, `Request failed (${response.status})`);
   }
   const artifact = body.artifact as AudioArtifact;
   return {
@@ -35,7 +38,7 @@ export async function artifactResponse(response: Response): Promise<AudioArtifac
   };
 }
 
-/** Fetches a recording server-side and retains it under an opaque, expiring reference. */
+/** Fetches a recording server-side and retains it under an opaque, expiring reference. Rejects with {@link ApiError}. */
 export async function acquireArtifact(youtubeUrlOrId: string): Promise<AudioArtifact> {
   return artifactResponse(await apiFetch("/v1/audio/artifacts/acquire", {
     method: "POST",

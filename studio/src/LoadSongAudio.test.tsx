@@ -45,7 +45,7 @@ describe("LoadSongAudio", () => {
     }), { status: 201, headers: { "Content-Type": "application/json" } }));
     const onChange = vi.fn();
     const user = userEvent.setup();
-    render(<LoadSongAudio bench={{ song }} onChange={onChange} />);
+    render(<LoadSongAudio bench={{ song }} token="tab-token" onChange={onChange} />);
 
     await user.click(screen.getByRole("button", { name: "Load this song's audio" }));
 
@@ -67,13 +67,13 @@ describe("LoadSongAudio", () => {
   // came from, so there is no button to press.
   it("renders nothing when the song has no recording on file", () => {
     const { container } = render(
-      <LoadSongAudio bench={{ song: { ...song, youtubeVideoId: undefined } }} onChange={vi.fn()} />,
+      <LoadSongAudio bench={{ song: { ...song, youtubeVideoId: undefined } }} token="tab-token" onChange={vi.fn()} />,
     );
     expect(container).toBeEmptyDOMElement();
   });
 
   it("renders nothing with no song selected", () => {
-    const { container } = render(<LoadSongAudio bench={{}} onChange={vi.fn()} />);
+    const { container } = render(<LoadSongAudio bench={{}} token="tab-token" onChange={vi.fn()} />);
     expect(container).toBeEmptyDOMElement();
   });
 
@@ -82,7 +82,7 @@ describe("LoadSongAudio", () => {
       song,
       audio: { audioRef: "aud_1", filename: "a.webm", songId: song.id, youtubeVideoId: "abcdefghijk" },
     };
-    render(<LoadSongAudio bench={bench} onChange={vi.fn()} />);
+    render(<LoadSongAudio bench={bench} token="tab-token" onChange={vi.fn()} />);
     expect(screen.getByRole("button", { name: "Audio loaded" })).toBeDisabled();
   });
 
@@ -91,9 +91,39 @@ describe("LoadSongAudio", () => {
       status: 502, headers: { "Content-Type": "application/json" },
     }));
     const user = userEvent.setup();
-    render(<LoadSongAudio bench={{ song }} onChange={vi.fn()} />);
+    render(<LoadSongAudio bench={{ song }} token="tab-token" onChange={vi.fn()} />);
 
     await user.click(screen.getByRole("button", { name: "Load this song's audio" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("video unavailable");
+  });
+
+  // The failure that blocked the pipeline in production: YouTube bot-checks the
+  // datacenter address, and the raw yt-dlp text said nothing about the fix.
+  it("offers to reconnect YouTube when the download is bot-checked", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      detail: "yt-dlp failed for abcdefghijk: ERROR: [youtube] abcdefghijk: Sign in to confirm you're not a bot.",
+      errorCode: "youtube_auth_required",
+      reason: "YouTube connection expired or was blocked. Reconnect YouTube (sign in again in the app) and retry.",
+    }), { status: 502, headers: { "Content-Type": "application/json" } }));
+    const user = userEvent.setup();
+    render(<LoadSongAudio bench={{ song }} token="tab-token" onChange={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "Load this song's audio" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("YouTube refused this download.");
+    expect(screen.getByRole("button", { name: "Reconnect YouTube" })).toBeVisible();
+  });
+
+  it("still shows an ordinary failure as an ordinary failure", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ detail: "Video unavailable" }), {
+      status: 502, headers: { "Content-Type": "application/json" },
+    }));
+    const user = userEvent.setup();
+    render(<LoadSongAudio bench={{ song }} token="tab-token" onChange={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "Load this song's audio" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Video unavailable");
+    expect(screen.queryByRole("button", { name: "Reconnect YouTube" })).toBeNull();
   });
 });

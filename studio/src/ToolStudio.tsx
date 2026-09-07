@@ -14,6 +14,8 @@ import {
   type ResultTelemetry,
   type StudioTool,
 } from "./tooling";
+import { isYouTubeAuthFailure } from "./youtube";
+import { YouTubeAuthNotice } from "./YouTubeAuthNotice";
 import { benchMismatches, derivesIdentityFromRecording, identityConflict, seedFromWorkbench, type Workbench } from "./workbench";
 
 type ClientFactory = (token: string) => ToolStudioClient;
@@ -351,7 +353,11 @@ export function ToolStudio({ token, bench, onBenchChange, clientFactory = create
                 onCancel={() => abortRef.current?.abort()}
                 onValuesChange={setLiveValues}
               />
-              {invocationError && <p className="error invocation-error" role="alert">{invocationError}</p>}
+              {invocationError && (
+                isYouTubeAuthFailure(invocationError)
+                  ? <YouTubeAuthNotice token={token} detail={invocationError} onReconnected={() => setInvocationError("")} />
+                  : <p className="error invocation-error" role="alert">{invocationError}</p>
+              )}
               {result && (
                 <section className={result.failed ? "result-panel failed" : "result-panel"} aria-labelledby="result-heading">
                   <h4 id="result-heading">{result.failed ? "Tool error" : "Tool result"}</h4>

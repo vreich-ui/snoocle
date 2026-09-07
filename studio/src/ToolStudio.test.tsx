@@ -184,7 +184,7 @@ describe("ToolStudio", () => {
     render(<ToolStudio token="tab-token" bench={bench} onBenchChange={vi.fn()} clientFactory={() => client} />);
 
     await screen.findByText(/Connected · 1 tools/);
-    expect(screen.getByText("From workbench: song_id, song_version")).toBeVisible();
+    expect(await screen.findByText("From workbench: song_id, song_version")).toBeVisible();
     expect(screen.getByLabelText(/Song Id/i)).toHaveValue("artist--song");
     expect(screen.getByLabelText(/Song Version/i)).toHaveValue("v2");
     // Seeded fields stay fully editable, never disabled.
@@ -248,7 +248,9 @@ describe("ToolStudio", () => {
     expect(await screen.findByLabelText(/Youtube Url Or Id/i)).toHaveValue("abcdefghijk");
     expect(screen.getByLabelText(/^Title/i)).toHaveValue("Back to Black");
     expect(screen.getByLabelText(/^Artist/i)).toHaveValue("Amy Winehouse");
-    expect(screen.getByText(/From workbench: youtube_url_or_id, title, artist/)).toBeVisible();
+    // The line now describes the form rather than the seed, so it settles once
+    // the field values are reported back.
+    expect(await screen.findByText(/From workbench: youtube_url_or_id, title, artist/)).toBeVisible();
   });
 
   // The live guard that lets the fields be filled in at all: pasting another
@@ -273,6 +275,78 @@ describe("ToolStudio", () => {
     expect(alert).toHaveTextContent("RNCH0xA-hNY");
     expect(alert).toHaveTextContent("Back to Black");
   });
+
+  // Acquiring audio mid-form used to remount the whole argument editor, so
+  // every field typed before pressing Acquire was thrown away.
+  it("fills a newly available workbench value without discarding what was typed", async () => {
+    const client = mockClient();
+    client.connectAndDiscover = vi.fn().mockResolvedValue([
+      tool("analyze_audio", {
+        title: "Analyze Audio",
+        contract: contract({ title: "Analyze Audio", category: "audio", browserSafety: "safe" }),
+        inputSchema: {
+          type: "object",
+          properties: { audio_ref: { type: "string" }, accuracy: { type: "string" } },
+        },
+      }),
+    ]);
+    const song = { id: "artist--song", title: "Song", artist: "Artist" };
+    const factory = () => client;
+    const user = userEvent.setup();
+    const view = render(
+      <ToolStudio token="tab-token" bench={{ song }} onBenchChange={vi.fn()} clientFactory={factory} />,
+    );
+
+    const accuracy = await screen.findByLabelText(/Accuracy/i);
+    await user.type(accuracy, "high");
+    expect(await screen.findByLabelText(/Audio Ref/i)).toHaveValue("");
+
+    // The workbench gains a recording while the form is open.
+    view.rerender(
+      <ToolStudio
+        token="tab-token"
+        bench={{ song, audio: { audioRef: "aud_new", filename: "a.webm", songId: song.id } }}
+        onBenchChange={vi.fn()}
+        clientFactory={factory}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText(/Audio Ref/i)).toHaveValue("aud_new"));
+    expect(screen.getByLabelText(/Accuracy/i)).toHaveValue("high");
+  });
+
+  it("leaves a field the operator has edited alone when the workbench changes", async () => {
+    const client = mockClient();
+    client.connectAndDiscover = vi.fn().mockResolvedValue([
+      tool("analyze_audio", {
+        title: "Analyze Audio",
+        contract: contract({ title: "Analyze Audio", category: "audio", browserSafety: "safe" }),
+        inputSchema: { type: "object", properties: { audio_ref: { type: "string" } } },
+      }),
+    ]);
+    const song = { id: "artist--song", title: "Song", artist: "Artist" };
+    const factory = () => client;
+    const user = userEvent.setup();
+    const view = render(
+      <ToolStudio token="tab-token" bench={{ song }} onBenchChange={vi.fn()} clientFactory={factory} />,
+    );
+
+    await user.type(await screen.findByLabelText(/Audio Ref/i), "aud_typed_by_hand");
+
+    view.rerender(
+      <ToolStudio
+        token="tab-token"
+        bench={{ song, audio: { audioRef: "aud_new", filename: "a.webm", songId: song.id } }}
+        onBenchChange={vi.fn()}
+        clientFactory={factory}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText(/Audio Ref/i)).toHaveValue("aud_typed_by_hand"));
+    // And the line no longer claims a workbench value the form is not carrying.
+    expect(screen.queryByText(/From workbench: audio_ref/)).toBeNull();
+  });
+
 });
 
 describe("looksUnauthorized", () => {

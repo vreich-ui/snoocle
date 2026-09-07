@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SchemaForm, type JsonSchema } from "./SchemaForm";
@@ -55,5 +55,48 @@ describe("SchemaForm", () => {
     rerender(<SchemaForm schema={{ type: "object", properties: {} }} busy requiresConfirmation onSubmit={vi.fn()} onCancel={onCancel} />);
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  // "Confirmation before each run" has to mean each run; the box used to stay
+  // ticked, so a second click re-ran a persistent tool unconfirmed.
+  it("re-arms the confirmation after every submit", async () => {
+    const onSubmit = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SchemaForm
+        schema={{ type: "object", properties: { note: { type: "string" } } }}
+        busy={false}
+        requiresConfirmation
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    const submit = screen.getByRole("button", { name: /invoke/i });
+    expect(submit).toBeDisabled();
+    const box = screen.getByRole("checkbox");
+    await user.click(box);
+    expect(submit).toBeEnabled();
+
+    await user.click(submit);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(box).not.toBeChecked();
+    expect(submit).toBeDisabled();
+  });
+
+  it("applies a later seed to untouched fields only", async () => {
+    const schema = { type: "object", properties: { a: { type: "string" }, b: { type: "string" } } } as const;
+    const user = userEvent.setup();
+    const view = render(
+      <SchemaForm schema={schema} seed={{ a: "seed-a" }} busy={false} requiresConfirmation={false} onSubmit={vi.fn()} onCancel={vi.fn()} />,
+    );
+    await user.type(document.getElementById("field-b")!, "typed-b");
+
+    view.rerender(
+      <SchemaForm schema={schema} seed={{ a: "seed-a2", b: "seed-b" }} busy={false} requiresConfirmation={false} onSubmit={vi.fn()} onCancel={vi.fn()} />,
+    );
+
+    await waitFor(() => expect(document.getElementById("field-a")).toHaveValue("seed-a2"));
+    expect(document.getElementById("field-b")).toHaveValue("typed-b");
   });
 });
